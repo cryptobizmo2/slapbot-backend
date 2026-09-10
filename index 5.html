@@ -1,0 +1,1048 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BIG MOUF SLAPBOT - Solana Trading Intelligence</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/chart.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/axios@1.4.0/dist/axios.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --bg-primary: #0a0e27;
+            --bg-secondary: #1a1f3a;
+            --bg-tertiary: #252d4a;
+            --accent-neon: #00ff41;
+            --accent-gold: #ffd700;
+            --accent-danger: #ff2050;
+            --text-primary: #ffffff;
+            --text-secondary: #b0b9c9;
+            --border-color: #2a3456;
+            --success: #10b981;
+            --warning: #f59e0b;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.6;
+            overflow-x: hidden;
+        }
+
+        /* ===== HEADER ===== */
+        header {
+            background: linear-gradient(135deg, rgba(0,255,65,0.05) 0%, rgba(255,215,0,0.05) 100%);
+            border-bottom: 1px solid var(--border-color);
+            padding: 1.2rem 1.5rem;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            backdrop-filter: blur(10px);
+        }
+
+        .header-container {
+            max-width: 1400px;
+            margin: 0 auto;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .logo-section {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .logo-3d {
+            width: 70px;
+            height: 70px;
+            perspective: 1200px;
+            cursor: pointer;
+            position: relative;
+        }
+
+        .logo-inner {
+            width: 100%;
+            height: 100%;
+            position: relative;
+            transform-style: preserve-3d;
+            animation: coinFlip 3s infinite ease-in-out;
+        }
+
+        @keyframes coinFlip {
+            0% { transform: rotateY(0deg) rotateX(2deg); }
+            50% { transform: rotateY(180deg) rotateX(2deg); }
+            100% { transform: rotateY(360deg) rotateX(2deg); }
+        }
+
+        .logo-face {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            backface-visibility: hidden;
+            border-radius: 50%;
+            overflow: hidden;
+            box-shadow: 0 8px 24px rgba(255, 215, 0, 0.4);
+            border: 3px solid rgba(255, 215, 0, 0.6);
+        }
+
+        .logo-face:nth-child(1) {
+            transform: rotateY(0deg);
+        }
+
+        .logo-face:nth-child(2) {
+            transform: rotateY(180deg);
+        }
+
+        .logo-face img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            display: block;
+        }
+
+        .brand-text {
+            display: flex;
+            flex-direction: column;
+            gap: 0.2rem;
+        }
+
+        .brand-text h1 {
+            font-size: 1.4rem;
+            font-weight: 900;
+            letter-spacing: 2px;
+            background: linear-gradient(135deg, var(--accent-neon), var(--accent-gold));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .brand-text p {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            letter-spacing: 1.5px;
+            text-transform: uppercase;
+        }
+
+        .header-status {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .live-indicator {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem 1rem;
+            background: rgba(16, 185, 129, 0.1);
+            border: 1px solid var(--success);
+            border-radius: 20px;
+            font-size: 0.85rem;
+            font-weight: 600;
+        }
+
+        .live-dot {
+            width: 8px;
+            height: 8px;
+            background: var(--success);
+            border-radius: 50%;
+            animation: pulse 1.5s ease-in-out infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+
+        .market-ticker {
+            display: flex;
+            gap: 1.5rem;
+            font-size: 0.9rem;
+        }
+
+        .ticker-item {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.4rem 0.8rem;
+            background: var(--bg-secondary);
+            border-radius: 6px;
+        }
+
+        .ticker-label {
+            color: var(--text-secondary);
+            font-weight: 500;
+        }
+
+        .ticker-value {
+            font-weight: 700;
+            font-family: 'Courier New', monospace;
+        }
+
+        .ticker-value.up { color: var(--success); }
+        .ticker-value.down { color: var(--accent-danger); }
+
+        /* ===== NAVIGATION ===== */
+        nav {
+            border-bottom: 1px solid var(--border-color);
+            background: var(--bg-secondary);
+            overflow-x: auto;
+            padding: 0 1.5rem;
+        }
+
+        nav ul {
+            list-style: none;
+            display: flex;
+            gap: 0;
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        nav li {
+            flex: 0 0 auto;
+        }
+
+        nav button {
+            background: none;
+            border: none;
+            color: var(--text-secondary);
+            padding: 1rem 1.5rem;
+            cursor: pointer;
+            font-size: 0.95rem;
+            font-weight: 600;
+            border-bottom: 3px solid transparent;
+            transition: all 0.3s ease;
+            white-space: nowrap;
+        }
+
+        nav button:hover {
+            color: var(--accent-neon);
+        }
+
+        nav button.active {
+            color: var(--accent-neon);
+            border-bottom-color: var(--accent-neon);
+        }
+
+        /* ===== MAIN CONTENT ===== */
+        main {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 2rem 1.5rem;
+        }
+
+        .content-section {
+            display: none;
+        }
+
+        .content-section.active {
+            display: block;
+            animation: fadeIn 0.3s ease;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+
+        /* ===== SCANNER TAB ===== */
+        .scanner-container {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 2rem;
+        }
+
+        .stat-card {
+            background: linear-gradient(135deg, var(--bg-secondary) 0%, var(--bg-tertiary) 100%);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 1.5rem;
+            transition: all 0.3s ease;
+        }
+
+        .stat-card:hover {
+            border-color: var(--accent-neon);
+            box-shadow: 0 0 20px rgba(0, 255, 65, 0.2);
+        }
+
+        .stat-label {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 0.8rem;
+        }
+
+        .stat-value {
+            font-size: 2.2rem;
+            font-weight: 900;
+            font-family: 'Courier New', monospace;
+            margin-bottom: 0.5rem;
+        }
+
+        .stat-value.up { color: var(--success); }
+        .stat-value.down { color: var(--accent-danger); }
+
+        .signal-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 1.5rem;
+            margin-top: 2rem;
+        }
+
+        .signal-table {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            overflow: hidden;
+        }
+
+        .signal-table table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.9rem;
+        }
+
+        .signal-table th {
+            background: var(--bg-tertiary);
+            padding: 1rem;
+            text-align: left;
+            font-weight: 700;
+            color: var(--text-secondary);
+            border-bottom: 1px solid var(--border-color);
+            text-transform: uppercase;
+            font-size: 0.75rem;
+            letter-spacing: 1px;
+        }
+
+        .signal-table td {
+            padding: 0.9rem 1rem;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .signal-table tr:hover {
+            background: rgba(0, 255, 65, 0.05);
+        }
+
+        .price-cell {
+            font-family: 'Courier New', monospace;
+            font-weight: 700;
+        }
+
+        .change-cell {
+            font-weight: 700;
+        }
+
+        .change-cell.up { color: var(--success); }
+        .change-cell.down { color: var(--accent-danger); }
+
+        .indicator-badge {
+            display: inline-block;
+            padding: 0.3rem 0.7rem;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 700;
+            text-transform: uppercase;
+        }
+
+        .badge-bullish { background: rgba(16, 185, 129, 0.2); color: var(--success); }
+        .badge-bearish { background: rgba(255, 32, 80, 0.2); color: var(--accent-danger); }
+
+        /* ===== COPY TRADING TAB ===== */
+        .copy-trading-container {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 2rem;
+            margin-bottom: 2rem;
+        }
+
+        @media (max-width: 1024px) {
+            .copy-trading-container {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .copy-section {
+            background: linear-gradient(135deg, var(--bg-secondary) 0%, var(--bg-tertiary) 100%);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 2rem;
+            transition: all 0.3s ease;
+        }
+
+        .copy-section:hover {
+            border-color: var(--accent-neon);
+            box-shadow: 0 0 20px rgba(0, 255, 65, 0.15);
+        }
+
+        .copy-section h3 {
+            font-size: 1.3rem;
+            margin-bottom: 1.5rem;
+            color: var(--accent-neon);
+            display: flex;
+            align-items: center;
+            gap: 0.7rem;
+        }
+
+        .copy-section h3::before {
+            content: '';
+            width: 4px;
+            height: 1.3rem;
+            background: linear-gradient(180deg, var(--accent-neon), var(--accent-gold));
+            border-radius: 2px;
+        }
+
+        .form-group {
+            margin-bottom: 1.5rem;
+        }
+
+        .form-group label {
+            display: block;
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: var(--text-secondary);
+            margin-bottom: 0.6rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .form-group input,
+        .form-group select {
+            width: 100%;
+            padding: 0.9rem 1rem;
+            background: var(--bg-primary);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            color: var(--text-primary);
+            font-family: 'Courier New', monospace;
+            font-size: 0.9rem;
+            transition: all 0.3s ease;
+        }
+
+        .form-group input:focus,
+        .form-group select:focus {
+            outline: none;
+            border-color: var(--accent-neon);
+            box-shadow: 0 0 12px rgba(0, 255, 65, 0.3);
+        }
+
+        .btn-primary {
+            width: 100%;
+            padding: 1rem;
+            background: linear-gradient(135deg, var(--accent-neon), #00dd3d);
+            border: none;
+            border-radius: 8px;
+            color: var(--bg-primary);
+            font-weight: 900;
+            font-size: 1rem;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 24px rgba(0, 255, 65, 0.4);
+        }
+
+        .btn-primary:active {
+            transform: translateY(0);
+        }
+
+        .btn-primary.disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .btn-danger {
+            background: linear-gradient(135deg, var(--accent-danger), #ff1a4d);
+            color: white;
+        }
+
+        .trade-history {
+            max-height: 500px;
+            overflow-y: auto;
+        }
+
+        .trade-item {
+            background: var(--bg-primary);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 1rem;
+            margin-bottom: 1rem;
+            transition: all 0.3s ease;
+        }
+
+        .trade-item:hover {
+            border-color: var(--accent-neon);
+            background: rgba(0, 255, 65, 0.05);
+        }
+
+        .trade-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 0.7rem;
+            font-weight: 700;
+        }
+
+        .trade-time {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+        }
+
+        .trade-status {
+            padding: 0.3rem 0.7rem;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 700;
+            text-transform: uppercase;
+        }
+
+        .status-pending { background: rgba(245, 158, 11, 0.2); color: var(--warning); }
+        .status-executed { background: rgba(16, 185, 129, 0.2); color: var(--success); }
+        .status-failed { background: rgba(255, 32, 80, 0.2); color: var(--accent-danger); }
+
+        .trade-details {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            line-height: 1.6;
+        }
+
+        .wallet-stats {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+            padding-bottom: 1.5rem;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .wallet-stat {
+            background: var(--bg-primary);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 1rem;
+            text-align: center;
+        }
+
+        .wallet-stat-label {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            margin-bottom: 0.5rem;
+        }
+
+        .wallet-stat-value {
+            font-size: 1.4rem;
+            font-weight: 900;
+            font-family: 'Courier New', monospace;
+            color: var(--accent-neon);
+        }
+
+        .monitoring-status {
+            display: flex;
+            align-items: center;
+            gap: 0.7rem;
+            padding: 1rem;
+            background: rgba(0, 255, 65, 0.1);
+            border: 1px solid var(--accent-neon);
+            border-radius: 8px;
+            margin-bottom: 1.5rem;
+            font-weight: 600;
+        }
+
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            background: var(--accent-neon);
+            border-radius: 50%;
+            animation: pulse 1.5s ease-in-out infinite;
+        }
+
+        .loading {
+            display: inline-block;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        /* ===== CHART TAB ===== */
+        .chart-container {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 2rem;
+            margin-bottom: 2rem;
+        }
+
+        canvas {
+            max-height: 400px;
+        }
+
+        /* ===== RESPONSIVE ===== */
+        @media (max-width: 768px) {
+            .header-container {
+                flex-direction: column;
+                gap: 1rem;
+            }
+
+            .market-ticker {
+                flex-direction: column;
+                gap: 0.5rem;
+            }
+
+            .scanner-container {
+                grid-template-columns: 1fr;
+            }
+
+            .signal-grid {
+                grid-template-columns: 1fr;
+            }
+
+            nav button {
+                padding: 0.8rem 1rem;
+                font-size: 0.8rem;
+            }
+
+            main {
+                padding: 1rem;
+            }
+        }
+
+        /* ===== SCROLLBAR ===== */
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: var(--bg-secondary);
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: var(--border-color);
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: var(--accent-neon);
+        }
+
+        /* ===== TOOLTIPS ===== */
+        .tooltip {
+            position: relative;
+            display: inline-block;
+        }
+
+        .tooltip .tooltiptext {
+            visibility: hidden;
+            background-color: var(--bg-tertiary);
+            border: 1px solid var(--accent-neon);
+            color: var(--accent-neon);
+            text-align: center;
+            border-radius: 6px;
+            padding: 0.5rem 0.8rem;
+            position: absolute;
+            z-index: 1;
+            bottom: 125%;
+            left: 50%;
+            margin-left: -60px;
+            opacity: 0;
+            transition: opacity 0.3s;
+            font-size: 0.75rem;
+            white-space: nowrap;
+        }
+
+        .tooltip:hover .tooltiptext {
+            visibility: visible;
+            opacity: 1;
+        }
+    </style>
+</head>
+<body>
+    <!-- HEADER -->
+    <header>
+        <div class="header-container">
+            <div class="logo-section">
+                <div class="logo-3d">
+                    <div class="logo-inner">
+                        <div class="logo-face">
+                            <img src="https://raw.githubusercontent.com/cryptobizmo2/SLAPBOT/main/logo.png" alt="BIG MOUF SLAPBOT" onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 200 200%22><circle cx=%22100%22 cy=%22100%22 r=%2295%22 fill=%22%23ffd700%22/><text x=%22100%22 y=%22110%22 font-size=%2240%22 font-weight=%22900%22 text-anchor=%22middle%22 fill=%22%23000%22>SLAP</text></svg>'">
+                        </div>
+                        <div class="logo-face">
+                            <img src="https://raw.githubusercontent.com/cryptobizmo2/SLAPBOT/main/logo.png" alt="BIG MOUF SLAPBOT" onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 200 200%22><circle cx=%22100%22 cy=%22100%22 r=%2295%22 fill=%22%23ff6b35%22/><text x=%22100%22 y=%22110%22 font-size=%2240%22 font-weight=%22900%22 text-anchor=%22middle%22 fill=%22%23000%22>BOT</text></svg>'">
+                        </div>
+                    </div>
+                </div>
+                <div class="brand-text">
+                    <h1>BIG MOUF SLAPBOT</h1>
+                    <p>Solana Trading Intelligence</p>
+                </div>
+            </div>
+            <div class="header-status">
+                <div class="market-ticker">
+                    <div class="ticker-item">
+                        <span class="ticker-label">ETH</span>
+                        <span class="ticker-value" id="eth-price">$0.00</span>
+                    </div>
+                    <div class="ticker-item">
+                        <span class="ticker-label">BTC</span>
+                        <span class="ticker-value" id="btc-price">$0.00</span>
+                    </div>
+                    <div class="ticker-item">
+                        <span class="ticker-label">RAY</span>
+                        <span class="ticker-value" id="ray-price">$0.00</span>
+                    </div>
+                </div>
+                <div class="live-indicator">
+                    <div class="live-dot"></div>
+                    <span>LIVE</span>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <!-- NAVIGATION -->
+    <nav>
+        <ul>
+            <li><button class="nav-btn active" data-tab="scanner">Scanner</button></li>
+            <li><button class="nav-btn" data-tab="copy">Copy Trading</button></li>
+            <li><button class="nav-btn" data-tab="chart">Chart</button></li>
+            <li><button class="nav-btn" data-tab="safety">Safety</button></li>
+            <li><button class="nav-btn" data-tab="paper">Paper Trading</button></li>
+            <li><button class="nav-btn" data-tab="settings">Settings</button></li>
+        </ul>
+    </nav>
+
+    <!-- MAIN CONTENT -->
+    <main>
+        <!-- SCANNER TAB -->
+        <section id="scanner" class="content-section active">
+            <div class="scanner-container">
+                <div class="stat-card">
+                    <div class="stat-label">Trading Pairs</div>
+                    <div class="stat-value" id="pair-count">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Buy Signals</div>
+                    <div class="stat-value up" id="buy-signal-count">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Sell Signals</div>
+                    <div class="stat-value down" id="sell-signal-count">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Volume > $1B</div>
+                    <div class="stat-value" id="volume-count">0</div>
+                </div>
+            </div>
+
+            <div class="signal-grid">
+                <div class="signal-table">
+                    <table id="signals-table">
+                        <thead>
+                            <tr>
+                                <th>Pair</th>
+                                <th>Price</th>
+                                <th>24h %</th>
+                                <th>RSI(14)</th>
+                                <th>Signal</th>
+                            </tr>
+                        </thead>
+                        <tbody id="table-body">
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        <!-- COPY TRADING TAB -->
+        <section id="copy" class="content-section">
+            <div class="copy-trading-container">
+                <!-- Left: Configuration -->
+                <div class="copy-section">
+                    <h3>Target Wallet Setup</h3>
+                    
+                    <div class="form-group">
+                        <label>Target Wallet Address</label>
+                        <input type="text" id="target-wallet" placeholder="Enter Solana wallet address to mirror..." spellcheck="false">
+                    </div>
+
+                    <div class="form-group">
+                        <label>Copy Factor (%)</label>
+                        <input type="number" id="copy-factor" value="100" min="1" max="500" placeholder="100">
+                    </div>
+
+                    <div class="form-group">
+                        <label>Max Trade Size (SOL)</label>
+                        <input type="number" id="max-trade-size" value="10" min="0.1" step="0.1">
+                    </div>
+
+                    <div class="form-group">
+                        <label>Slippage Tolerance (%)</label>
+                        <input type="number" id="slippage-tolerance" value="2" min="0.1" max="10" step="0.1">
+                    </div>
+
+                    <button class="btn-primary" id="start-copy-btn">Start Monitoring</button>
+                    <button class="btn-primary btn-danger" id="stop-copy-btn" style="margin-top: 0.8rem; display: none;">Stop Monitoring</button>
+
+                    <div id="monitoring-status" style="display: none; margin-top: 1.5rem;">
+                        <div class="monitoring-status">
+                            <div class="status-dot"></div>
+                            <span>Monitoring wallet for trades...</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Right: Trade History & Wallet Stats -->
+                <div class="copy-section">
+                    <h3>Wallet Activity</h3>
+                    
+                    <div class="wallet-stats" id="wallet-stats" style="display: none;">
+                        <div class="wallet-stat">
+                            <div class="wallet-stat-label">Target Balance</div>
+                            <div class="wallet-stat-value" id="target-balance">0 SOL</div>
+                        </div>
+                        <div class="wallet-stat">
+                            <div class="wallet-stat-label">Your Balance</div>
+                            <div class="wallet-stat-value" id="your-balance">0 SOL</div>
+                        </div>
+                        <div class="wallet-stat">
+                            <div class="wallet-stat-label">Copied Trades</div>
+                            <div class="wallet-stat-value" id="copied-count">0</div>
+                        </div>
+                        <div class="wallet-stat">
+                            <div class="wallet-stat-label">Win Rate</div>
+                            <div class="wallet-stat-value" id="win-rate">0%</div>
+                        </div>
+                    </div>
+
+                    <h3 style="margin-top: 1.5rem;">Recent Trades</h3>
+                    <div class="trade-history" id="trade-history">
+                        <div style="text-align: center; color: var(--text-secondary); padding: 2rem;">
+                            No trades yet
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- CHART TAB -->
+        <section id="chart" class="content-section">
+            <div class="chart-container">
+                <h3 style="margin-bottom: 1.5rem; color: var(--accent-neon);">Market Overview</h3>
+                <canvas id="priceChart"></canvas>
+            </div>
+        </section>
+
+        <!-- SAFETY TAB -->
+        <section id="safety" class="content-section">
+            <div class="signal-grid">
+                <div class="stat-card">
+                    <div class="stat-label">Frozen Tokens</div>
+                    <div class="stat-value" id="frozen-count">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Risky Mints</div>
+                    <div class="stat-value down" id="risky-count">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Safe Tokens</div>
+                    <div class="stat-value up" id="safe-count">0</div>
+                </div>
+            </div>
+            <div id="safety-table" class="signal-table" style="margin-top: 2rem;">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Token</th>
+                            <th>Mint Status</th>
+                            <th>Freeze Authority</th>
+                            <th>Risk Level</th>
+                        </tr>
+                    </thead>
+                    <tbody id="safety-body">
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <!-- PAPER TRADING TAB -->
+        <section id="paper" class="content-section">
+            <div class="copy-trading-container">
+                <div class="copy-section">
+                    <h3>Paper Trading</h3>
+                    <div class="form-group">
+                        <label>Starting Balance (SOL)</label>
+                        <input type="number" id="paper-balance" value="100" min="1">
+                    </div>
+                    <button class="btn-primary" id="reset-paper-btn">Reset Balance</button>
+                </div>
+                <div class="copy-section">
+                    <h3>Portfolio</h3>
+                    <div id="paper-portfolio" style="font-family: monospace; line-height: 1.8;">
+                        No positions yet
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- SETTINGS TAB -->
+        <section id="settings" class="content-section">
+            <div class="copy-section" style="max-width: 600px;">
+                <h3>Dashboard Settings</h3>
+                <div class="form-group">
+                    <label>Wallet Address</label>
+                    <input type="text" id="wallet-address" placeholder="Your Solana wallet" spellcheck="false">
+                </div>
+                <div class="form-group">
+                    <label>RPC Endpoint</label>
+                    <input type="text" id="rpc-endpoint" value="https://api.mainnet-beta.solana.com">
+                </div>
+                <button class="btn-primary" id="save-settings-btn">Save Settings</button>
+            </div>
+        </section>
+    </main>
+
+    <script>
+        const API_BASE = 'https://slapbot-backend-production.up.railway.app/api';
+
+        // ===== TAB SWITCHING =====
+        document.querySelectorAll('.nav-btn').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+                document.querySelectorAll('.content-section').forEach(s => s.classList.remove('active'));
+                
+                e.target.classList.add('active');
+                const tabId = e.target.dataset.tab;
+                document.getElementById(tabId).classList.add('active');
+            });
+        });
+
+        // ===== COPY TRADING CORE =====
+        let copyTradingActive = false;
+        let monitoringInterval = null;
+
+        document.getElementById('start-copy-btn').addEventListener('click', startCopyTrading);
+        document.getElementById('stop-copy-btn').addEventListener('click', stopCopyTrading);
+
+        async function startCopyTrading() {
+            const targetWallet = document.getElementById('target-wallet').value.trim();
+            
+            if (!targetWallet || targetWallet.length < 43) {
+                alert('Please enter a valid Solana wallet address');
+                return;
+            }
+
+            copyTradingActive = true;
+            document.getElementById('start-copy-btn').style.display = 'none';
+            document.getElementById('stop-copy-btn').style.display = 'block';
+            document.getElementById('monitoring-status').style.display = 'block';
+            document.getElementById('wallet-stats').style.display = 'grid';
+
+            // Fetch wallet trades and set up monitoring
+            monitorWalletTrades(targetWallet);
+            monitoringInterval = setInterval(() => monitorWalletTrades(targetWallet), 5000);
+        }
+
+        function stopCopyTrading() {
+            copyTradingActive = false;
+            if (monitoringInterval) clearInterval(monitoringInterval);
+            
+            document.getElementById('start-copy-btn').style.display = 'block';
+            document.getElementById('stop-copy-btn').style.display = 'none';
+            document.getElementById('monitoring-status').style.display = 'none';
+        }
+
+        async function monitorWalletTrades(wallet) {
+            try {
+                const res = await axios.get(`${API_BASE}/wallet-trades?wallet=${wallet}`);
+                const trades = res.data.trades || [];
+
+                updateTradeHistory(trades);
+                updateWalletStats(trades);
+            } catch (err) {
+                console.error('Error fetching wallet trades:', err);
+            }
+        }
+
+        function updateTradeHistory(trades) {
+            const container = document.getElementById('trade-history');
+            
+            if (trades.length === 0) {
+                container.innerHTML = '<div style="text-align: center; color: var(--text-secondary); padding: 2rem;">No trades detected</div>';
+                return;
+            }
+
+            container.innerHTML = trades.slice(0, 10).map(trade => `
+                <div class="trade-item">
+                    <div class="trade-header">
+                        <span>${trade.tokenSymbol || 'UNKNOWN'}</span>
+                        <span class="trade-status status-${trade.status}">${trade.status}</span>
+                    </div>
+                    <div class="trade-details">
+                        <div>Type: ${trade.type === 'buy' ? '🟢 BUY' : '🔴 SELL'}</div>
+                        <div>Amount: ${trade.amount} SOL</div>
+                        <div>Price: $${trade.price}</div>
+                        <div class="trade-time">${new Date(trade.timestamp).toLocaleString()}</div>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function updateWalletStats(trades) {
+            const buyTrades = trades.filter(t => t.type === 'buy').length;
+            const sellTrades = trades.filter(t => t.type === 'sell').length;
+            const winRate = buyTrades > 0 ? Math.round((sellTrades / buyTrades) * 100) : 0;
+
+            document.getElementById('copied-count').textContent = trades.length;
+            document.getElementById('win-rate').textContent = winRate + '%';
+        }
+
+        // ===== MARKET DATA =====
+        async function updateMarketData() {
+            try {
+                // Fetch top tokens and update scanner
+                const res = await axios.get(`${API_BASE}/health`);
+                
+                // Placeholder data for demo
+                document.getElementById('pair-count').textContent = '10';
+                document.getElementById('buy-signal-count').textContent = '5';
+                document.getElementById('sell-signal-count').textContent = '1';
+                document.getElementById('volume-count').textContent = '5';
+            } catch (err) {
+                console.error('Error fetching market data:', err);
+            }
+        }
+
+        // ===== INITIALIZATION =====
+        updateMarketData();
+        setInterval(updateMarketData, 30000);
+
+        // Load settings from localStorage
+        window.addEventListener('load', () => {
+            const savedWallet = localStorage.getItem('userWallet') || '';
+            document.getElementById('wallet-address').value = savedWallet;
+        });
+
+        document.getElementById('save-settings-btn').addEventListener('click', () => {
+            const wallet = document.getElementById('wallet-address').value;
+            localStorage.setItem('userWallet', wallet);
+            alert('Settings saved!');
+        });
+    </script>
+</body>
+</html>
