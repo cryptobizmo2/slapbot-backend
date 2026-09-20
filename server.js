@@ -19,6 +19,7 @@ const express = require("express");
 const cors = require("cors");
 const rateLimit = require("express-rate-limit");
 const { Connection, PublicKey } = require("@solana/web3.js");
+const { getAssociatedTokenAddress } = require("@solana/spl-token");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -253,8 +254,314 @@ app.get("/api/launches", async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════
+// ④ REVENUE — fee account for Jupiter platform fee on real swaps
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * GET /api/fee-account/:mint
+ * Returns the Associated Token Account (ATA) address for MY_WALLET that
+ * will receive your platform fee cut on every real swap in that token.
+ * The frontend calls this once per token and passes it to Jupiter's
+ * swap API as the `feeAccount` parameter.
+ *
+ * IMPORTANT: this ATA must actually exist on-chain to receive fees.
+ * If it doesn't exist yet for a given mint, the first fee-earning swap
+ * in that token may fail until the account is created (e.g. by
+ * receiving a small amount of that token once, or via a setup script).
+ */
+app.get("/api/fee-account/:mint", async (req, res) => {
+  const { mint } = req.params;
+  if (!MY_WALLET) return res.status(400).json({ error: "MY_WALLET not configured on server" });
+  try {
+    const mintPubkey = new PublicKey(mint);
+    const ownerPubkey = new PublicKey(MY_WALLET);
+    const ata = await getAssociatedTokenAddress(mintPubkey, ownerPubkey);
+    log("revenue", `Fee account for mint ${mint.slice(0,8)}... → ${ata.toBase58()}`);
+    res.json({ feeAccount: ata.toBase58(), owner: MY_WALLET, mint });
+  } catch (err) {
+    log("error", `fee-account failed for mint ${mint}: ${err.message}`);
+    res.status(400).json({ error: "Invalid mint address" });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// ⑤ COPY TRADING — watch a wallet, scale trade size proportionally
+// ═══════════════════════════════════════════════════════════════════════
+
+// Known token prices come from CoinGecko; mint → coingecko id, for portfolio valuation
+const KNOWN_TOKENS = {
+  "So11111111111111111111111111111111111111112": { sym: "SOL", cgId: "solana", decimals: 9 },
+  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": { sym: "USDC", cgId: "usd-coin", decimals: 6 },
+  "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R": { sym: "RAY", cgId: "raydium", decimals: 6 },
+  "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN": { sym: "JUP", cgId: "jupiter-exchange-solana", decimals: 6 },
+  "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263": { sym: "BONK", cgId: "bonk", decimals: 5 },
+  "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm": { sym: "WIF", cgId: "dogwifcoin", decimals: 6 },
+};
+
+let priceCache2 = { data: {}, ts: 0 };
+async function getPrices() {
+  const now = Date.now();
+  if (priceCache2.data && now - priceCache2.ts < 20000) return priceCache2.data;
+  const ids = [...new Set(Object.values(KNOWN_TOKENS).map((t) => t.cgId))].join(",");
+  const r = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd`);
+  const data = await r.json();
+  priceCache2 = { data, ts: now };
+  return data;
+}
+
+/**
+ * Computes a wallet's total portfolio value in USD across SOL + known SPL tokens.
+ * Unknown/exotic tokens are not priced (would need a full token-list + price feed)
+ * — this is a reasonable approximation, not a complete net-worth calculator.
+ */
+async function getWalletValueUSD(address) {
+  const pubkey = new PublicKey(address);
+  const [solBalance, tokenAccounts, prices] = await Promise.all([
+    connection.getBalance(pubkey),
+    connection.getParsedTokenAccountsByOwner(pubkey, { programId: new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA") }),
+    getPrices(),
+  ]);
+
+  const solUsd = (solBalance / 1e9) * (prices.solana?.usd || 0);
+  let tokenUsd = 0;
+  const holdings = [];
+
+  for (const acc of tokenAccounts.value) {
+    const info = acc.account.data.parsed.info;
+    const mint = info.mint;
+    const uiAmount = info.tokenAmount.uiAmount || 0;
+    if (uiAmount <= 0) continue;
+    const known = KNOWN_TOKENS[mint];
+    if (known) {
+      const usd = uiAmount * (prices[known.cgId]?.usd || 0);
+      tokenUsd += usd;
+      holdings.push({ mint, sym: known.sym, amount: uiAmount, usd });
+    } else {
+      holdings.push({ mint, sym: "?", amount: uiAmount, usd: 0 });
+    }
+  }
+
+  return {
+    address,
+    solBalance: solBalance / 1e9,
+    solUsd,
+    totalUsd: solUsd + tokenUsd,
+    holdings,
+  };
+}
+
+/**
+ * GET /api/wallet-value/:address
+ * Returns total portfolio value (USD) for any wallet — used to compute
+ * the proportional sizing ratio between a tracked wallet and your own.
+ */
+app.get("/api/wallet-value/:address", async (req, res) => {
+  try {
+    const result = await getWalletValueUSD(req.params.address);
+    log("copytrade", `Wallet ${req.params.address.slice(0, 6)}... valued at $${result.totalUsd.toFixed(2)}`);
+    res.json(result);
+  } catch (err) {
+    log("error", `wallet-value failed: ${err.message}`);
+    res.status(400).json({ error: "Invalid wallet address or RPC error" });
+  }
+});
+
+/**
+ * GET /api/wallet-swaps/:address?limit=15&minUsd=10
+ * Inspects a wallet's recent transactions and detects likely swaps by
+ * comparing pre/post token balances. Filters out anything below minUsd
+ * so dust transactions don't trigger copy-trade signals.
+ *
+ * This reads token balance deltas directly from transaction metadata —
+ * no external swap-parsing service required.
+ */
+app.get("/api/wallet-swaps/:address", async (req, res) => {
+  const { address } = req.params;
+  const limit = Math.min(parseInt(req.query.limit) || 15, 30);
+  const minUsd = parseFloat(req.query.minUsd) || 10;
+
+  try {
+    const pubkey = new PublicKey(address);
+    const prices = await getPrices();
+    const sigs = await connection.getSignaturesForAddress(pubkey, { limit });
+
+    const swaps = [];
+    for (const sigInfo of sigs) {
+      if (sigInfo.err) continue;
+      try {
+        const tx = await connection.getParsedTransaction(sigInfo.signature, { maxSupportedTransactionVersion: 0 });
+        if (!tx || !tx.meta) continue;
+
+        const preBal = tx.meta.preTokenBalances || [];
+        const postBal = tx.meta.postTokenBalances || [];
+        const ownerIdx = tx.transaction.message.accountKeys.findIndex((k) => k.pubkey.toBase58() === address);
+        if (ownerIdx === -1) continue;
+
+        // Find token balance changes for this specific owner
+        const changes = {};
+        for (const pb of preBal) {
+          if (pb.owner !== address) continue;
+          changes[pb.mint] = { pre: pb.uiTokenAmount.uiAmount || 0, post: 0 };
+        }
+        for (const pb of postBal) {
+          if (pb.owner !== address) continue;
+          if (!changes[pb.mint]) changes[pb.mint] = { pre: 0, post: 0 };
+          changes[pb.mint].post = pb.uiTokenAmount.uiAmount || 0;
+        }
+
+        // Also check native SOL delta for this account
+        const preSol = tx.meta.preBalances[ownerIdx] / 1e9;
+        const postSol = tx.meta.postBalances[ownerIdx] / 1e9;
+        const solDelta = postSol - preSol;
+
+        let sold = null, bought = null;
+        for (const [mint, c] of Object.entries(changes)) {
+          const delta = c.post - c.pre;
+          if (Math.abs(delta) < 1e-9) continue;
+          const known = KNOWN_TOKENS[mint];
+          const usd = known ? Math.abs(delta) * (prices[known.cgId]?.usd || 0) : 0;
+          if (delta < 0 && (!sold || usd > sold.usd)) sold = { mint, sym: known?.sym || "?", amount: Math.abs(delta), usd };
+          if (delta > 0 && (!bought || usd > bought.usd)) bought = { mint, sym: known?.sym || "?", amount: delta, usd };
+        }
+        // Fold in SOL side if it moved meaningfully and no SPL side captured it
+        if (Math.abs(solDelta) > 0.001) {
+          const usd = Math.abs(solDelta) * (prices.solana?.usd || 0);
+          if (solDelta < 0 && (!sold || usd > sold.usd)) sold = { mint: "SOL", sym: "SOL", amount: Math.abs(solDelta), usd };
+          if (solDelta > 0 && (!bought || usd > bought.usd)) bought = { mint: "SOL", sym: "SOL", amount: solDelta, usd };
+        }
+
+        if (sold && bought) {
+          const tradeUsd = Math.max(sold.usd, bought.usd);
+          if (tradeUsd >= minUsd) {
+            swaps.push({
+              signature: sigInfo.signature,
+              time: sigInfo.blockTime ? sigInfo.blockTime * 1000 : null,
+              sold, bought, tradeUsd,
+            });
+          }
+        }
+      } catch (txErr) {
+        continue; // skip unparseable transactions
+      }
+    }
+
+    log("copytrade", `Scanned ${sigs.length} txs for ${address.slice(0,6)}... → ${swaps.length} swap(s) above $${minUsd}`);
+    res.json({ address, swaps });
+  } catch (err) {
+    log("error", `wallet-swaps failed: ${err.message}`);
+    res.status(400).json({ error: "Invalid wallet address or RPC error" });
+  }
+});
+
+/**
+ * GET /api/copy-size?target=<wallet>&mine=<wallet>&tradeUsd=<n>
+ * The core proportional-sizing calculation:
+ *   yourSize = (tradeUsd / targetWalletTotalUsd) * yourWalletTotalUsd
+ * This keeps position sizing safe regardless of how large the tracked
+ * wallet is compared to yours.
+ */
+app.get("/api/copy-size", async (req, res) => {
+  const { target, mine, tradeUsd } = req.query;
+  if (!target || !mine || !tradeUsd) {
+    return res.status(400).json({ error: "target, mine, and tradeUsd query params required" });
+  }
+  try {
+    const [targetVal, mineVal] = await Promise.all([
+      getWalletValueUSD(target),
+      getWalletValueUSD(mine),
+    ]);
+    if (targetVal.totalUsd <= 0) {
+      return res.json({ yourSize: 0, ratio: 0, note: "Target wallet has no measurable value — cannot compute ratio" });
+    }
+    const ratio = parseFloat(tradeUsd) / targetVal.totalUsd;
+    const yourSize = ratio * mineVal.totalUsd;
+    log("copytrade", `Copy-size: target trade $${tradeUsd} (${(ratio*100).toFixed(2)}% of $${targetVal.totalUsd.toFixed(0)}) → your size $${yourSize.toFixed(2)}`);
+    res.json({
+      targetTotalUsd: targetVal.totalUsd,
+      yourTotalUsd: mineVal.totalUsd,
+      tradeUsd: parseFloat(tradeUsd),
+      ratioPct: ratio * 100,
+      yourSize: parseFloat(yourSize.toFixed(2)),
+    });
+  } catch (err) {
+    log("error", `copy-size failed: ${err.message}`);
+    res.status(400).json({ error: "Invalid wallet address or RPC error" });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
 // health check
 // ═══════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════
+// ⑥ DISCOVERY PROXY — real new/trending pools
+// ═══════════════════════════════════════════════════════════════════════
+/**
+ * Browsers cannot call GeckoTerminal or DexScreener's /token-boosts/*
+ * endpoints — those reject cross-origin requests (CORS), which is why the
+ * frontend could only ever do name-based text search and never found new
+ * launches. A server has no such restriction, so it fetches them here and
+ * re-serves the result to our own frontend with permissive headers.
+ *
+ *   GET /api/pools/new       → pools created most recently
+ *   GET /api/pools/trending  → highest current activity
+ */
+const poolCache = { new: { data: null, ts: 0 }, trending: { data: null, ts: 0 } };
+const POOL_TTL = 45_000;
+
+app.get("/api/pools/:type", async (req, res) => {
+  const type = req.params.type === "new" ? "new" : "trending";
+  const now = Date.now();
+  const hit = poolCache[type];
+  if (hit.data && now - hit.ts < POOL_TTL) return res.json(hit.data);
+
+  const endpoint = type === "new" ? "new_pools" : "trending_pools";
+
+  try {
+    const r = await fetch(
+      `https://api.geckoterminal.com/api/v2/networks/solana/${endpoint}?include=base_token`,
+      { headers: { accept: "application/json" } }
+    );
+    if (!r.ok) throw new Error(`GeckoTerminal ${r.status}`);
+    const raw = await r.json();
+
+    const included = raw.included || [];
+    const pools = (raw.data || []).map((p) => {
+      const a = p.attributes || {};
+      const btId = p.relationships?.base_token?.data?.id || "";
+      const bt = included.find((x) => x.id === btId);
+      const n = (v) => (Number.isFinite(+v) ? +v : 0);
+      const tx = a.transactions?.h24 || {};
+      const buys = n(tx.buys), sells = n(tx.sells);
+      return {
+        addr: (btId.split("_")[1]) || "",
+        pairAddress: a.address || "",
+        sym: bt?.attributes?.symbol || (a.name || "").split("/")[0].trim() || "?",
+        name: bt?.attributes?.name || "",
+        logo: bt?.attributes?.image_url || null,
+        price: n(a.base_token_price_usd),
+        ch1: n(a.price_change_percentage?.h1),
+        ch24: n(a.price_change_percentage?.h24),
+        vol: n(a.volume_usd?.h24),
+        liq: n(a.reserve_in_usd),
+        fdv: n(a.fdv_usd),
+        buys, sells,
+        txns: buys + sells,
+        createdAt: a.pool_created_at ? new Date(a.pool_created_at).getTime() : null,
+        dex: p.relationships?.dex?.data?.id || "",
+      };
+    }).filter((x) => x.addr && x.price > 0);
+
+    const payload = { source: "geckoterminal", type, count: pools.length, pools };
+    poolCache[type] = { data: payload, ts: now };
+    log("discovery", `${type}: ${pools.length} pools`);
+    res.json(payload);
+  } catch (err) {
+    log("error", `pool discovery (${type}) failed: ${err.message}`);
+    if (hit.data) return res.json(hit.data); // serve stale over failing
+    res.status(502).json({ error: err.message, pools: [] });
+  }
+});
+
 app.get("/api/health", (req, res) => {
   res.json({ status: "ok", mint: SLAPGOLD_MINT, minHold: MIN_HOLD_AMOUNT, time: new Date().toISOString() });
 });
