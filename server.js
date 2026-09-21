@@ -24,6 +24,13 @@ const { getAssociatedTokenAddress } = require("@solana/spl-token");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Railway terminates TLS at a single reverse proxy and forwards the real
+// client IP in X-Forwarded-For. Without this, req.ip is the PROXY's IP, so
+// every user on earth shares one rate-limit bucket — the limiter becomes
+// global and blocks everyone once it fills. Trust exactly ONE hop (not
+// 'true'), so a client can't forge its own IP to dodge the limit.
+app.set("trust proxy", 1);
+
 // ── config from environment (set these in Railway/Render dashboard) ───────
 const SOLANA_RPC_URL = process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
 const SLAPGOLD_MINT = process.env.SLAPGOLD_MINT; // e.g. 4R7Hbdhh3YeVqZaESRA3qPJ8Z3xh3Qedsw88RDjxL1Q9
@@ -42,9 +49,14 @@ const connection = new Connection(SOLANA_RPC_URL, "confirmed");
 app.use(cors({ origin: ALLOWED_ORIGIN }));
 app.use(express.json());
 
+// Per-user now (thanks to trust proxy). A live dashboard + armed Micro Bot
+// + scans legitimately runs ~10-20 req/min, so 30 left no headroom.
 const limiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 30,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => req.path === "/api/health",
   message: { error: "Rate limit exceeded. Slow down." },
 });
 app.use(limiter);
@@ -61,10 +73,25 @@ function log(type, msg) {
  * Also pulls top-10 holder concentration via getTokenLargestAccounts
  * (built into Solana RPC — no third-party API key required).
  */
+// Public Solana RPC can hang for 30s+ on getTokenLargestAccounts for tokens
+// with huge holder counts (e.g. BONK). Never let one slow call stall a scan.
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, rej) => setTimeout(() => rej(new Error(label + " timed out after " + ms + "ms")), ms)),
+  ]);
+}
+
+// Authority + holder data changes slowly — cache it so repeat scans are instant.
+const mintCache = new Map();
+const MINT_TTL = 5 * 60 * 1000;
+
 async function getMintCheck(address) {
+  const cached = mintCache.get(address);
+  if (cached && Date.now() - cached.ts < MINT_TTL) return cached.data;
   try {
     const mintPubkey = new PublicKey(address);
-    const info = await connection.getParsedAccountInfo(mintPubkey);
+    const info = await withTimeout(connection.getParsedAccountInfo(mintPubkey), 6000, "getParsedAccountInfo");
 
     if (!info.value || info.value.data.parsed?.type !== "mint") {
       return { error: "Not a valid SPL token mint", found: false };
@@ -77,7 +104,7 @@ async function getMintCheck(address) {
 
     let top10Pct = null;
     try {
-      const largest = await connection.getTokenLargestAccounts(mintPubkey);
+      const largest = await withTimeout(connection.getTokenLargestAccounts(mintPubkey), 5000, "getTokenLargestAccounts");
       const top10Sum = largest.value.slice(0, 10).reduce((s, acc) => s + (acc.uiAmount || 0), 0);
       top10Pct = supply > 0 ? (top10Sum / supply) * 100 : null;
     } catch (e) {
@@ -101,6 +128,8 @@ async function getMintCheck(address) {
     } else {
       log("audit", `${address.slice(0, 8)}... → mint:${result.mintAuthorityRenounced ? "renounced" : "ACTIVE"} top10:${result.top10HolderPct}%`);
     }
+    mintCache.set(address, { data: result, ts: Date.now() });
+    if (mintCache.size > 2000) mintCache.delete(mintCache.keys().next().value);
     return result;
   } catch (err) {
     log("error", `mint-check failed for ${address}: ${err.message}`);
@@ -558,6 +587,68 @@ app.get("/api/pools/:type", async (req, res) => {
   } catch (err) {
     log("error", `pool discovery (${type}) failed: ${err.message}`);
     if (hit.data) return res.json(hit.data); // serve stale over failing
+    res.status(502).json({ error: err.message, pools: [] });
+  }
+});
+
+/**
+ * GET /api/pools/dex/:dexId
+ * Pools from ONE specific launchpad/DEX. Lets the frontend separate
+ * pump.fun launches from Raydium LaunchLab launches (TEBFun and similar
+ * branded launchpads all settle on raydium-launchlab).
+ *
+ * Useful dexIds: pump-fun · pumpswap · raydium-launchlab · meteora-dbc
+ */
+const dexCache = {};
+app.get("/api/pools/dex/:dexId", async (req, res) => {
+  const dexId = String(req.params.dexId || "").replace(/[^a-z0-9-]/gi, "");
+  if (!dexId) return res.status(400).json({ error: "dexId required" });
+
+  const now = Date.now();
+  const hit = dexCache[dexId];
+  if (hit && now - hit.ts < POOL_TTL) return res.json(hit.data);
+
+  try {
+    const r = await fetch(
+      `https://api.geckoterminal.com/api/v2/networks/solana/dexes/${dexId}/pools?include=base_token&page=1`,
+      { headers: { accept: "application/json" } }
+    );
+    if (!r.ok) throw new Error(`GeckoTerminal ${r.status}`);
+    const raw = await r.json();
+    const included = raw.included || [];
+    const n = (v) => (Number.isFinite(+v) ? +v : 0);
+
+    const pools = (raw.data || []).map((p) => {
+      const a = p.attributes || {};
+      const btId = p.relationships?.base_token?.data?.id || "";
+      const bt = included.find((x) => x.id === btId);
+      const tx = a.transactions?.h24 || {};
+      const buys = n(tx.buys), sells = n(tx.sells);
+      return {
+        addr: (btId.split("_")[1]) || "",
+        pairAddress: a.address || "",
+        sym: bt?.attributes?.symbol || (a.name || "").split("/")[0].trim() || "?",
+        name: bt?.attributes?.name || "",
+        logo: bt?.attributes?.image_url || null,
+        price: n(a.base_token_price_usd),
+        ch1: n(a.price_change_percentage?.h1),
+        ch24: n(a.price_change_percentage?.h24),
+        vol: n(a.volume_usd?.h24),
+        liq: n(a.reserve_in_usd),
+        fdv: n(a.fdv_usd),
+        buys, sells, txns: buys + sells,
+        createdAt: a.pool_created_at ? new Date(a.pool_created_at).getTime() : null,
+        dex: dexId,
+      };
+    }).filter((x) => x.addr && x.price > 0);
+
+    const payload = { source: "geckoterminal", dex: dexId, count: pools.length, pools };
+    dexCache[dexId] = { data: payload, ts: now };
+    log("discovery", `${dexId}: ${pools.length} pools`);
+    res.json(payload);
+  } catch (err) {
+    log("error", `dex feed (${dexId}) failed: ${err.message}`);
+    if (hit) return res.json(hit.data);
     res.status(502).json({ error: err.message, pools: [] });
   }
 });
