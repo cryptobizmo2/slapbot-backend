@@ -926,7 +926,14 @@ app.get("/api/pools/dex/:dexId", async (req, res) => {
 });
 
 app.get("/api/health", (req, res) => {
-  res.json({ status: "ok", mint: SLAPGOLD_MINT, minHold: MIN_HOLD_AMOUNT, gateMint: GATE_MINT, gateMinHold: GATE_MIN_HOLD, time: new Date().toISOString() });
+  res.json({
+    status: "ok",
+    // What actually opens the Exclusive page:
+    exclusiveGate: { token: GATE_MINT, mustHold: GATE_MIN_HOLD },
+    // Legacy SLAP GOLD check — kept for the old /api/verify-holder endpoint only.
+    legacySlapGold: { token: SLAPGOLD_MINT, mustHold: MIN_HOLD_AMOUNT },
+    time: new Date().toISOString(),
+  });
 });
 
 app.listen(PORT, () => {
