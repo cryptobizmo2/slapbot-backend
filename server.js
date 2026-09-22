@@ -20,6 +20,7 @@ const cors = require("cors");
 const rateLimit = require("express-rate-limit");
 const { Connection, PublicKey } = require("@solana/web3.js");
 const { getAssociatedTokenAddress } = require("@solana/spl-token");
+const crypto = require("crypto");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -37,6 +38,16 @@ const SLAPGOLD_MINT = process.env.SLAPGOLD_MINT; // e.g. 4R7Hbdhh3YeVqZaESRA3qPJ
 const MY_WALLET = process.env.MY_WALLET;         // YOUR wallet address — the only one allowed in
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*"; // lock to your GitHub Pages URL once live
 const MIN_HOLD_AMOUNT = parseFloat(process.env.MIN_HOLD_AMOUNT || "1"); // min SLAP GOLD to unlock
+
+// ── Exclusive-page gate: which token opens it, and how much you must hold ──
+// Defaults to your main token. Change either one in Railway → Variables,
+// no code upload needed. Pump.fun tokens have ~1B supply, so hold "1" would
+// cost a fraction of a cent — set GATE_MIN_HOLD to a meaningful amount.
+const MAIN_TOKEN = "9pn9N3S3QQUfkWpDzw98Jags6eWeSyti42DvHAsmpump";
+let GATE_MINT = (process.env.GATE_MINT || MAIN_TOKEN).trim();
+try { new PublicKey(GATE_MINT); }
+catch { console.error(`[WARN] GATE_MINT "${GATE_MINT}" is not a valid address — using main token`); GATE_MINT = MAIN_TOKEN; }
+const GATE_MIN_HOLD = parseFloat(process.env.GATE_MIN_HOLD || "100000");
 
 if (!SLAPGOLD_MINT) {
   console.error("[FATAL] SLAPGOLD_MINT env var not set. Server cannot start.");
@@ -519,6 +530,267 @@ app.get("/api/copy-size", async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════
+// ⑦ HOLDER-GATED EXCLUSIVE — proof of ownership + live balance check
+// ═══════════════════════════════════════════════════════════════════════
+/**
+ * Why a signature: checking the balance of an address someone *types in*
+ * proves nothing — anyone could paste a whale's address. Signing a message
+ * proves they control the wallet. Signing is free, sends no transaction and
+ * cannot move funds.
+ *
+ * Why the data lives here: the site is a public GitHub repo, so anything
+ * "hidden" in the page can be read by anyone. Exclusive data is only ever
+ * handed to a valid, signed session.
+ *
+ * Uses only Node's built-in crypto (Ed25519 + HMAC) — no extra npm packages.
+ */
+
+// Base58 (the alphabet Solana uses for addresses)
+const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+function b58decode(str) {
+  if (typeof str !== "string" || !str.length) throw new Error("empty");
+  let n = 0n;
+  for (const ch of str) {
+    const v = B58.indexOf(ch);
+    if (v < 0) throw new Error("invalid base58");
+    n = n * 58n + BigInt(v);
+  }
+  let hex = n.toString(16);
+  if (hex.length % 2) hex = "0" + hex;
+  const body = n === 0n ? Buffer.alloc(0) : Buffer.from(hex, "hex");
+  let lead = 0;
+  for (const ch of str) { if (ch === "1") lead++; else break; }
+  return Buffer.concat([Buffer.alloc(lead), body]);
+}
+
+// A Solana address IS an Ed25519 public key. Wrap its 32 raw bytes in the
+// standard SPKI header so Node's crypto can verify signatures against it.
+const ED25519_SPKI = Buffer.from("302a300506032b6570032100", "hex");
+function verifySolanaSignature(walletB58, message, signatureB64) {
+  try {
+    const raw = b58decode(walletB58);
+    if (raw.length !== 32) return false;
+    const sig = Buffer.from(String(signatureB64 || ""), "base64");
+    if (sig.length !== 64) return false;
+    const key = crypto.createPublicKey({ key: Buffer.concat([ED25519_SPKI, raw]), format: "der", type: "spki" });
+    return crypto.verify(null, Buffer.from(message, "utf8"), key, sig);
+  } catch { return false; }
+}
+
+// Signed session passes (HMAC). Set SESSION_SECRET in Railway so passes
+// survive restarts; without it they reset and holders simply sign again.
+const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString("hex");
+if (!process.env.SESSION_SECRET) log("warn", "SESSION_SECRET not set — holder sessions reset on each restart");
+const SESSION_MS = 12 * 60 * 60 * 1000;
+
+function issuePass(wallet) {
+  const body = Buffer.from(JSON.stringify({ w: wallet, exp: Date.now() + SESSION_MS })).toString("base64url");
+  const mac = crypto.createHmac("sha256", SESSION_SECRET).update(body).digest("base64url");
+  return body + "." + mac;
+}
+function readPass(pass) {
+  if (typeof pass !== "string" || pass.split(".").length !== 2) return null;
+  const [body, mac] = pass.split(".");
+  const want = crypto.createHmac("sha256", SESSION_SECRET).update(body).digest("base64url");
+  const a = Buffer.from(mac), b = Buffer.from(want);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;   // tamper-proof
+  try {
+    const data = JSON.parse(Buffer.from(body, "base64url").toString());
+    return data.exp > Date.now() ? data : null;
+  } catch { return null; }
+}
+
+// One-time sign-in challenges, 5-minute lifetime
+const challenges = new Map();
+const CHALLENGE_MS = 5 * 60 * 1000;
+function challengeText(wallet, nonce) {
+  return "Sign in to SLAPBOT Exclusive\n\n" +
+         "Wallet: " + wallet + "\n" +
+         "Nonce: " + nonce + "\n\n" +
+         "This proves you own this wallet. It is free, sends no transaction, and cannot move your funds.";
+}
+
+// Live gate-token balance, cached 5 min per wallet
+const holderCache = new Map();
+const HOLDER_TTL = 5 * 60 * 1000;
+async function getHolderStatus(wallet) {
+  const hit = holderCache.get(wallet);
+  if (hit && Date.now() - hit.ts < HOLDER_TTL) return hit.data;
+  const accts = await withTimeout(
+    connection.getParsedTokenAccountsByOwner(new PublicKey(wallet), { mint: new PublicKey(GATE_MINT) }),
+    8000, "holder balance");
+  const balance = accts.value.reduce((s, a) => s + (a.account.data.parsed.info.tokenAmount.uiAmount || 0), 0);
+  const isOwner = !!MY_WALLET && wallet === MY_WALLET;   // base58 is case-sensitive: exact match only
+  const data = { balance, isOwner, minRequired: GATE_MIN_HOLD, authorized: isOwner || balance >= GATE_MIN_HOLD };
+  holderCache.set(wallet, { data, ts: Date.now() });
+  if (holderCache.size > 5000) holderCache.delete(holderCache.keys().next().value);
+  return data;
+}
+
+
+/**
+ * GET /api/gate — public: which token opens Exclusive, how much, and roughly
+ * what that's worth right now. Price is read live so the requirement always
+ * shows its real dollar value.
+ */
+let gateInfoCache = { data: null, ts: 0 };
+app.get("/api/gate", async (req, res) => {
+  if (gateInfoCache.data && Date.now() - gateInfoCache.ts < 60000) return res.json(gateInfoCache.data);
+  const base = { mint: GATE_MINT, minRequired: GATE_MIN_HOLD, symbol: null, name: null, logo: null, price: null, minUsd: null };
+  try {
+    const r = await withTimeout(fetch(`https://api.dexscreener.com/latest/dex/tokens/${GATE_MINT}`), 8000, "gate price");
+    const d = await r.json();
+    const pairs = (d.pairs || []).filter((p) => p.chainId === "solana");
+    if (pairs.length) {
+      const top = pairs.reduce((b, p) => ((p.liquidity?.usd || 0) > (b.liquidity?.usd || 0) ? p : b), pairs[0]);
+      const price = parseFloat(top.priceUsd || 0) || null;
+      Object.assign(base, { symbol: top.baseToken?.symbol || null, name: top.baseToken?.name || null,
+        logo: top.info?.imageUrl || null, price, minUsd: price ? +(price * GATE_MIN_HOLD).toFixed(2) : null });
+    }
+  } catch (err) { log("error", `gate info lookup failed: ${err.message}`); }
+  gateInfoCache = { data: base, ts: Date.now() };
+  res.json(base);
+});
+
+/** Step 1 — get a one-time message to sign */
+app.get("/api/auth/challenge", (req, res) => {
+  const wallet = String(req.query.wallet || "");
+  try { if (b58decode(wallet).length !== 32) throw 0; }
+  catch { return res.status(400).json({ error: "That isn't a valid Solana wallet address." }); }
+  const nonce = crypto.randomBytes(16).toString("hex");
+  challenges.set(wallet, { nonce, exp: Date.now() + CHALLENGE_MS });
+  if (challenges.size > 5000) challenges.delete(challenges.keys().next().value);
+  res.json({ message: challengeText(wallet, nonce) });
+});
+
+/** Step 2 — prove ownership, check balance, receive a pass */
+app.post("/api/auth/verify", async (req, res) => {
+  const { wallet, signature } = req.body || {};
+  const ch = challenges.get(wallet);
+  if (!ch || ch.exp < Date.now()) return res.status(400).json({ error: "Sign-in expired — please try again." });
+  challenges.delete(wallet);   // single use: blocks replay and brute-force
+  if (!verifySolanaSignature(wallet, challengeText(wallet, ch.nonce), signature)) {
+    log("access", `rejected signature for ${String(wallet).slice(0, 4)}…`);
+    return res.status(401).json({ error: "That signature doesn't match this wallet." });
+  }
+  let status;
+  try { status = await getHolderStatus(wallet); }
+  catch (err) {
+    log("error", `holder check failed: ${err.message}`);
+    // Never tell a real holder they're not one just because Solana was slow
+    return res.status(503).json({ error: "Couldn't reach Solana to check your balance. Please try again.", retry: true });
+  }
+  log("access", `${wallet.slice(0, 4)}…${wallet.slice(-4)} balance=${status.balance} authorized=${status.authorized}`);
+  if (!status.authorized) return res.status(403).json({ error: "Not enough tokens", ...status });
+  res.json({ pass: issuePass(wallet), ...status });
+});
+
+/** Guard for every exclusive endpoint — re-checks the balance on each visit */
+async function requireHolder(req, res, next) {
+  const h = req.headers.authorization || "";
+  const data = readPass(h.startsWith("Bearer ") ? h.slice(7) : "");
+  if (!data) return res.status(401).json({ error: "Please sign in." });
+  try {
+    const status = await getHolderStatus(data.w);
+    if (!status.authorized) return res.status(403).json({ error: "You no longer hold enough to access Exclusive.", ...status });
+    req.holder = { wallet: data.w, ...status };
+  } catch {
+    // Solana unreachable: they already proved holding at sign-in, so let them in
+    req.holder = { wallet: data.w, degraded: true };
+  }
+  next();
+}
+
+/** Who am I — lets the page show the holder badge */
+app.get("/api/exclusive/me", requireHolder, (req, res) => res.json(req.holder));
+
+// Shared GeckoTerminal pool mapper for the exclusive feed
+const NOISE = new Set(["SOL","WSOL","USDC","USDT","USD1","USDE","PYUSD","USDS","STSOL","MSOL","JITOSOL","JUPSOL","BSOL","INF","HSOL","JSOL","LST"]);
+function mapGecko(raw) {
+  const inc = raw.included || [];
+  const n = (v) => (Number.isFinite(+v) ? +v : 0);
+  return (raw.data || []).map((p) => {
+    const a = p.attributes || {};
+    const btId = p.relationships?.base_token?.data?.id || "";
+    const bt = inc.find((x) => x.id === btId);
+    const tx = a.transactions?.h24 || {};
+    const buys = n(tx.buys), sells = n(tx.sells);
+    return {
+      addr: btId.split("_")[1] || "", pairAddress: a.address || "",
+      sym: bt?.attributes?.symbol || (a.name || "").split("/")[0].trim() || "?",
+      name: bt?.attributes?.name || "", logo: bt?.attributes?.image_url || null,
+      price: n(a.base_token_price_usd), ch1: n(a.price_change_percentage?.h1), ch24: n(a.price_change_percentage?.h24),
+      vol: n(a.volume_usd?.h24), liq: n(a.reserve_in_usd), fdv: n(a.fdv_usd),
+      buys, sells, txns: buys + sells,
+      createdAt: a.pool_created_at ? new Date(a.pool_created_at).getTime() : null,
+      dex: p.relationships?.dex?.data?.id || "",
+    };
+  }).filter((x) => x.addr && x.price > 0 && !NOISE.has(String(x.sym).toUpperCase()) && !String(x.sym).includes("-"));
+}
+async function geckoFeed(kind) {
+  const r = await withTimeout(fetch(
+    `https://api.geckoterminal.com/api/v2/networks/solana/${kind}?include=base_token`,
+    { headers: { accept: "application/json" } }), 10000, kind);
+  if (!r.ok) throw new Error(`GeckoTerminal ${r.status}`);
+  return mapGecko(await r.json());
+}
+
+/**
+ * GET /api/exclusive/picks — the holder-only feed
+ *   verified: fresh launches that PASSED on-chain safety
+ *             (mint revoked, freeze revoked, top-10 wallets under 60%)
+ *   momentum: trending tokens with rising price and strong buy pressure
+ * Computed once a minute and shared, so holders never trigger RPC storms.
+ */
+let picksCache = { data: null, ts: 0 };
+const PICKS_TTL = 60 * 1000;
+app.get("/api/exclusive/picks", requireHolder, async (req, res) => {
+  if (picksCache.data && Date.now() - picksCache.ts < PICKS_TTL) return res.json(picksCache.data);
+  try {
+    const [fresh, trending] = await Promise.all([
+      geckoFeed("new_pools").catch(() => []),
+      geckoFeed("trending_pools").catch(() => []),
+    ]);
+
+    // Cheap gates first, then the expensive on-chain check on the best few
+    const seen = new Set();
+    const candidates = [...fresh, ...trending]
+      .filter((p) => p.liq >= 3000 && p.txns >= 20 && !seen.has(p.addr) && seen.add(p.addr))
+      .sort((a, b) => b.vol - a.vol)
+      .slice(0, 14);
+
+    const checks = await Promise.allSettled(candidates.map((p) => getMintCheck(p.addr)));
+    let checked = 0;
+    const verified = [];
+    candidates.forEach((p, i) => {
+      const c = checks[i].status === "fulfilled" ? checks[i].value : null;
+      if (!c || !c.found) return;
+      checked++;
+      const safe = c.mintAuthorityRenounced && c.freezeAuthorityRenounced &&
+                   (c.top10HolderPct == null || c.top10HolderPct < 60);
+      if (safe) verified.push({ ...p, top10: c.top10HolderPct,
+        buyPct: p.txns ? Math.round((p.buys / p.txns) * 100) : 50 });
+    });
+
+    const momentum = trending
+      .filter((p) => p.liq >= 10000 && p.txns >= 100 && p.ch1 > 0 && p.txns && p.buys / p.txns >= 0.55)
+      .map((p) => ({ ...p, buyPct: Math.round((p.buys / p.txns) * 100) }))
+      .sort((a, b) => b.ch1 - a.ch1)
+      .slice(0, 12);
+
+    const payload = { updated: Date.now(), verified: verified.slice(0, 12), momentum,
+                      checked, candidates: candidates.length };
+    picksCache = { data: payload, ts: Date.now() };
+    log("exclusive", `picks: ${verified.length} verified of ${checked} checked, ${momentum.length} momentum`);
+    res.json(payload);
+  } catch (err) {
+    log("error", `picks failed: ${err.message}`);
+    if (picksCache.data) return res.json(picksCache.data);
+    res.status(502).json({ error: "Couldn't build picks right now. Try again shortly." });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
 // health check
 // ═══════════════════════════════════════════════════════════════════════
 // ═══════════════════════════════════════════════════════════════════════
@@ -654,11 +926,12 @@ app.get("/api/pools/dex/:dexId", async (req, res) => {
 });
 
 app.get("/api/health", (req, res) => {
-  res.json({ status: "ok", mint: SLAPGOLD_MINT, minHold: MIN_HOLD_AMOUNT, time: new Date().toISOString() });
+  res.json({ status: "ok", mint: SLAPGOLD_MINT, minHold: MIN_HOLD_AMOUNT, gateMint: GATE_MINT, gateMinHold: GATE_MIN_HOLD, time: new Date().toISOString() });
 });
 
 app.listen(PORT, () => {
   log("init", `BIG MOUF SLAPBOT backend running on port ${PORT}`);
   log("init", `Gating on mint: ${SLAPGOLD_MINT}`);
   log("init", `Min hold to unlock: ${MIN_HOLD_AMOUNT} SLAP GOLD`);
+  log("init", `Exclusive gate: hold ${GATE_MIN_HOLD} of ${GATE_MINT}`);
 });
