@@ -46,7 +46,18 @@ const MAIN_TOKEN = "9pn9N3S3QQUfkWpDzw98Jags6eWeSyti42DvHAsmpump";
 let GATE_MINT = (process.env.GATE_MINT || MAIN_TOKEN).trim();
 try { new PublicKey(GATE_MINT); }
 catch { console.error(`[WARN] GATE_MINT "${GATE_MINT}" is not a valid address — using main token`); GATE_MINT = MAIN_TOKEN; }
-const GATE_MIN_HOLD = parseFloat(process.env.GATE_MIN_HOLD || "100000");
+// Holder Key fallback: used ONLY when the live price can't be read
+const GATE_MIN_HOLD = parseFloat(process.env.GATE_MIN_HOLD || "1000000");
+
+// ── Two keys to Exclusive — either one opens it ──
+//  🥇 Gold Key   hold GOLD_MIN_HOLD of the scarce $SLAPGOLD (10,000 exist → 2,000 keys at 5 each)
+//  🔑 Holder Key hold GATE_MIN_USD dollars of the main token. Pegged to dollars because a meme
+//                coin's price swings — a fixed count would cost $250 one month and pennies the next.
+let GOLD_MINT = (process.env.GOLD_MINT || SLAPGOLD_MINT).trim();
+try { new PublicKey(GOLD_MINT); } catch { console.error(`[WARN] GOLD_MINT invalid — using SLAPGOLD_MINT`); GOLD_MINT = SLAPGOLD_MINT; }
+const GOLD_MIN_HOLD = parseFloat(process.env.GOLD_MIN_HOLD || "5");
+const GATE_MIN_USD = parseFloat(process.env.GATE_MIN_USD || "25");
+if (GATE_MINT === GOLD_MINT) console.error("[WARN] GATE_MINT equals GOLD_MINT — both keys use one token; remove GATE_MINT to use the main token");
 
 if (!SLAPGOLD_MINT) {
   console.error("[FATAL] SLAPGOLD_MINT env var not set. Server cannot start.");
@@ -301,15 +312,31 @@ function challengeText(wallet, nonce) {
 // Live gate-token balance, cached 5 min per wallet
 const holderCache = new Map();
 const HOLDER_TTL = 5 * 60 * 1000;
+/** Pure: who gets in, and how close everyone else is. */
+function decideAccess({ goldBal, mainBal, price, isOwner }) {
+  const gold = { balance: goldBal, need: GOLD_MIN_HOLD, ok: goldBal != null && goldBal >= GOLD_MIN_HOLD };
+  const key = price
+    ? { balance: mainBal, valueUsd: mainBal != null ? +(mainBal * price).toFixed(2) : null, needUsd: GATE_MIN_USD,
+        need: Math.ceil(GATE_MIN_USD / price), ok: mainBal != null && mainBal * price >= GATE_MIN_USD }
+    : { balance: mainBal, valueUsd: null, needUsd: GATE_MIN_USD, need: GATE_MIN_HOLD, priceUnavailable: true,
+        ok: mainBal != null && mainBal >= GATE_MIN_HOLD };
+  return { isOwner: !!isOwner, gold, key, authorized: !!isOwner || gold.ok || key.ok,
+           balance: mainBal ?? 0, minRequired: key.need };          // older pages read these two
+}
+async function balanceOf(wallet, mint) {
+  const accts = await withTimeout(
+    connection.getParsedTokenAccountsByOwner(new PublicKey(wallet), { mint: new PublicKey(mint) }), 8000, "holder balance");
+  return accts.value.reduce((s, a) => s + (a.account.data.parsed.info.tokenAmount.uiAmount || 0), 0);
+}
 async function getHolderStatus(wallet) {
   const hit = holderCache.get(wallet);
   if (hit && Date.now() - hit.ts < HOLDER_TTL) return hit.data;
-  const accts = await withTimeout(
-    connection.getParsedTokenAccountsByOwner(new PublicKey(wallet), { mint: new PublicKey(GATE_MINT) }),
-    8000, "holder balance");
-  const balance = accts.value.reduce((s, a) => s + (a.account.data.parsed.info.tokenAmount.uiAmount || 0), 0);
   const isOwner = !!MY_WALLET && wallet === MY_WALLET;   // base58 is case-sensitive: exact match only
-  const data = { balance, isOwner, minRequired: GATE_MIN_HOLD, authorized: isOwner || balance >= GATE_MIN_HOLD };
+  const [g, m, p] = await Promise.allSettled([balanceOf(wallet, GOLD_MINT), balanceOf(wallet, GATE_MINT), tokenPriceUsd(GATE_MINT)]);
+  const goldBal = g.status === "fulfilled" ? g.value : null, mainBal = m.status === "fulfilled" ? m.value : null;
+  const data = decideAccess({ goldBal, mainBal, price: p.status === "fulfilled" ? p.value.v : null, isOwner });
+  // Never tell a real holder they don't hold just because a lookup failed
+  if (!data.authorized && (goldBal == null || mainBal == null)) throw new Error("balance lookup failed");
   holderCache.set(wallet, { data, ts: Date.now() });
   if (holderCache.size > 5000) holderCache.delete(holderCache.keys().next().value);
   return data;
@@ -317,27 +344,64 @@ async function getHolderStatus(wallet) {
 
 
 /**
- * GET /api/gate — public: which token opens Exclusive, how much, and roughly
- * what that's worth right now. Price is read live so the requirement always
- * shows its real dollar value.
+ * Trusted USD price for a Solana token. Same rules as the scanner: the token must be
+ * the BASE side, the reference price comes from pools against real assets (by address),
+ * outliers are dropped, THEN the deepest pool wins. Not on a DEX yet → read the
+ * pump.fun bonding curve on-chain. Cached 60 s.
+ */
+const REAL_QUOTES = new Set(["So11111111111111111111111111111111111111112",
+  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"]);
+function trustedDexPair(pairs, mint) {
+  const base = (pairs || []).filter((p) => p.chainId === "solana" && p.baseToken?.address === mint && +p.priceUsd > 0);
+  if (!base.length) return null;
+  const liquid = base.filter((p) => (+p.liquidity?.usd || 0) >= 1000), pool = liquid.length ? liquid : base;
+  const real = (p) => REAL_QUOTES.has(p.quoteToken?.address);
+  const ref = (pool.some(real) ? pool.filter(real) : pool).map((p) => +p.priceUsd).sort((x, y) => x - y);
+  const med = ref[Math.floor((ref.length - 1) / 2)];
+  const sane = pool.filter((p) => { const r = +p.priceUsd / med; return r >= 0.67 && r <= 1.5; });
+  const cands = sane.some(real) ? sane.filter(real) : (sane.length ? sane : pool);
+  return cands.reduce((best, p) => ((+p.liquidity?.usd || 0) > (+best.liquidity?.usd || 0) ? p : best), cands[0]);
+}
+const usdCache = new Map();
+async function tokenPriceUsd(mint) {
+  const hit = usdCache.get(mint);
+  if (hit && Date.now() - hit.ts < 60000) return hit;
+  let v = null, info = {};
+  try {
+    const d = await (await withTimeout(fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`), 8000, "price")).json();
+    const top = trustedDexPair(d.pairs, mint);
+    if (top) { v = +top.priceUsd; info = { symbol: top.baseToken?.symbol || null, name: top.baseToken?.name || null, logo: top.info?.imageUrl || null }; }
+  } catch {}
+  if (!v) { try { const c = await readBondingCurve(mint); if (c && !c.complete) v = curveMarket(c, await getSolUsd(), 6).price; } catch {} }
+  if (!info.symbol) { try { const md = await readMetadata(mint); if (md) info = { ...info, symbol: md.symbol, name: md.name }; } catch {} }
+  const out = { v: v > 0 ? v : null, info, ts: Date.now() };
+  usdCache.set(mint, out);
+  return out;
+}
+
+/**
+ * GET /api/gate — public: the two keys, what each costs right now, and how many
+ * Gold Keys can ever exist (from real on-chain supply — burns lower it honestly).
  */
 let gateInfoCache = { data: null, ts: 0 };
 app.get("/api/gate", async (req, res) => {
   if (gateInfoCache.data && Date.now() - gateInfoCache.ts < 60000) return res.json(gateInfoCache.data);
-  const base = { mint: GATE_MINT, minRequired: GATE_MIN_HOLD, symbol: null, name: null, logo: null, price: null, minUsd: null };
-  try {
-    const r = await withTimeout(fetch(`https://api.dexscreener.com/latest/dex/tokens/${GATE_MINT}`), 8000, "gate price");
-    const d = await r.json();
-    const pairs = (d.pairs || []).filter((p) => p.chainId === "solana");
-    if (pairs.length) {
-      const top = pairs.reduce((b, p) => ((p.liquidity?.usd || 0) > (b.liquidity?.usd || 0) ? p : b), pairs[0]);
-      const price = parseFloat(top.priceUsd || 0) || null;
-      Object.assign(base, { symbol: top.baseToken?.symbol || null, name: top.baseToken?.name || null,
-        logo: top.info?.imageUrl || null, price, minUsd: price ? +(price * GATE_MIN_HOLD).toFixed(2) : null });
-    }
-  } catch (err) { log("error", `gate info lookup failed: ${err.message}`); }
-  gateInfoCache = { data: base, ts: Date.now() };
-  res.json(base);
+  const [gold, main, goldChain] = await Promise.all([
+    tokenPriceUsd(GOLD_MINT), tokenPriceUsd(GATE_MINT), getMintCheck(GOLD_MINT).catch(() => null)]);
+  const supply = goldChain && goldChain.found ? goldChain.supply : null;
+  const keyNeed = main.v ? Math.ceil(GATE_MIN_USD / main.v) : GATE_MIN_HOLD;
+  const out = {
+    gold: { mint: GOLD_MINT, symbol: gold.info.symbol || "SLAPGOLD", need: GOLD_MIN_HOLD, price: gold.v,
+            needUsd: gold.v ? +(gold.v * GOLD_MIN_HOLD).toFixed(2) : null, supply,
+            maxKeys: supply ? Math.floor(supply / GOLD_MIN_HOLD) : null },
+    key: { mint: GATE_MINT, symbol: main.info.symbol || null, name: main.info.name || null, needUsd: GATE_MIN_USD,
+           price: main.v, need: keyNeed, priceUnavailable: !main.v },
+    // older pages read these
+    mint: GATE_MINT, symbol: main.info.symbol || null, name: main.info.name || null, logo: main.info.logo || null,
+    price: main.v, minRequired: keyNeed, minUsd: main.v ? GATE_MIN_USD : null,
+  };
+  gateInfoCache = { data: out, ts: Date.now() };
+  res.json(out);
 });
 
 /** Step 1 — get a one-time message to sign */
@@ -1050,7 +1114,7 @@ app.get("/api/health", (req, res) => {
   res.json({
     status: "ok",
     // What actually opens the Exclusive page:
-    exclusiveGate: { token: GATE_MINT, mustHold: GATE_MIN_HOLD },
+    exclusiveGate: { goldKey: { token: GOLD_MINT, hold: GOLD_MIN_HOLD }, holderKey: { token: GATE_MINT, holdUsd: GATE_MIN_USD } },
     time: new Date().toISOString(),
   });
 });
@@ -1072,5 +1136,5 @@ app.listen(PORT, () => {
   log("init", `BIG MOUF SLAPBOT backend running on port ${PORT}`);
   if (ALLOWED_ORIGINS.includes("*")) log("warn", "ALLOWED_ORIGIN is * — any website can call this API. Set it to your site URL.");
   if (process.env.SESSION_SECRET && process.env.SESSION_SECRET.length < 32) log("warn", "SESSION_SECRET is short — use 32+ random characters.");
-  log("init", `Exclusive gate: hold ${GATE_MIN_HOLD} of ${GATE_MINT}`);
+  log("init", `Exclusive: Gold Key = ${GOLD_MIN_HOLD} of ${GOLD_MINT} · Holder Key = $${GATE_MIN_USD} of ${GATE_MINT}`);
 });
