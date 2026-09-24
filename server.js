@@ -574,7 +574,7 @@ app.get("/api/token/:mint", async (req, res) => {
   if (hit && Date.now() - hit.ts < 30000) return res.json(hit.data);
 
   const [poolsR, curveR, metaR, chainR] = await Promise.allSettled([
-    gecko(`/tokens/${mint}/pools?include=base_token&page=1`),
+    gecko(`/tokens/${mint}/pools?include=base_token,quote_token&page=1`),
     readBondingCurve(mint),
     readMetadata(mint),
     getMintCheck(mint),
@@ -593,26 +593,52 @@ app.get("/api/token/:mint", async (req, res) => {
     onchainOk: !!chain?.found,
   };
 
-  // Graduated / indexed: the most liquid pool wins
+  // Graduated / indexed. "Biggest pool wins" is exploitable: junk pools pair a real
+  // token against a self-priced coin to fake liquidity and a garbage price. So the
+  // token must be on the BASE side, the reference price comes from pools against real
+  // assets (SOL / USDC / USDT, by address), outliers are dropped, THEN deepest wins.
   if (poolsR.status === "fulfilled") {
-    const raw = poolsR.value, inc = raw.included || [];
-    const pools = (raw.data || []).slice().sort((a, b) => n(b.attributes?.reserve_in_usd) - n(a.attributes?.reserve_in_usd));
-    const top = pools[0];
+    const raw = poolsR.value, inc = raw.included || [], me = "solana_" + mint;
+    const REAL = new Set(["solana_So11111111111111111111111111111111111111112",
+      "solana_EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "solana_Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"]);
+    const rel = (x, k) => x.relationships?.[k]?.data?.id;
+    const pick = (list, priceOf, otherKey) => {
+      if (!list.length) return null;
+      const liquid = list.filter((x) => n(x.attributes?.reserve_in_usd) >= 1000), pool = liquid.length ? liquid : list;
+      const real = (x) => REAL.has(rel(x, otherKey));
+      const ref = pool.filter(real).length ? pool.filter(real) : pool;
+      const sorted = ref.map(priceOf).sort((q, w) => q - w), med = sorted[Math.floor((sorted.length - 1) / 2)];
+      const sane = pool.filter((x) => { const r = priceOf(x) / med; return r >= 0.67 && r <= 1.5; });
+      const cands = sane.some(real) ? sane.filter(real) : (sane.length ? sane : pool);
+      return cands.reduce((best, x) => n(x.attributes?.reserve_in_usd) > n(best.attributes?.reserve_in_usd) ? x : best, cands[0]);
+    };
+    const all = raw.data || [];
+    let side = "base";
+    let top = pick(all.filter((x) => rel(x, "base_token") === me && n(x.attributes?.base_token_price_usd) > 0),
+                   (x) => n(x.attributes.base_token_price_usd), "quote_token");
+    if (!top) {
+      side = "quote";       // only trades as the quote coin
+      top = pick(all.filter((x) => rel(x, "quote_token") === me && n(x.attributes?.quote_token_price_usd) > 0),
+                 (x) => n(x.attributes.quote_token_price_usd), "base_token");
+    }
     if (top) {
-      const a = top.attributes || {}, tx = a.transactions?.h24 || {};
-      const bt = inc.find((x) => x.id === top.relationships?.base_token?.data?.id);
+      const a = top.attributes || {}, tx = a.transactions?.h24 || {}, buys = n(tx.buys), sells = n(tx.sells);
+      const tok = inc.find((x) => x.id === me);
       Object.assign(p, {
-        source: "pool", poolAddress: a.address || null, dex: top.relationships?.dex?.data?.id || null,
-        price: n(a.base_token_price_usd), ch1: n(a.price_change_percentage?.h1), ch24: n(a.price_change_percentage?.h24),
+        source: "pool", side, poolAddress: a.address || null, dex: rel(top, "dex") || null,
+        price: side === "base" ? n(a.base_token_price_usd) : n(a.quote_token_price_usd),
+        // the pool's % change and market cap describe its BASE coin — only valid when that's us
+        ch1: side === "base" ? n(a.price_change_percentage?.h1) : null,
+        ch24: side === "base" ? n(a.price_change_percentage?.h24) : null,
+        mcap: side === "base" ? (n(a.market_cap_usd) || n(a.fdv_usd) || null) : null,
         vol24: n(a.volume_usd?.h24), liq: n(a.reserve_in_usd),
-        mcap: n(a.market_cap_usd) || n(a.fdv_usd) || null,
-        buys24: n(tx.buys), sells24: n(tx.sells), txns24: n(tx.buys) + n(tx.sells),
+        buys24: side === "base" ? buys : sells, sells24: side === "base" ? sells : buys, txns24: buys + sells,
         createdAt: a.pool_created_at ? new Date(a.pool_created_at).getTime() : null,
       });
-      if (bt?.attributes) {
-        p.symbol = p.symbol || bt.attributes.symbol || null;
-        p.name = p.name || bt.attributes.name || null;
-        p.logo = bt.attributes.image_url || null;
+      if (tok?.attributes) {
+        p.symbol = p.symbol || tok.attributes.symbol || null;
+        p.name = p.name || tok.attributes.name || null;
+        p.logo = tok.attributes.image_url || null;
       }
     }
   }
@@ -624,6 +650,11 @@ app.get("/api/token/:mint", async (req, res) => {
       p.curve = { progress: m.progress, complete: false, address: curve.curve };
       if (p.source === "none") Object.assign(p, { source: "curve", price: m.price, mcap: m.mcap, liq: m.liq, dex: "pump.fun curve" });
     } catch (err) { log("error", `curve pricing failed for ${mint}: ${err.message}`); }
+  }
+
+  if (p.price > 0 && p.supply > 0) {
+    const ceiling = p.price * p.supply;
+    if (p.mcap == null || p.mcap > ceiling * 1.02) p.mcap = ceiling;
   }
 
   // Logo from the token's own metadata file, if nobody indexed one
@@ -645,13 +676,14 @@ app.get("/api/chart/:pool", async (req, res) => {
   const chain = String(req.query.chain || "solana").toLowerCase();
   if (!DEX_CHAINS.includes(chain)) return res.status(400).json({ error: "Unknown chain" });
   if (!POOL_ADDR.test(pool)) return res.status(400).json({ error: "Invalid pool" });
-  const key = chain + pool + tf, hit = chartCache.get(key);
+  const side = req.query.side === "quote" ? "quote" : "base";
+  const key = chain + pool + tf + side, hit = chartCache.get(key);
   if (hit && Date.now() - hit.ts < 20000) return res.json(hit.data);
   try {
     const [unit, agg] = TF[tf];
     const gid = await resolveGecko(chain);
     if (!gid) return res.status(404).json({ error: "Charts aren't available for this chain yet." });
-    const d = await geckoAny(`/networks/${gid}/pools/${pool}/ohlcv/${unit}?aggregate=${agg}&limit=120&currency=usd`);
+    const d = await geckoAny(`/networks/${gid}/pools/${pool}/ohlcv/${unit}?aggregate=${agg}&limit=120&currency=usd&token=${side}`);
     const candles = (d?.data?.attributes?.ohlcv_list || [])
       .map(([t, o, h, l, c, v]) => ({ t: +t, o: +o, h: +h, l: +l, c: +c, v: +v }))
       .filter((k) => k.t > 0 && k.c > 0).sort((a, b) => a.t - b.t);
