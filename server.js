@@ -19,7 +19,6 @@ const express = require("express");
 const cors = require("cors");
 const rateLimit = require("express-rate-limit");
 const { Connection, PublicKey } = require("@solana/web3.js");
-const { getAssociatedTokenAddress } = require("@solana/spl-token");
 const crypto = require("crypto");
 
 const app = express();
@@ -57,8 +56,32 @@ if (!SLAPGOLD_MINT) {
 const connection = new Connection(SOLANA_RPC_URL, "confirmed");
 
 // ── middleware ──────────────────────────────────────────────────────────
-app.use(cors({ origin: ALLOWED_ORIGIN }));
-app.use(express.json());
+// ── Security hardening ──────────────────────────────────────────────────
+app.disable("x-powered-by");                      // don't advertise the framework
+
+/** This server only ever returns JSON, so lock browsers down accordingly. */
+function securityHeaders(req, res, next) {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'");
+  res.setHeader("Permissions-Policy", "geolocation=(), camera=(), microphone=()");
+  res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  if (req.path.startsWith("/api/auth") || req.path.startsWith("/api/exclusive")) res.setHeader("Cache-Control", "no-store");
+  next();
+}
+app.use(securityHeaders);
+
+// CORS allowlist — comma-separated, e.g. "https://cryptobizmo2.github.io,https://bigmoufslapbot.com"
+const ALLOWED_ORIGINS = String(ALLOWED_ORIGIN).split(",").map((o) => o.trim()).filter(Boolean);
+app.use(cors({
+  origin: ALLOWED_ORIGINS.includes("*") ? "*" : ALLOWED_ORIGINS,
+  // let the security self-scan read these from the browser
+  exposedHeaders: ["X-Content-Type-Options", "X-Frame-Options", "Referrer-Policy", "Content-Security-Policy",
+                   "Strict-Transport-Security", "RateLimit-Limit", "RateLimit-Remaining"],
+}));
+// Only one route takes a body ({wallet, signature}); 8 KB is generous. Objects/arrays only.
+app.use(express.json({ limit: "8kb", strict: true }));
 
 // Per-user now (thanks to trust proxy). A live dashboard + armed Micro Bot
 // + scans legitimately runs ~10-20 req/min, so 30 left no headroom.
@@ -71,6 +94,10 @@ const limiter = rateLimit({
   message: { error: "Rate limit exceeded. Slow down." },
 });
 app.use(limiter);
+app.use("/api/auth", rateLimit({ windowMs: 60 * 1000, max: 12, standardHeaders: true, legacyHeaders: false,
+  message: { error: "Too many sign-in attempts. Wait a minute." } }));
+app.use(["/api/token", "/api/mint-check"], rateLimit({ windowMs: 60 * 1000, max: 40, standardHeaders: true,
+  legacyHeaders: false, message: { error: "Too many lookups. Slow down." } }));
 
 function log(type, msg) {
   console.log(`[${new Date().toISOString()}] [${type.toUpperCase()}] ${msg}`);
@@ -113,11 +140,32 @@ async function getMintCheck(address) {
     const freezeAuthority = parsed.freezeAuthority || null;
     const supply = Number(parsed.supply) / Math.pow(10, parsed.decimals);
 
-    let top10Pct = null;
+    // Two concentration figures:
+    //   top10Pct       — every account, including pools and bonding curves
+    //   top10WalletPct — only accounts owned by real wallets
+    // A pump.fun bonding curve (or an AMM pool) is usually the single largest
+    // "holder", but it's a program, not a whale. Counting it would flag nearly
+    // every pre-graduation token as 90%+ concentrated. Wallets are points on
+    // the Ed25519 curve; program-derived addresses are deliberately off it —
+    // that is exactly how Solana tells the two apart.
+    let top10Pct = null, top10WalletPct = null;
     try {
       const largest = await withTimeout(connection.getTokenLargestAccounts(mintPubkey), 5000, "getTokenLargestAccounts");
-      const top10Sum = largest.value.slice(0, 10).reduce((s, acc) => s + (acc.uiAmount || 0), 0);
+      const top = largest.value.slice(0, 20);
+      const top10Sum = top.slice(0, 10).reduce((s, acc) => s + (acc.uiAmount || 0), 0);
       top10Pct = supply > 0 ? (top10Sum / supply) * 100 : null;
+      try {
+        const infos = await withTimeout(connection.getMultipleParsedAccounts(top.map((a) => a.address)), 5000, "holder owners");
+        let walletSum = 0, counted = 0;
+        top.forEach((a, i) => {
+          const owner = infos.value[i]?.data?.parsed?.info?.owner;
+          if (!owner || counted >= 10) return;
+          if (PublicKey.isOnCurve(new PublicKey(owner).toBytes())) { walletSum += a.uiAmount || 0; counted++; }
+        });
+        top10WalletPct = supply > 0 ? (walletSum / supply) * 100 : null;
+      } catch (e) {
+        log("error", `holder owner lookup failed for ${address}: ${e.message}`);
+      }
     } catch (e) {
       log("error", `getTokenLargestAccounts failed for ${address}: ${e.message}`);
     }
@@ -131,6 +179,7 @@ async function getMintCheck(address) {
       supply,
       decimals: parsed.decimals,
       top10HolderPct: top10Pct !== null ? parseFloat(top10Pct.toFixed(2)) : null,
+      top10WalletPct: top10WalletPct !== null ? parseFloat(top10WalletPct.toFixed(2)) : null,
       criticalHoneypot: !!freezeAuthority,
     };
 
@@ -149,99 +198,6 @@ async function getMintCheck(address) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// ① ACCESS CONTROL — the personal lock
-// ═══════════════════════════════════════════════════════════════════════
-
-/**
- * GET /api/verify-holder?wallet=<address>
- * Checks the wallet's SLAP GOLD balance on-chain.
- * Returns { authorized: boolean, balance: number, isOwner: boolean }
- */
-app.get("/api/verify-holder", async (req, res) => {
-  const wallet = req.query.wallet;
-  if (!wallet) return res.status(400).json({ error: "wallet query param required" });
-
-  try {
-    const walletPubkey = new PublicKey(wallet);
-    const mintPubkey = new PublicKey(SLAPGOLD_MINT);
-
-    const tokenAccounts = await connection.getParsedTokenAccountsByOwner(walletPubkey, {
-      mint: mintPubkey,
-    });
-
-    let balance = 0;
-    if (tokenAccounts.value.length > 0) {
-      balance = tokenAccounts.value.reduce((sum, acc) => {
-        const amt = acc.account.data.parsed.info.tokenAmount.uiAmount || 0;
-        return sum + amt;
-      }, 0);
-    }
-
-    const isOwner = MY_WALLET && wallet.toLowerCase() === MY_WALLET.toLowerCase();
-    const authorized = isOwner || balance >= MIN_HOLD_AMOUNT;
-
-    log("access", `${wallet.slice(0, 4)}...${wallet.slice(-4)} → balance=${balance} authorized=${authorized}`);
-    res.json({ authorized, balance, isOwner, minRequired: MIN_HOLD_AMOUNT });
-  } catch (err) {
-    log("error", `verify-holder failed: ${err.message}`);
-    res.status(400).json({ error: "Invalid wallet address or RPC error", authorized: false });
-  }
-});
-
-// ═══════════════════════════════════════════════════════════════════════
-// ② PRICE PROXY — hides rate limits from the browser, adds caching
-// ═══════════════════════════════════════════════════════════════════════
-
-let priceCache = { data: null, ts: 0 };
-const PRICE_CACHE_MS = 20_000;
-
-app.get("/api/prices", async (req, res) => {
-  const now = Date.now();
-  if (priceCache.data && now - priceCache.ts < PRICE_CACHE_MS) {
-    return res.json(priceCache.data);
-  }
-  try {
-    const ids = "solana,bitcoin,ethereum,raydium,jupiter-exchange-solana,binancecoin,bonk,dogwifcoin,avalanche-2,chainlink";
-    const r = await fetch(
-      `https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true`
-    );
-    const data = await r.json();
-    priceCache = { data, ts: now };
-    log("scan", "Price cache refreshed from CoinGecko");
-    res.json(data);
-  } catch (err) {
-    log("error", `Price fetch failed: ${err.message}`);
-    if (priceCache.data) return res.json(priceCache.data); // serve stale on failure
-    res.status(502).json({ error: "Price provider unavailable" });
-  }
-});
-
-/**
- * GET /api/slapgold-price
- * Your own token's live price + liquidity from DexScreener.
- */
-app.get("/api/slapgold-price", async (req, res) => {
-  try {
-    const r = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${SLAPGOLD_MINT}`);
-    const data = await r.json();
-    const pairs = data.pairs || [];
-    if (!pairs.length) return res.json({ found: false });
-    const top = pairs.reduce((b, p) => ((p.liquidity?.usd || 0) > (b.liquidity?.usd || 0) ? p : b), pairs[0]);
-    res.json({
-      found: true,
-      price: parseFloat(top.priceUsd || 0),
-      change24h: top.priceChange?.h24 || 0,
-      liquidity: top.liquidity?.usd || 0,
-      volume24h: top.volume?.h24 || 0,
-      dex: top.dexId,
-    });
-  } catch (err) {
-    log("error", `SLAPGOLD price fetch failed: ${err.message}`);
-    res.status(502).json({ error: "Failed to fetch SLAP GOLD price" });
-  }
-});
-
-// ═══════════════════════════════════════════════════════════════════════
 // ③ TOKEN SCANNER — market data + real on-chain rug checks
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -253,280 +209,11 @@ app.get("/api/slapgold-price", async (req, res) => {
  * Also pulls top-10 holder concentration from the largest token accounts.
  */
 app.get("/api/mint-check/:address", async (req, res) => {
+  try { if (b58decode(String(req.params.address)).length !== 32) throw 0; }
+  catch { return res.status(400).json({ error: "Invalid token address" }); }
   const result = await getMintCheck(req.params.address);
   if (result.error) return res.status(400).json(result);
   res.json(result);
-});
-
-/**
- * GET /api/scan/:address
- * Combined scan: DexScreener market data + on-chain mint/freeze/holder checks
- * in a single response, so the frontend only needs one call.
- */
-app.get("/api/scan/:address", async (req, res) => {
-  const { address } = req.params;
-  try {
-    const [dexRes, onchain] = await Promise.allSettled([
-      fetch(`https://api.dexscreener.com/latest/dex/tokens/${address}`).then((r) => r.json()),
-      getMintCheck(address),
-    ]);
-
-    const market = dexRes.status === "fulfilled" ? dexRes.value : { pairs: [] };
-    const onchainResult = onchain.status === "fulfilled" ? onchain.value : { found: false };
-
-    log("scan", `Full scan on ${address.slice(0, 8)}... — market pairs: ${(market.pairs || []).length}, onchain: ${onchainResult.found}`);
-    res.json({ market, onchain: onchainResult });
-  } catch (err) {
-    log("error", `Combined scan failed: ${err.message}`);
-    res.status(502).json({ error: "Scanner unavailable" });
-  }
-});
-
-app.get("/api/launches", async (req, res) => {
-  try {
-    const r = await fetch("https://api.dexscreener.com/latest/dex/search?q=solana");
-    const data = await r.json();
-    res.json(data);
-  } catch (err) {
-    log("error", `Launches proxy failed: ${err.message}`);
-    res.status(502).json({ error: "Launches provider unavailable" });
-  }
-});
-
-// ═══════════════════════════════════════════════════════════════════════
-// ④ REVENUE — fee account for Jupiter platform fee on real swaps
-// ═══════════════════════════════════════════════════════════════════════
-
-/**
- * GET /api/fee-account/:mint
- * Returns the Associated Token Account (ATA) address for MY_WALLET that
- * will receive your platform fee cut on every real swap in that token.
- * The frontend calls this once per token and passes it to Jupiter's
- * swap API as the `feeAccount` parameter.
- *
- * IMPORTANT: this ATA must actually exist on-chain to receive fees.
- * If it doesn't exist yet for a given mint, the first fee-earning swap
- * in that token may fail until the account is created (e.g. by
- * receiving a small amount of that token once, or via a setup script).
- */
-app.get("/api/fee-account/:mint", async (req, res) => {
-  const { mint } = req.params;
-  if (!MY_WALLET) return res.status(400).json({ error: "MY_WALLET not configured on server" });
-  try {
-    const mintPubkey = new PublicKey(mint);
-    const ownerPubkey = new PublicKey(MY_WALLET);
-    const ata = await getAssociatedTokenAddress(mintPubkey, ownerPubkey);
-    log("revenue", `Fee account for mint ${mint.slice(0,8)}... → ${ata.toBase58()}`);
-    res.json({ feeAccount: ata.toBase58(), owner: MY_WALLET, mint });
-  } catch (err) {
-    log("error", `fee-account failed for mint ${mint}: ${err.message}`);
-    res.status(400).json({ error: "Invalid mint address" });
-  }
-});
-
-// ═══════════════════════════════════════════════════════════════════════
-// ⑤ COPY TRADING — watch a wallet, scale trade size proportionally
-// ═══════════════════════════════════════════════════════════════════════
-
-// Known token prices come from CoinGecko; mint → coingecko id, for portfolio valuation
-const KNOWN_TOKENS = {
-  "So11111111111111111111111111111111111111112": { sym: "SOL", cgId: "solana", decimals: 9 },
-  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": { sym: "USDC", cgId: "usd-coin", decimals: 6 },
-  "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R": { sym: "RAY", cgId: "raydium", decimals: 6 },
-  "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN": { sym: "JUP", cgId: "jupiter-exchange-solana", decimals: 6 },
-  "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263": { sym: "BONK", cgId: "bonk", decimals: 5 },
-  "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm": { sym: "WIF", cgId: "dogwifcoin", decimals: 6 },
-};
-
-let priceCache2 = { data: {}, ts: 0 };
-async function getPrices() {
-  const now = Date.now();
-  if (priceCache2.data && now - priceCache2.ts < 20000) return priceCache2.data;
-  const ids = [...new Set(Object.values(KNOWN_TOKENS).map((t) => t.cgId))].join(",");
-  const r = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd`);
-  const data = await r.json();
-  priceCache2 = { data, ts: now };
-  return data;
-}
-
-/**
- * Computes a wallet's total portfolio value in USD across SOL + known SPL tokens.
- * Unknown/exotic tokens are not priced (would need a full token-list + price feed)
- * — this is a reasonable approximation, not a complete net-worth calculator.
- */
-async function getWalletValueUSD(address) {
-  const pubkey = new PublicKey(address);
-  const [solBalance, tokenAccounts, prices] = await Promise.all([
-    connection.getBalance(pubkey),
-    connection.getParsedTokenAccountsByOwner(pubkey, { programId: new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA") }),
-    getPrices(),
-  ]);
-
-  const solUsd = (solBalance / 1e9) * (prices.solana?.usd || 0);
-  let tokenUsd = 0;
-  const holdings = [];
-
-  for (const acc of tokenAccounts.value) {
-    const info = acc.account.data.parsed.info;
-    const mint = info.mint;
-    const uiAmount = info.tokenAmount.uiAmount || 0;
-    if (uiAmount <= 0) continue;
-    const known = KNOWN_TOKENS[mint];
-    if (known) {
-      const usd = uiAmount * (prices[known.cgId]?.usd || 0);
-      tokenUsd += usd;
-      holdings.push({ mint, sym: known.sym, amount: uiAmount, usd });
-    } else {
-      holdings.push({ mint, sym: "?", amount: uiAmount, usd: 0 });
-    }
-  }
-
-  return {
-    address,
-    solBalance: solBalance / 1e9,
-    solUsd,
-    totalUsd: solUsd + tokenUsd,
-    holdings,
-  };
-}
-
-/**
- * GET /api/wallet-value/:address
- * Returns total portfolio value (USD) for any wallet — used to compute
- * the proportional sizing ratio between a tracked wallet and your own.
- */
-app.get("/api/wallet-value/:address", async (req, res) => {
-  try {
-    const result = await getWalletValueUSD(req.params.address);
-    log("copytrade", `Wallet ${req.params.address.slice(0, 6)}... valued at $${result.totalUsd.toFixed(2)}`);
-    res.json(result);
-  } catch (err) {
-    log("error", `wallet-value failed: ${err.message}`);
-    res.status(400).json({ error: "Invalid wallet address or RPC error" });
-  }
-});
-
-/**
- * GET /api/wallet-swaps/:address?limit=15&minUsd=10
- * Inspects a wallet's recent transactions and detects likely swaps by
- * comparing pre/post token balances. Filters out anything below minUsd
- * so dust transactions don't trigger copy-trade signals.
- *
- * This reads token balance deltas directly from transaction metadata —
- * no external swap-parsing service required.
- */
-app.get("/api/wallet-swaps/:address", async (req, res) => {
-  const { address } = req.params;
-  const limit = Math.min(parseInt(req.query.limit) || 15, 30);
-  const minUsd = parseFloat(req.query.minUsd) || 10;
-
-  try {
-    const pubkey = new PublicKey(address);
-    const prices = await getPrices();
-    const sigs = await connection.getSignaturesForAddress(pubkey, { limit });
-
-    const swaps = [];
-    for (const sigInfo of sigs) {
-      if (sigInfo.err) continue;
-      try {
-        const tx = await connection.getParsedTransaction(sigInfo.signature, { maxSupportedTransactionVersion: 0 });
-        if (!tx || !tx.meta) continue;
-
-        const preBal = tx.meta.preTokenBalances || [];
-        const postBal = tx.meta.postTokenBalances || [];
-        const ownerIdx = tx.transaction.message.accountKeys.findIndex((k) => k.pubkey.toBase58() === address);
-        if (ownerIdx === -1) continue;
-
-        // Find token balance changes for this specific owner
-        const changes = {};
-        for (const pb of preBal) {
-          if (pb.owner !== address) continue;
-          changes[pb.mint] = { pre: pb.uiTokenAmount.uiAmount || 0, post: 0 };
-        }
-        for (const pb of postBal) {
-          if (pb.owner !== address) continue;
-          if (!changes[pb.mint]) changes[pb.mint] = { pre: 0, post: 0 };
-          changes[pb.mint].post = pb.uiTokenAmount.uiAmount || 0;
-        }
-
-        // Also check native SOL delta for this account
-        const preSol = tx.meta.preBalances[ownerIdx] / 1e9;
-        const postSol = tx.meta.postBalances[ownerIdx] / 1e9;
-        const solDelta = postSol - preSol;
-
-        let sold = null, bought = null;
-        for (const [mint, c] of Object.entries(changes)) {
-          const delta = c.post - c.pre;
-          if (Math.abs(delta) < 1e-9) continue;
-          const known = KNOWN_TOKENS[mint];
-          const usd = known ? Math.abs(delta) * (prices[known.cgId]?.usd || 0) : 0;
-          if (delta < 0 && (!sold || usd > sold.usd)) sold = { mint, sym: known?.sym || "?", amount: Math.abs(delta), usd };
-          if (delta > 0 && (!bought || usd > bought.usd)) bought = { mint, sym: known?.sym || "?", amount: delta, usd };
-        }
-        // Fold in SOL side if it moved meaningfully and no SPL side captured it
-        if (Math.abs(solDelta) > 0.001) {
-          const usd = Math.abs(solDelta) * (prices.solana?.usd || 0);
-          if (solDelta < 0 && (!sold || usd > sold.usd)) sold = { mint: "SOL", sym: "SOL", amount: Math.abs(solDelta), usd };
-          if (solDelta > 0 && (!bought || usd > bought.usd)) bought = { mint: "SOL", sym: "SOL", amount: solDelta, usd };
-        }
-
-        if (sold && bought) {
-          const tradeUsd = Math.max(sold.usd, bought.usd);
-          if (tradeUsd >= minUsd) {
-            swaps.push({
-              signature: sigInfo.signature,
-              time: sigInfo.blockTime ? sigInfo.blockTime * 1000 : null,
-              sold, bought, tradeUsd,
-            });
-          }
-        }
-      } catch (txErr) {
-        continue; // skip unparseable transactions
-      }
-    }
-
-    log("copytrade", `Scanned ${sigs.length} txs for ${address.slice(0,6)}... → ${swaps.length} swap(s) above $${minUsd}`);
-    res.json({ address, swaps });
-  } catch (err) {
-    log("error", `wallet-swaps failed: ${err.message}`);
-    res.status(400).json({ error: "Invalid wallet address or RPC error" });
-  }
-});
-
-/**
- * GET /api/copy-size?target=<wallet>&mine=<wallet>&tradeUsd=<n>
- * The core proportional-sizing calculation:
- *   yourSize = (tradeUsd / targetWalletTotalUsd) * yourWalletTotalUsd
- * This keeps position sizing safe regardless of how large the tracked
- * wallet is compared to yours.
- */
-app.get("/api/copy-size", async (req, res) => {
-  const { target, mine, tradeUsd } = req.query;
-  if (!target || !mine || !tradeUsd) {
-    return res.status(400).json({ error: "target, mine, and tradeUsd query params required" });
-  }
-  try {
-    const [targetVal, mineVal] = await Promise.all([
-      getWalletValueUSD(target),
-      getWalletValueUSD(mine),
-    ]);
-    if (targetVal.totalUsd <= 0) {
-      return res.json({ yourSize: 0, ratio: 0, note: "Target wallet has no measurable value — cannot compute ratio" });
-    }
-    const ratio = parseFloat(tradeUsd) / targetVal.totalUsd;
-    const yourSize = ratio * mineVal.totalUsd;
-    log("copytrade", `Copy-size: target trade $${tradeUsd} (${(ratio*100).toFixed(2)}% of $${targetVal.totalUsd.toFixed(0)}) → your size $${yourSize.toFixed(2)}`);
-    res.json({
-      targetTotalUsd: targetVal.totalUsd,
-      yourTotalUsd: mineVal.totalUsd,
-      tradeUsd: parseFloat(tradeUsd),
-      ratioPct: ratio * 100,
-      yourSize: parseFloat(yourSize.toFixed(2)),
-    });
-  } catch (err) {
-    log("error", `copy-size failed: ${err.message}`);
-    res.status(400).json({ error: "Invalid wallet address or RPC error" });
-  }
 });
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -549,6 +236,7 @@ app.get("/api/copy-size", async (req, res) => {
 const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 function b58decode(str) {
   if (typeof str !== "string" || !str.length) throw new Error("empty");
+  if (str.length > 64) throw new Error("too long");   // addresses are ≤44 chars; refuse giant inputs cheaply
   let n = 0n;
   for (const ch of str) {
     const v = B58.indexOf(ch);
@@ -666,6 +354,9 @@ app.get("/api/auth/challenge", (req, res) => {
 /** Step 2 — prove ownership, check balance, receive a pass */
 app.post("/api/auth/verify", async (req, res) => {
   const { wallet, signature } = req.body || {};
+  // Types and sizes first — never let an object, array or huge string reach the crypto
+  if (typeof wallet !== "string" || typeof signature !== "string" || wallet.length > 64 || signature.length > 200)
+    return res.status(400).json({ error: "Malformed sign-in request." });
   const ch = challenges.get(wallet);
   if (!ch || ch.exp < Date.now()) return res.status(400).json({ error: "Sign-in expired — please try again." });
   challenges.delete(wallet);   // single use: blocks replay and brute-force
@@ -767,8 +458,8 @@ app.get("/api/exclusive/picks", requireHolder, async (req, res) => {
       if (!c || !c.found) return;
       checked++;
       const safe = c.mintAuthorityRenounced && c.freezeAuthorityRenounced &&
-                   (c.top10HolderPct == null || c.top10HolderPct < 60);
-      if (safe) verified.push({ ...p, top10: c.top10HolderPct,
+                   ((c.top10WalletPct ?? c.top10HolderPct) == null || (c.top10WalletPct ?? c.top10HolderPct) < 60);
+      if (safe) verified.push({ ...p, top10: c.top10WalletPct ?? c.top10HolderPct,
         buyPct: p.txns ? Math.round((p.buys / p.txns) * 100) : 50 });
     });
 
@@ -787,6 +478,404 @@ app.get("/api/exclusive/picks", requireHolder, async (req, res) => {
     log("error", `picks failed: ${err.message}`);
     if (picksCache.data) return res.json(picksCache.data);
     res.status(502).json({ error: "Couldn't build picks right now. Try again shortly." });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// ⑧ TOKEN PROFILE, CHART & TRADES — works before AND after graduation
+// ═══════════════════════════════════════════════════════════════════════
+/**
+ * Pre-graduation pump.fun tokens have no DEX pool, so price indexers skip
+ * them. But the bonding curve is a Solana account whose reserves set the
+ * price exactly, so we read it straight from the chain.
+ */
+const PUMP_PROGRAM = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
+// Anchor account ID = first 8 bytes of sha256("account:BondingCurve").
+// Every read is checked against it, so no other account can be misread as a price.
+const BONDING_CURVE_ID = crypto.createHash("sha256").update("account:BondingCurve").digest().subarray(0, 8);
+const INITIAL_REAL_TOKEN_RESERVES = 793100000000000n;   // 793.1M tokens × 10^6, pump.fun's curve size
+const METADATA_PROGRAM = new PublicKey("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s");
+
+/** Decode a bonding-curve account buffer. Pure — no network. */
+function decodeBondingCurve(data) {
+  if (!data || data.length < 49 || !data.subarray(0, 8).equals(BONDING_CURVE_ID)) return null;
+  return {
+    vTok: data.readBigUInt64LE(8),  vSol: data.readBigUInt64LE(16),
+    rTok: data.readBigUInt64LE(24), rSol: data.readBigUInt64LE(32),
+    supply: data.readBigUInt64LE(40), complete: data[48] === 1,
+  };
+}
+/** Turn curve reserves into USD figures. Pure — no network. */
+function curveMarket(c, solUsd, decimals = 6) {
+  const priceSol = (Number(c.vSol) / 1e9) / (Number(c.vTok) / 10 ** decimals);
+  const supplyTokens = Number(c.supply) / 10 ** decimals;
+  const progress = c.rTok >= INITIAL_REAL_TOKEN_RESERVES ? 0
+    : 1 - Number((c.rTok * 10000n) / INITIAL_REAL_TOKEN_RESERVES) / 10000;
+  return {
+    priceSol, price: priceSol * solUsd,
+    mcap: priceSol * solUsd * supplyTokens,
+    liq: (Number(c.rSol) / 1e9) * solUsd,          // real SOL locked in the curve
+    progress: Math.round(Math.min(1, Math.max(0, progress)) * 10000) / 100,
+    complete: c.complete,
+  };
+}
+/** Read a Metaplex metadata account → name / symbol / uri. Pure — no network. */
+function decodeMetadata(data) {
+  try {
+    let o = 1 + 32 + 32;                                   // key, update authority, mint
+    const str = () => { const n = data.readUInt32LE(o); o += 4;
+      const v = data.subarray(o, o + n).toString("utf8").replace(/\0/g, "").trim(); o += n; return v; };
+    const name = str(), symbol = str(), uri = str();
+    return { name: name || null, symbol: symbol || null, uri: uri || null };
+  } catch { return null; }
+}
+
+let solUsd = { v: null, ts: 0 };
+async function getSolUsd() {
+  if (solUsd.v && Date.now() - solUsd.ts < 60000) return solUsd.v;
+  const r = await withTimeout(fetch("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"), 6000, "SOL price");
+  const v = +(await r.json())?.solana?.usd;
+  if (!(v > 0)) throw new Error("no SOL price");
+  solUsd = { v, ts: Date.now() };
+  return v;
+}
+async function readBondingCurve(mint) {
+  const [curve] = PublicKey.findProgramAddressSync([Buffer.from("bonding-curve"), new PublicKey(mint).toBuffer()], PUMP_PROGRAM);
+  const acct = await withTimeout(connection.getAccountInfo(curve), 7000, "bonding curve");
+  if (!acct || !acct.owner.equals(PUMP_PROGRAM)) return null;   // not a pump.fun token
+  const c = decodeBondingCurve(acct.data);
+  return c ? { ...c, curve: curve.toBase58() } : null;
+}
+async function readMetadata(mint) {
+  const [pda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("metadata"), METADATA_PROGRAM.toBuffer(), new PublicKey(mint).toBuffer()], METADATA_PROGRAM);
+  const acct = await withTimeout(connection.getAccountInfo(pda), 6000, "metadata");
+  return acct ? decodeMetadata(acct.data) : null;
+}
+
+async function gecko(path, ms = 9000) {
+  const r = await withTimeout(fetch("https://api.geckoterminal.com/api/v2/networks/solana" + path,
+    { headers: { accept: "application/json" } }), ms, "gecko " + path.split("?")[0]);
+  if (!r.ok) throw new Error("GeckoTerminal " + r.status);
+  return r.json();
+}
+
+/**
+ * GET /api/token/:mint — one profile for any token:
+ *   source "pool"  → graduated, priced from its most liquid pool
+ *   source "curve" → still on pump.fun, priced from the bonding curve on-chain
+ *   source "none"  → no market found yet
+ */
+const profileCache = new Map();
+app.get("/api/token/:mint", async (req, res) => {
+  const mint = String(req.params.mint || "");
+  try { if (b58decode(mint).length !== 32) throw 0; } catch { return res.status(400).json({ error: "Invalid token address" }); }
+  const hit = profileCache.get(mint);
+  if (hit && Date.now() - hit.ts < 30000) return res.json(hit.data);
+
+  const [poolsR, curveR, metaR, chainR] = await Promise.allSettled([
+    gecko(`/tokens/${mint}/pools?include=base_token&page=1`),
+    readBondingCurve(mint),
+    readMetadata(mint),
+    getMintCheck(mint),
+  ]);
+  const n = (v) => (Number.isFinite(+v) ? +v : 0);
+  const chain = chainR.status === "fulfilled" ? chainR.value : null;
+  const meta = metaR.status === "fulfilled" ? metaR.value : null;
+  const curve = curveR.status === "fulfilled" ? curveR.value : null;
+  const p = {
+    mint, symbol: meta?.symbol || null, name: meta?.name || null, logo: null,
+    source: "none", price: null, ch1: 0, ch24: 0, vol24: 0, liq: 0, mcap: null,
+    buys24: 0, sells24: 0, txns24: 0, poolAddress: null, dex: null, createdAt: null, curve: null,
+    supply: chain?.found ? chain.supply : null, decimals: chain?.decimals ?? null,
+    mintAuthority: chain?.mintAuthority ?? null, freezeAuthority: chain?.freezeAuthority ?? null,
+    top10Pct: chain?.top10HolderPct ?? null, top10WalletPct: chain?.top10WalletPct ?? null,
+    onchainOk: !!chain?.found,
+  };
+
+  // Graduated / indexed: the most liquid pool wins
+  if (poolsR.status === "fulfilled") {
+    const raw = poolsR.value, inc = raw.included || [];
+    const pools = (raw.data || []).slice().sort((a, b) => n(b.attributes?.reserve_in_usd) - n(a.attributes?.reserve_in_usd));
+    const top = pools[0];
+    if (top) {
+      const a = top.attributes || {}, tx = a.transactions?.h24 || {};
+      const bt = inc.find((x) => x.id === top.relationships?.base_token?.data?.id);
+      Object.assign(p, {
+        source: "pool", poolAddress: a.address || null, dex: top.relationships?.dex?.data?.id || null,
+        price: n(a.base_token_price_usd), ch1: n(a.price_change_percentage?.h1), ch24: n(a.price_change_percentage?.h24),
+        vol24: n(a.volume_usd?.h24), liq: n(a.reserve_in_usd),
+        mcap: n(a.market_cap_usd) || n(a.fdv_usd) || null,
+        buys24: n(tx.buys), sells24: n(tx.sells), txns24: n(tx.buys) + n(tx.sells),
+        createdAt: a.pool_created_at ? new Date(a.pool_created_at).getTime() : null,
+      });
+      if (bt?.attributes) {
+        p.symbol = p.symbol || bt.attributes.symbol || null;
+        p.name = p.name || bt.attributes.name || null;
+        p.logo = bt.attributes.image_url || null;
+      }
+    }
+  }
+
+  // Still on the curve: price it from the chain itself
+  if (curve && !curve.complete) {
+    try {
+      const m = curveMarket(curve, await getSolUsd(), p.decimals ?? 6);
+      p.curve = { progress: m.progress, complete: false, address: curve.curve };
+      if (p.source === "none") Object.assign(p, { source: "curve", price: m.price, mcap: m.mcap, liq: m.liq, dex: "pump.fun curve" });
+    } catch (err) { log("error", `curve pricing failed for ${mint}: ${err.message}`); }
+  }
+
+  // Logo from the token's own metadata file, if nobody indexed one
+  if (!p.logo && meta?.uri && /^https:\/\//.test(meta.uri)) {
+    try { const j = await (await withTimeout(fetch(meta.uri), 4000, "token uri")).json();
+      if (typeof j?.image === "string" && /^https:\/\//.test(j.image)) p.logo = j.image; } catch {}
+  }
+
+  profileCache.set(mint, { data: p, ts: Date.now() });
+  if (profileCache.size > 2000) profileCache.delete(profileCache.keys().next().value);
+  res.json(p);
+});
+
+/** GET /api/chart/:pool?tf=1m|5m|15m|1h — candles, oldest first */
+const TF = { "1m": ["minute", 1], "5m": ["minute", 5], "15m": ["minute", 15], "1h": ["hour", 1] };
+const chartCache = new Map();
+app.get("/api/chart/:pool", async (req, res) => {
+  const pool = String(req.params.pool || ""), tf = TF[req.query.tf] ? req.query.tf : "5m";
+  const chain = String(req.query.chain || "solana").toLowerCase();
+  if (!DEX_CHAINS.includes(chain)) return res.status(400).json({ error: "Unknown chain" });
+  if (!POOL_ADDR.test(pool)) return res.status(400).json({ error: "Invalid pool" });
+  const key = chain + pool + tf, hit = chartCache.get(key);
+  if (hit && Date.now() - hit.ts < 20000) return res.json(hit.data);
+  try {
+    const [unit, agg] = TF[tf];
+    const gid = await resolveGecko(chain);
+    if (!gid) return res.status(404).json({ error: "Charts aren't available for this chain yet." });
+    const d = await geckoAny(`/networks/${gid}/pools/${pool}/ohlcv/${unit}?aggregate=${agg}&limit=120&currency=usd`);
+    const candles = (d?.data?.attributes?.ohlcv_list || [])
+      .map(([t, o, h, l, c, v]) => ({ t: +t, o: +o, h: +h, l: +l, c: +c, v: +v }))
+      .filter((k) => k.t > 0 && k.c > 0).sort((a, b) => a.t - b.t);
+    const out = { tf, candles };
+    chartCache.set(key, { data: out, ts: Date.now() });
+    if (chartCache.size > 1000) chartCache.delete(chartCache.keys().next().value);
+    res.json(out);
+  } catch (err) {
+    if (hit) return res.json(hit.data);
+    res.status(502).json({ error: "Chart data unavailable right now." });
+  }
+});
+
+/** GET /api/trades/:pool — latest trades, newest first */
+const tradesCache = new Map();
+app.get("/api/trades/:pool", async (req, res) => {
+  const pool = String(req.params.pool || "");
+  const chain = String(req.query.chain || "solana").toLowerCase();
+  if (!DEX_CHAINS.includes(chain)) return res.status(400).json({ error: "Unknown chain" });
+  if (!POOL_ADDR.test(pool)) return res.status(400).json({ error: "Invalid pool" });
+  const tkey = chain + pool, hit = tradesCache.get(tkey);
+  if (hit && Date.now() - hit.ts < 15000) return res.json(hit.data);
+  try {
+    const gid = await resolveGecko(chain);
+    if (!gid) return res.status(404).json({ error: "Trades aren't available for this chain yet." });
+    const d = await geckoAny(`/networks/${gid}/pools/${pool}/trades`);
+    const trades = (d?.data || []).slice(0, 40).map((t) => {
+      const a = t.attributes || {};
+      return { kind: a.kind === "sell" ? "sell" : "buy", usd: +a.volume_in_usd || 0,
+        wallet: a.tx_from_address || null, tx: a.tx_hash || null,
+        at: a.block_timestamp ? new Date(a.block_timestamp).getTime() : null };
+    });
+    const out = { trades };
+    tradesCache.set(tkey, { data: out, ts: Date.now() });
+    if (tradesCache.size > 1000) tradesCache.delete(tradesCache.keys().next().value);
+    res.json(out);
+  } catch (err) {
+    if (hit) return res.json(hit.data);
+    res.status(502).json({ error: "Trades unavailable right now." });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// ⑨ MULTI-CHAIN — every chain DexScreener lists; graded ONLY where verifiable
+// ═══════════════════════════════════════════════════════════════════════
+/** Every chain in DexScreener's top bar (their own ids). */
+const DEX_CHAINS = ["solana","robinhood","bsc","base","ethereum","arc","polygon","pulsechain","hyperevm","ton",
+  "sui","near","avalanche","arbitrum","ink","cronos","xrpl","sonic","hyperliquid","monad","hedera","tron",
+  "worldchain","starknet","abstract","stable","optimism","mantle","seiv2","linea","icp","berachain","megaeth",
+  "injective","aptos","flare","algorand","plasma","zksync","metis","fantom","apechain","cardano","unichain",
+  "blast","stacks","celo","opbnb","flowevm","soneium","manta","conflux","merlinchain","scroll","beam","katana",
+  "story","kava","fuse","multiversx","telos","movement","polkadot","stepnetwork"];
+
+/** GoPlus chain ids — ONLY these have verified contract-safety coverage. */
+const GOPLUS = { ethereum:1, bsc:56, polygon:137, arbitrum:42161, base:8453, avalanche:43114,
+  optimism:10, fantom:250, cronos:25, linea:59144, scroll:534352, mantle:5000, zksync:324 };
+
+/** DexScreener→GeckoTerminal ids that differ. Each is confirmed against the
+ *  live network list before use — a wrong guess can never be trusted. */
+const GECKO_ALIAS = { ethereum:"eth", polygon:"polygon_pos", avalanche:"avax", cronos:"cro",
+  fantom:"ftm", sui:"sui-network", seiv2:"sei-evm" };
+
+const normName = (s) => String(s || "").toLowerCase().replace(/\b(chain|network|mainnet)\b/g, "").replace(/[^a-z0-9]/g, "");
+/** Pure: pick the GeckoTerminal id for a DexScreener chain, given the live list. */
+function pickGecko(dexChain, nets) {
+  dexChain = String(dexChain || "").toLowerCase();
+  if (!nets || !nets.length) return null;
+  const ids = new Set(nets.map((n) => n.id));
+  if (ids.has(dexChain)) return dexChain;
+  const alias = GECKO_ALIAS[dexChain];
+  if (alias && ids.has(alias)) return alias;
+  const m = nets.find((n) => normName(n.name) === normName(dexChain));
+  return m ? m.id : null;
+}
+
+let geckoNets = { list: null, ts: 0 };
+async function getGeckoNetworks() {
+  if (geckoNets.list && Date.now() - geckoNets.ts < 24 * 3600e3) return geckoNets.list;
+  const all = [], seen = new Set();
+  for (let page = 1; page <= 15; page++) {
+    let rows = [];
+    try {
+      const r = await withTimeout(fetch(`https://api.geckoterminal.com/api/v2/networks?page=${page}`,
+        { headers: { accept: "application/json" } }), 9000, "networks");
+      if (!r.ok) break;
+      rows = (await r.json()).data || [];
+    } catch { break; }
+    let fresh = 0;
+    for (const n of rows) { if (!seen.has(n.id)) { seen.add(n.id); fresh++; all.push({ id: n.id, name: n.attributes?.name || n.id }); } }
+    if (!rows.length || !fresh) break;             // empty or repeating page → done
+  }
+  if (all.length) geckoNets = { list: all, ts: Date.now() };
+  return geckoNets.list || [];
+}
+const resolvedNets = new Map();
+async function resolveGecko(dexChain) {
+  dexChain = String(dexChain || "solana").toLowerCase();
+  if (dexChain === "solana") return "solana";
+  if (resolvedNets.has(dexChain)) return resolvedNets.get(dexChain);
+  const nets = await getGeckoNetworks();
+  if (!nets.length) return GECKO_ALIAS[dexChain] || dexChain;   // list down: best effort, not cached
+  const gid = pickGecko(dexChain, nets);
+  resolvedNets.set(dexChain, gid);
+  return gid;
+}
+async function geckoAny(fullPath, ms = 9000) {
+  const r = await withTimeout(fetch("https://api.geckoterminal.com/api/v2" + fullPath,
+    { headers: { accept: "application/json" } }), ms, "gecko " + fullPath.split("?")[0]);
+  if (!r.ok) throw new Error("GeckoTerminal " + r.status);
+  return r.json();
+}
+
+// Pool/pair addresses differ by chain (base58, 0x…40, v4 0x…64). Allow only
+// characters that can't break out of a URL or a quoted string.
+const SAFE_ADDR = /^[A-Za-z0-9:._-]{3,200}$/;
+// Pool IDs must be a REAL format — Solana base58, EVM 0x…40 (v2/v3) or 0x…64 (v4 / Sui), or TON —
+// so junk like "__proto__" is refused before it costs an outbound call.
+const POOL_ADDR = /^(?:[1-9A-HJ-NP-Za-km-z]{32,44}|0x[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?|[EU]Q[A-Za-z0-9_-]{46})$/;
+const WRAPPED_NOISE = new Set([...NOISE, "WETH","ETH","WBNB","BNB","WAVAX","AVAX","WMATIC","MATIC","WPOL","POL",
+  "DAI","WBTC","CBBTC","FDUSD","TUSD","USDBC","USDB","EURC","WS","WHYPE","WBERA","WTRX","WTON"]);
+
+/**
+ * GET /api/feed/:type?chain=all|<dexChainId>   (type = trending | new)
+ * "all" mirrors DexScreener's homepage: one mixed list across every network.
+ */
+const feedCache = new Map();
+app.get("/api/feed/:type", async (req, res) => {
+  const type = req.params.type === "new" ? "new_pools" : "trending_pools";
+  const chain = String(req.query.chain || "all").toLowerCase();
+  if (chain !== "all" && !DEX_CHAINS.includes(chain)) return res.status(400).json({ error: "Unknown chain" });
+  const key = type + ":" + chain, hit = feedCache.get(key);
+  if (hit && Date.now() - hit.ts < 45000) return res.json(hit.data);
+  try {
+    let path;
+    if (chain === "all") path = `/networks/${type}?include=base_token,network`;
+    else {
+      const gid = await resolveGecko(chain);
+      if (!gid) return res.json({ chain, pools: [], unavailable: true });
+      path = `/networks/${gid}/${type}?include=base_token,network`;
+    }
+    const raw = await geckoAny(path);
+    const inc = raw.included || [];
+    const netName = (id) => inc.find((x) => x.type === "network" && x.id === id)?.attributes?.name || id;
+    // map GeckoTerminal ids back to DexScreener ids for the frontend
+    const nets = await getGeckoNetworks();
+    const back = {}; for (const d of DEX_CHAINS) { const g = pickGecko(d, nets); if (g) back[g] = d; }
+    back.solana = "solana";
+    const n = (v) => (Number.isFinite(+v) ? +v : 0);
+    const pools = (raw.data || []).map((p) => {
+      const a = p.attributes || {}, tx = a.transactions?.h24 || {};
+      const btId = p.relationships?.base_token?.data?.id || "";
+      const bt = inc.find((x) => x.id === btId);
+      const gid = p.relationships?.network?.data?.id || btId.split("_")[0] || "";
+      return {
+        addr: btId.slice(btId.indexOf("_") + 1) || "", pairAddress: a.address || "",
+        sym: bt?.attributes?.symbol || (a.name || "").split("/")[0].trim() || "?",
+        name: bt?.attributes?.name || "", logo: bt?.attributes?.image_url || null,
+        price: n(a.base_token_price_usd), ch1: n(a.price_change_percentage?.h1), ch24: n(a.price_change_percentage?.h24),
+        vol: n(a.volume_usd?.h24), liq: n(a.reserve_in_usd), fdv: n(a.fdv_usd),
+        buys: n(tx.buys), sells: n(tx.sells), txns: n(tx.buys) + n(tx.sells),
+        createdAt: a.pool_created_at ? new Date(a.pool_created_at).getTime() : null,
+        dex: p.relationships?.dex?.data?.id || "",
+        net: { gid, name: netName(gid), chain: back[gid] || null },
+      };
+    }).filter((x) => x.addr && SAFE_ADDR.test(x.addr) && x.price > 0 && !WRAPPED_NOISE.has(String(x.sym).toUpperCase()));
+    const out = { chain, count: pools.length, pools };
+    feedCache.set(key, { data: out, ts: Date.now() });
+    log("discovery", `${chain} ${type}: ${pools.length} pools`);
+    res.json(out);
+  } catch (err) {
+    log("error", `feed ${chain} ${type}: ${err.message}`);
+    if (hit) return res.json(hit.data);
+    res.status(502).json({ error: "Market data unavailable right now.", pools: [] });
+  }
+});
+
+/** Pure: GoPlus raw record → normalized flags. Unknown stays null — never "safe". */
+function normalizeGoPlus(e, chain) {
+  if (!e || typeof e !== "object" || !Object.keys(e).length)
+    return { covered: true, ok: false, chain, error: "No security data for this token yet" };
+  const flag = (v) => (String(v) === "1" ? true : String(v) === "0" ? false : null);
+  const frac = (v) => (v === "" || v == null || !Number.isFinite(+v) ? null : +v);
+  const owner = String(e.owner_address || "");
+  const renounced = owner === "" || /^0x0{40}$/i.test(owner) || /^0x0{36}dead$/i.test(owner);
+  const holders = Array.isArray(e.holders) ? e.holders : [];
+  // Real wallets only — skip contracts and locked positions (pools, lockers)
+  const wallets = holders.filter((h) => String(h.is_contract) !== "1" && String(h.is_locked) !== "1").slice(0, 10);
+  const top10 = wallets.length ? wallets.reduce((s, h) => s + (+h.percent || 0), 0) * 100 : null;
+  return {
+    covered: true, ok: true, chain, name: e.token_name || null, symbol: e.token_symbol || null,
+    honeypot: flag(e.is_honeypot), cannotBuy: flag(e.cannot_buy), cannotSellAll: flag(e.cannot_sell_all),
+    buyTax: frac(e.buy_tax), sellTax: frac(e.sell_tax),
+    mintable: flag(e.is_mintable), openSource: flag(e.is_open_source), proxy: flag(e.is_proxy),
+    hiddenOwner: flag(e.hidden_owner), takeBackOwnership: flag(e.can_take_back_ownership),
+    ownerChangeBalance: flag(e.owner_change_balance), blacklist: flag(e.is_blacklisted),
+    pausable: flag(e.transfer_pausable), taxModifiable: flag(e.slippage_modifiable), selfdestruct: flag(e.selfdestruct),
+    ownerRenounced: renounced, holderCount: Number.isFinite(+e.holder_count) && e.holder_count !== "" ? +e.holder_count : null,
+    top10WalletPct: top10 != null ? +top10.toFixed(2) : null,
+  };
+}
+
+/** GET /api/security/:chain/:address — contract safety, only on chains GoPlus covers */
+const secCache = new Map();
+app.get("/api/security/:chain/:address", async (req, res) => {
+  const chain = String(req.params.chain || "").toLowerCase();
+  const addr = String(req.params.address || "").toLowerCase();
+  const cid = GOPLUS[chain];
+  if (!cid) return res.json({ covered: false, chain });
+  if (!/^0x[0-9a-f]{40}$/.test(addr)) return res.status(400).json({ error: "Invalid contract address" });
+  const key = chain + ":" + addr, hit = secCache.get(key);
+  if (hit && Date.now() - hit.ts < 10 * 60e3) return res.json(hit.data);
+  try {
+    const r = await withTimeout(fetch(`https://api.gopluslabs.io/api/v1/token_security/${cid}?contract_addresses=${addr}`,
+      { headers: { accept: "application/json" } }), 10000, "goplus");
+    const d = await r.json();
+    const res0 = d?.result || {};
+    const entry = res0[addr] || Object.entries(res0).find(([k]) => k.toLowerCase() === addr)?.[1];
+    const out = normalizeGoPlus(entry, chain);
+    secCache.set(key, { data: out, ts: Date.now() });
+    if (secCache.size > 3000) secCache.delete(secCache.keys().next().value);
+    res.json(out);
+  } catch (err) {
+    log("error", `security ${chain} ${addr}: ${err.message}`);
+    res.json({ covered: true, ok: false, chain, error: "Security data unavailable right now" });
   }
 });
 
@@ -859,7 +948,7 @@ app.get("/api/pools/:type", async (req, res) => {
   } catch (err) {
     log("error", `pool discovery (${type}) failed: ${err.message}`);
     if (hit.data) return res.json(hit.data); // serve stale over failing
-    res.status(502).json({ error: err.message, pools: [] });
+    res.status(502).json({ error: "Market data unavailable right now.", pools: [] });
   }
 });
 
@@ -921,7 +1010,7 @@ app.get("/api/pools/dex/:dexId", async (req, res) => {
   } catch (err) {
     log("error", `dex feed (${dexId}) failed: ${err.message}`);
     if (hit) return res.json(hit.data);
-    res.status(502).json({ error: err.message, pools: [] });
+    res.status(502).json({ error: "Market data unavailable right now.", pools: [] });
   }
 });
 
@@ -930,15 +1019,26 @@ app.get("/api/health", (req, res) => {
     status: "ok",
     // What actually opens the Exclusive page:
     exclusiveGate: { token: GATE_MINT, mustHold: GATE_MIN_HOLD },
-    // Legacy SLAP GOLD check — kept for the old /api/verify-holder endpoint only.
-    legacySlapGold: { token: SLAPGOLD_MINT, mustHold: MIN_HOLD_AMOUNT },
     time: new Date().toISOString(),
   });
 });
 
+// ── Unknown routes & errors: plain JSON, no framework fingerprint, no stack traces ──
+function notFound(req, res) { res.status(404).json({ error: "Not found" }); }
+function errorHandler(err, req, res, next) {        // 4 args = Express error handler
+  const status = err && err.type === "entity.too.large" ? 413
+               : err && err.type === "entity.parse.failed" ? 400
+               : err && err.status >= 400 && err.status < 500 ? err.status : 500;
+  if (status >= 500) log("error", `${req.method} ${req.path}: ${err && err.message}`);
+  res.status(status).json({ error: status === 413 ? "Request too large" : status < 500 ? "Malformed request" : "Something went wrong" });
+}
+app.use(notFound);
+app.use(errorHandler);
+process.on("unhandledRejection", (e) => log("error", `unhandled rejection: ${e && e.message}`));
+
 app.listen(PORT, () => {
   log("init", `BIG MOUF SLAPBOT backend running on port ${PORT}`);
-  log("init", `Gating on mint: ${SLAPGOLD_MINT}`);
-  log("init", `Min hold to unlock: ${MIN_HOLD_AMOUNT} SLAP GOLD`);
+  if (ALLOWED_ORIGINS.includes("*")) log("warn", "ALLOWED_ORIGIN is * — any website can call this API. Set it to your site URL.");
+  if (process.env.SESSION_SECRET && process.env.SESSION_SECRET.length < 32) log("warn", "SESSION_SECRET is short — use 32+ random characters.");
   log("init", `Exclusive gate: hold ${GATE_MIN_HOLD} of ${GATE_MINT}`);
 });
