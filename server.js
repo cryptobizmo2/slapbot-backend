@@ -493,56 +493,95 @@ async function geckoFeed(kind) {
 }
 
 /**
- * GET /api/exclusive/picks — the holder-only feed
- *   verified: fresh launches that PASSED on-chain safety
- *             (mint revoked, freeze revoked, top-10 wallets under 60%)
- *   momentum: trending tokens with rising price and strong buy pressure
- * Computed once a minute and shared, so holders never trigger RPC storms.
+ * The picks are built once a minute and shared by everyone, then filtered per viewer:
+ *   daily       🖐 The Daily Slap — passed EVERY on-chain safety check
+ *   noSeatbelt  🚨 No Seatbelt — real momentum, but each has at least one named red flag
+ *   First Slap  🥇 Gold Key holders see a pick the moment it appears; Holder Key
+ *               holders see it FIRST_SLAP_HOURS later (default 2).
  */
-let picksCache = { data: null, ts: 0 };
+const FIRST_SLAP_MS = Math.max(0, parseFloat(process.env.FIRST_SLAP_HOURS || "2")) * 3600 * 1000;
+const firstSeen = new Map();   // token → when the bot first picked it
+let picksWarm = false;         // first build after a restart: treat current picks as already seen
+
+/** Pure: contract dangers, in plain words. Any one of these keeps a token out of the Daily Slap. */
+function redFlags(c) {
+  const f = [];
+  if (!c.mintAuthorityRenounced) f.push("Creator can still print more");
+  if (!c.freezeAuthorityRenounced) f.push("Creator can still freeze wallets");
+  const w = c.top10WalletPct ?? c.top10HolderPct;
+  if (w != null && w >= 60) f.push(`Top 10 wallets hold ${Math.round(w)}%`);
+  return f;
+}
+/** Pure: market cautions — not contract dangers, but worth knowing. */
+function cautions(p, now = Date.now()) {
+  const n = [];
+  if (p.liq < 10000) n.push(`Thin liquidity ($${Math.round(p.liq).toLocaleString("en-US")})`);
+  if (p.createdAt && now - p.createdAt < 24 * 3600e3) n.push("Under a day old");
+  return n;
+}
+const slapScore = (p) => Math.log10(p.vol + 1) + (p.buyPct - 50) / 10 + Math.max(-20, Math.min(20, p.ch1)) / 10;
+
+async function buildPicks() {
+  const [fresh, trending] = await Promise.all([
+    geckoFeed("new_pools").catch(() => []), geckoFeed("trending_pools").catch(() => [])]);
+  const seen = new Set();
+  const candidates = [...fresh, ...trending]
+    .filter((p) => p.liq >= 3000 && p.txns >= 20 && !seen.has(p.addr) && seen.add(p.addr))
+    .sort((x, y) => y.vol - x.vol).slice(0, 18);
+  const checks = await Promise.allSettled(candidates.map((p) => getMintCheck(p.addr)));
+  let checked = 0;
+  const daily = [], noSeatbelt = [];
+  candidates.forEach((p, i) => {
+    const c = checks[i].status === "fulfilled" ? checks[i].value : null;
+    if (!c || !c.found) return;            // couldn't verify: never vouch for it, never accuse it
+    checked++;
+    const t = { ...p, buyPct: p.txns ? Math.round((p.buys / p.txns) * 100) : 50, top10: c.top10WalletPct ?? c.top10HolderPct ?? null };
+    const flags = redFlags(c);
+    if (!flags.length) daily.push({ ...t, cautions: cautions(t), score: slapScore(t) });
+    else if (t.ch1 > 0 && t.buyPct >= 55 && t.txns >= 100) noSeatbelt.push({ ...t, flags, cautions: cautions(t) });
+  });
+  daily.sort((x, y) => y.score - x.score);
+  noSeatbelt.sort((x, y) => y.ch1 - x.ch1);
+  const momentum = trending       // unchanged list, kept for pages that haven't updated yet
+    .filter((p) => p.liq >= 10000 && p.txns >= 100 && p.ch1 > 0 && p.buys / p.txns >= 0.55)
+    .map((p) => ({ ...p, buyPct: Math.round((p.buys / p.txns) * 100) }))
+    .sort((x, y) => y.ch1 - x.ch1).slice(0, 12);
+  const now = Date.now(), D = daily.slice(0, 12), N = noSeatbelt.slice(0, 10);
+  for (const t of [...D, ...N, ...momentum])
+    if (!firstSeen.has(t.addr)) firstSeen.set(t.addr, picksWarm ? now : now - FIRST_SLAP_MS);
+  picksWarm = true;
+  for (const [k, v] of firstSeen) if (now - v > 48 * 3600e3) firstSeen.delete(k);
+  const stamp = (t) => ({ ...t, seenAt: firstSeen.get(t.addr) });
+  return { updated: now, checked, candidates: candidates.length, daily: D.map(stamp), noSeatbelt: N.map(stamp), momentum: momentum.map(stamp) };
+}
+
+/** Pure: Gold Key (or owner) sees everything now; Holder Key waits out the First Slap window. */
+function forViewer(data, holder, now = Date.now()) {
+  const early = !!(holder && (holder.isOwner || holder.degraded || (holder.gold && holder.gold.ok)));
+  const fresh = (t) => now - (t.seenAt || 0) < FIRST_SLAP_MS;
+  const view = (list) => (list || []).filter((t) => early || !fresh(t)).map((t) => ({ ...t, firstSlap: fresh(t) }));
+  const daily = view(data.daily), noSeatbelt = view(data.noSeatbelt);
+  const heldBack = early ? 0 : [...(data.daily || []), ...(data.noSeatbelt || [])].filter(fresh).length;
+  return { ...data, daily, noSeatbelt, verified: daily, momentum: view(data.momentum),
+           firstSlap: { early, hours: FIRST_SLAP_MS / 3600e3, heldBack } };
+}
+
+let picksCache = { data: null, ts: 0 }, picksBuilding = null;
 const PICKS_TTL = 60 * 1000;
 app.get("/api/exclusive/picks", requireHolder, async (req, res) => {
-  if (picksCache.data && Date.now() - picksCache.ts < PICKS_TTL) return res.json(picksCache.data);
   try {
-    const [fresh, trending] = await Promise.all([
-      geckoFeed("new_pools").catch(() => []),
-      geckoFeed("trending_pools").catch(() => []),
-    ]);
-
-    // Cheap gates first, then the expensive on-chain check on the best few
-    const seen = new Set();
-    const candidates = [...fresh, ...trending]
-      .filter((p) => p.liq >= 3000 && p.txns >= 20 && !seen.has(p.addr) && seen.add(p.addr))
-      .sort((a, b) => b.vol - a.vol)
-      .slice(0, 14);
-
-    const checks = await Promise.allSettled(candidates.map((p) => getMintCheck(p.addr)));
-    let checked = 0;
-    const verified = [];
-    candidates.forEach((p, i) => {
-      const c = checks[i].status === "fulfilled" ? checks[i].value : null;
-      if (!c || !c.found) return;
-      checked++;
-      const safe = c.mintAuthorityRenounced && c.freezeAuthorityRenounced &&
-                   ((c.top10WalletPct ?? c.top10HolderPct) == null || (c.top10WalletPct ?? c.top10HolderPct) < 60);
-      if (safe) verified.push({ ...p, top10: c.top10WalletPct ?? c.top10HolderPct,
-        buyPct: p.txns ? Math.round((p.buys / p.txns) * 100) : 50 });
-    });
-
-    const momentum = trending
-      .filter((p) => p.liq >= 10000 && p.txns >= 100 && p.ch1 > 0 && p.txns && p.buys / p.txns >= 0.55)
-      .map((p) => ({ ...p, buyPct: Math.round((p.buys / p.txns) * 100) }))
-      .sort((a, b) => b.ch1 - a.ch1)
-      .slice(0, 12);
-
-    const payload = { updated: Date.now(), verified: verified.slice(0, 12), momentum,
-                      checked, candidates: candidates.length };
-    picksCache = { data: payload, ts: Date.now() };
-    log("exclusive", `picks: ${verified.length} verified of ${checked} checked, ${momentum.length} momentum`);
-    res.json(payload);
+    if (!picksCache.data || Date.now() - picksCache.ts >= PICKS_TTL) {
+      picksBuilding = picksBuilding || buildPicks().finally(() => { picksBuilding = null; });
+      const data = await picksBuilding;
+      if (picksCache.data !== data) {
+        picksCache = { data, ts: Date.now() };
+        log("exclusive", `picks: ${data.daily.length} Daily Slap, ${data.noSeatbelt.length} No Seatbelt (${data.checked} checked)`);
+      }
+    }
+    res.json(forViewer(picksCache.data, req.holder));
   } catch (err) {
     log("error", `picks failed: ${err.message}`);
-    if (picksCache.data) return res.json(picksCache.data);
+    if (picksCache.data) return res.json(forViewer(picksCache.data, req.holder));
     res.status(502).json({ error: "Couldn't build picks right now. Try again shortly." });
   }
 });
