@@ -107,6 +107,8 @@ const limiter = rateLimit({
 app.use(limiter);
 app.use("/api/auth", rateLimit({ windowMs: 60 * 1000, max: 12, standardHeaders: true, legacyHeaders: false,
   message: { error: "Too many sign-in attempts. Wait a minute." } }));
+app.use("/api/claim", rateLimit({ windowMs: 60 * 1000, max: 12, standardHeaders: true, legacyHeaders: false,
+  message: { error: "Too many attempts. Wait a minute." } }));
 app.use(["/api/token", "/api/mint-check"], rateLimit({ windowMs: 60 * 1000, max: 40, standardHeaders: true,
   legacyHeaders: false, message: { error: "Too many lookups. Slow down." } }));
 
@@ -976,6 +978,150 @@ app.get("/api/security/:chain/:address", async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════
+// ⑩ BIG MOUF ALLOCATION LIST — hold SLAP IT N YA MOUF, earn a $SLAPGOLD share
+// ═══════════════════════════════════════════════════════════════════════
+/**
+ * Holders of the main token sign once (free, no transaction) to join the list.
+ * At the reveal, the owner takes a snapshot: every wallet's holding is re-read
+ * LIVE, anyone who sold below the bar drops off, and the $SLAPGOLD pool is split
+ * in proportion to what each wallet holds right then.
+ *
+ *  - Proportional, not per-wallet: one bag split across ten wallets earns exactly
+ *    what it earns in one, so the list can't be farmed.
+ *  - Snapshot at export, not at sign-up: buy, join, sell = nothing.
+ *  - Stored on a Railway Volume so restarts and new uploads never wipe it.
+ *    Without one it still works in memory, and /api/health says so plainly.
+ */
+const nodeFs = require("fs"), nodePath = require("path");
+const VOLUME_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || process.env.DATA_DIR || "";
+const CLAIMS_FILE = VOLUME_DIR ? nodePath.join(VOLUME_DIR, "allocation-list.json") : "";
+const claims = new Map();
+let claimsPersistent = false;
+if (CLAIMS_FILE) {
+  try {
+    nodeFs.mkdirSync(VOLUME_DIR, { recursive: true });
+    if (nodeFs.existsSync(CLAIMS_FILE))
+      for (const c of JSON.parse(nodeFs.readFileSync(CLAIMS_FILE, "utf8")))
+        if (c && typeof c.wallet === "string") claims.set(c.wallet, c);
+    nodeFs.accessSync(VOLUME_DIR, nodeFs.constants.W_OK);
+    claimsPersistent = true;
+    log("init", `Allocation list: ${claims.size} wallets loaded from the volume`);
+  } catch (e) { log("error", `Allocation list storage unavailable (${e.message}) — memory only`); }
+} else log("warn", "No Railway Volume attached — the allocation list is wiped on every restart");
+
+function saveClaims() {
+  if (!claimsPersistent) return;
+  try {
+    const tmp = CLAIMS_FILE + ".tmp";
+    nodeFs.writeFileSync(tmp, JSON.stringify([...claims.values()]));
+    nodeFs.renameSync(tmp, CLAIMS_FILE);        // atomic: a crash mid-write can't corrupt the list
+  } catch (e) { log("error", `Saving the allocation list failed: ${e.message}`); }
+}
+
+function claimChallengeText(wallet, nonce) {
+  return "Join the BIG MOUF allocation list\n\nWallet: " + wallet + "\nNonce: " + nonce +
+         "\n\nThis proves you own this wallet. It is free, sends no transaction, and cannot move your funds.";
+}
+const claimChallenges = new Map();
+
+/** Live holding check — used at sign-up and again for every wallet at the snapshot. */
+async function holdingNow(wallet) {
+  const [bal, price] = await Promise.all([balanceOf(wallet, GATE_MINT), tokenPriceUsd(GATE_MINT)]);
+  const valueUsd = price.v ? +(bal * price.v).toFixed(2) : null;
+  return { balance: bal, valueUsd, eligible: price.v ? valueUsd >= GATE_MIN_USD : bal >= GATE_MIN_HOLD };
+}
+
+/** Pure: split `pool` across eligible rows in proportion to holdings. Rounds down, never over-allocates. */
+function allocate(rows, pool) {
+  const total = rows.reduce((s, r) => s + (r.eligible ? r.balance : 0), 0);
+  return rows.map((r) => {
+    const share = r.eligible && total > 0 ? r.balance / total : 0;
+    return { ...r, sharePct: +(share * 100).toFixed(4), amount: Math.floor(pool * share * 1e4) / 1e4 };
+  });
+}
+
+app.get("/api/claim/challenge", (req, res) => {
+  const wallet = String(req.query.wallet || "");
+  try { if (b58decode(wallet).length !== 32) throw 0; }
+  catch { return res.status(400).json({ error: "That isn't a valid Solana wallet address." }); }
+  const nonce = crypto.randomBytes(16).toString("hex");
+  claimChallenges.set(wallet, { nonce, exp: Date.now() + CHALLENGE_MS });
+  if (claimChallenges.size > 5000) claimChallenges.delete(claimChallenges.keys().next().value);
+  res.json({ message: claimChallengeText(wallet, nonce) });
+});
+
+app.post("/api/claim/verify", async (req, res) => {
+  try {
+    const { wallet, signature } = req.body || {};
+    if (typeof wallet !== "string" || typeof signature !== "string" || wallet.length > 64 || signature.length > 200)
+      return res.status(400).json({ error: "Malformed request." });
+    const ch = claimChallenges.get(wallet);
+    if (!ch || ch.exp < Date.now()) return res.status(400).json({ error: "Expired — please try again." });
+    claimChallenges.delete(wallet);
+    if (!verifySolanaSignature(wallet, claimChallengeText(wallet, ch.nonce), signature))
+      return res.status(401).json({ error: "That signature doesn't match this wallet." });
+
+    // The owner gets the snapshot tools — and is never on the list they're distributing.
+    if (MY_WALLET && wallet === MY_WALLET)
+      return res.json({ owner: true, ownerPass: issuePass(wallet), listedCount: claims.size, persistent: claimsPersistent });
+
+    let h;
+    try { h = await holdingNow(wallet); }
+    catch (err) {
+      log("error", `claim balance check failed: ${err.message}`);
+      return res.status(503).json({ error: "Couldn't reach Solana to check your balance. Please try again.", retry: true });
+    }
+    if (!h.eligible)
+      return res.status(403).json({ listed: claims.has(wallet), balance: h.balance, valueUsd: h.valueUsd, needUsd: GATE_MIN_USD, need: GATE_MIN_HOLD });
+    const prev = claims.get(wallet);
+    claims.set(wallet, { wallet, balance: h.balance, valueUsd: h.valueUsd, joined: prev ? prev.joined : Date.now(), checked: Date.now() });
+    saveClaims();
+    log("claim", `${wallet.slice(0, 4)}… ${prev ? "re-checked" : "joined"} — ${claims.size} on the list`);
+    res.json({ listed: true, first: !prev, balance: h.balance, valueUsd: h.valueUsd, needUsd: GATE_MIN_USD, listedCount: claims.size });
+  } catch (err) {
+    log("error", `claim/verify crashed: ${err.message}`);
+    res.status(500).json({ error: "Something went wrong." });
+  }
+});
+
+app.get("/api/claim/stats", (req, res) => res.json({ listedCount: claims.size, needUsd: GATE_MIN_USD }));
+
+/** Owner-only: take the snapshot and split the pool. */
+app.post("/api/claim/export", async (req, res) => {
+  try {
+    const p = readPass(String(req.headers.authorization || "").replace(/^Bearer\s+/i, ""));
+    if (!p) return res.status(401).json({ error: "Sign in with your owner wallet first." });
+    if (!MY_WALLET || p.w !== MY_WALLET) return res.status(403).json({ error: "Owner only." });
+    const pool = Number((req.body || {}).pool);
+    if (!Number.isFinite(pool) || pool <= 0 || pool > 10000)
+      return res.status(400).json({ error: "The pool must be between 0 and 10,000 $SLAPGOLD." });
+
+    const list = [...claims.values()], rows = [];
+    for (let i = 0; i < list.length; i += 5) {               // 5 at a time — gentle on the RPC
+      const batch = await Promise.allSettled(list.slice(i, i + 5).map((c) => holdingNow(c.wallet)));
+      batch.forEach((r, j) => {
+        const c = list[i + j];
+        if (r.status === "fulfilled") {
+          rows.push({ wallet: c.wallet, balance: r.value.balance, valueUsd: r.value.valueUsd, eligible: r.value.eligible,
+                      status: r.value.eligible ? "ok" : "below the bar at snapshot" });
+          claims.set(c.wallet, { ...c, balance: r.value.balance, valueUsd: r.value.valueUsd, checked: Date.now() });
+        } else rows.push({ wallet: c.wallet, balance: c.balance, valueUsd: c.valueUsd, eligible: false, status: "couldn't check — snapshot again" });
+      });
+    }
+    saveClaims();
+    const out = allocate(rows, pool);
+    const csv = "wallet,slapit_held,value_usd,status,share_pct,slapgold_amount\n" +
+      out.map((r) => [r.wallet, r.balance, r.valueUsd ?? "", r.status, r.sharePct, r.amount].join(",")).join("\n");
+    const unchecked = out.filter((r) => r.status.startsWith("couldn")).length;
+    log("claim", `snapshot: ${out.filter((r) => r.amount > 0).length} of ${out.length} wallets share ${pool} $SLAPGOLD`);
+    res.json({ snapshotAt: new Date().toISOString(), pool, rows: out, csv, unchecked });
+  } catch (err) {
+    log("error", `claim/export crashed: ${err.message}`);
+    res.status(500).json({ error: "Something went wrong." });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
 // health check
 // ═══════════════════════════════════════════════════════════════════════
 // ═══════════════════════════════════════════════════════════════════════
@@ -1115,6 +1261,7 @@ app.get("/api/health", (req, res) => {
     status: "ok",
     // What actually opens the Exclusive page:
     exclusiveGate: { goldKey: { token: GOLD_MINT, hold: GOLD_MIN_HOLD }, holderKey: { token: GATE_MINT, holdUsd: GATE_MIN_USD } },
+    allocationList: { listed: claims.size, savedPermanently: claimsPersistent },
     time: new Date().toISOString(),
   });
 });
