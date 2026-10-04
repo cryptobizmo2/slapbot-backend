@@ -819,8 +819,10 @@ app.get("/api/trades/:pool", async (req, res) => {
     const d = await geckoAny(`/networks/${gid}/pools/${pool}/trades`);
     const trades = (d?.data || []).slice(0, 40).map((t) => {
       const a = t.attributes || {};
-      return { kind: a.kind === "sell" ? "sell" : "buy", usd: +a.volume_in_usd || 0,
-        wallet: a.tx_from_address || null, tx: a.tx_hash || null,
+      // Only address-shaped strings get through, so nothing from the data source can inject into a page
+      const okAddr = /^(?:[1-9A-HJ-NP-Za-km-z]{32,44}|0x[0-9a-fA-F]{40})$/, okTx = /^(?:[1-9A-HJ-NP-Za-km-z]{64,90}|0x[0-9a-fA-F]{64})$/;
+      return { kind: a.kind === "sell" ? "sell" : "buy", usd: Number.isFinite(+a.volume_in_usd) ? +a.volume_in_usd : 0,
+        wallet: okAddr.test(String(a.tx_from_address)) ? a.tx_from_address : null, tx: okTx.test(String(a.tx_hash)) ? a.tx_hash : null,
         at: a.block_timestamp ? new Date(a.block_timestamp).getTime() : null };
     });
     const out = { trades };
@@ -1189,6 +1191,7 @@ const SMART_PRICE_USD = Math.max(1, parseFloat(process.env.SMART_PRICE_USD || "3
 const SMART_MS = Math.max(1, parseFloat(process.env.SMART_HOURS || "24")) * 3600e3;
 const SMART_FILE = VOLUME_DIR ? nodePath.join(VOLUME_DIR, "smart-wallets.json") : "";
 
+const SOL_ADDR = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/, SOL_SIG = /^[1-9A-HJ-NP-Za-km-z]{64,90}$/;
 const smartPaid = new Map();     // wallet → { until, sigs: [] }
 const smartQuotes = new Map();   // payment reference → { wallet, lamports, exp }
 const ledger = new Map();        // wallet → Map(token → { b, bt, s, st, n, f, l })
@@ -1239,7 +1242,10 @@ async function refreshWatchList() {
   for (const p of [...trending, ...fresh]) {
     if (!p.pairAddress || seen.has(p.addr) || p.liq < 5000 || p.txns < 50) continue;
     seen.add(p.addr);
-    list.push({ addr: p.addr, pair: p.pairAddress, sym: p.sym });
+    if (!SOL_ADDR.test(p.addr) || !SOL_ADDR.test(p.pairAddress)) continue;
+    const sym = String(p.sym || "?").replace(/[^\w$.\- ]/g, "").slice(0, 16) || "?";
+    p.sym = sym;
+    list.push({ addr: p.addr, pair: p.pairAddress, sym });
     tokenInfo.set(p.addr, { sym: p.sym, price: p.price, pool: p.pairAddress, ts: Date.now() });
   }
   if (list.length) watchList = list.slice(0, 30);
@@ -1255,7 +1261,8 @@ async function ingestPool(pool) {
     if (!a.tx_hash || seen.has(a.tx_hash)) continue;
     seen.add(a.tx_hash);
     const w = a.tx_from_address, usd = +a.volume_in_usd || 0, buy = a.kind === "buy";
-    if (!w || !(usd > 0)) continue;
+    if (!SOL_ADDR.test(String(w || "")) || !(usd > 0) || usd > 1e9) continue;   // real wallets, sane sizes only
+    if (!SOL_SIG.test(String(a.tx_hash))) continue;
     if (buy && a.to_token_address && a.to_token_address !== pool.addr) continue;
     if (!buy && a.from_token_address && a.from_token_address !== pool.addr) continue;
     const tok = buy ? +a.to_token_amount : +a.from_token_amount;
@@ -1290,6 +1297,12 @@ function pruneSmart() {
   }
   for (const [pair] of poolSeen) if (!watchList.some((p) => p.pair === pair)) poolSeen.delete(pair);
   for (const [ref, q] of smartQuotes) if (q.exp < now) smartQuotes.delete(ref);
+  if (tokenInfo.size > 3000) {                // keep prices only for tokens someone still holds or we watch
+    const live = new Set(watchList.map((p) => p.addr));
+    for (const m of ledger.values()) for (const t of m.keys()) live.add(t);
+    for (const t of tokenInfo.keys()) if (!live.has(t)) tokenInfo.delete(t);
+  }
+  for (const [w, p] of smartPaid) if (p.until < now - 7 * 24 * 3600e3) smartPaid.delete(w);
 }
 
 /** Pure: one wallet's record from its ledger. */
@@ -1341,7 +1354,7 @@ setInterval(async () => {
     const pool = watchList[watchIdx++ % watchList.length];
     await ingestPool(pool);
   } catch (e) { if (smartTick % 15 === 0) log("error", `smart wallets: ${e.message}`); }
-  if (smartTick % 30 === 0) { pruneSmart(); saveSmart(); }
+  if (smartTick % 30 === 0) { try { pruneSmart(); saveSmart(); } catch (e) { log("error", `smart upkeep: ${e.message}`); } }
 }, 20000);
 
 // ── access ──
@@ -1392,6 +1405,7 @@ app.post("/api/smart/quote", async (req, res) => {
     const { blockhash } = await withTimeout(connection.getLatestBlockhash("finalized"), 8000, "blockhash");
     const tx = new Transaction({ feePayer: new PublicKey(w), recentBlockhash: blockhash }).add(ix);
     smartQuotes.set(reference.toBase58(), { wallet: w, lamports, exp: Date.now() + 15 * 60e3 });
+    if (smartQuotes.size > 5000) smartQuotes.delete(smartQuotes.keys().next().value);
     res.json({ message: b58encode(tx.serializeMessage()),
                transaction: tx.serialize({ requireAllSignatures: false, verifySignatures: false }).toString("base64"),
                lamports, sol: +(lamports / 1e9).toFixed(4), usd: SMART_PRICE_USD, hours: SMART_MS / 3600e3 });
