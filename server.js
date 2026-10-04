@@ -76,7 +76,9 @@ function securityHeaders(req, res, next) {
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("Referrer-Policy", "no-referrer");
   res.setHeader("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'");
-  res.setHeader("Permissions-Policy", "geolocation=(), camera=(), microphone=()");
+  res.setHeader("Permissions-Policy", "geolocation=(), camera=(), microphone=(), payment=(), usb=()");
+  res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+  res.setHeader("X-DNS-Prefetch-Control", "off");
   res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
   if (req.path.startsWith("/api/auth") || req.path.startsWith("/api/exclusive") || req.path.startsWith("/api/smart")) res.setHeader("Cache-Control", "no-store");
   next();
@@ -109,6 +111,8 @@ app.use("/api/auth", rateLimit({ windowMs: 60 * 1000, max: 12, standardHeaders: 
   message: { error: "Too many sign-in attempts. Wait a minute." } }));
 app.use("/api/claim", rateLimit({ windowMs: 60 * 1000, max: 12, standardHeaders: true, legacyHeaders: false,
   message: { error: "Too many attempts. Wait a minute." } }));
+app.use("/api/lowsupply", rateLimit({ windowMs: 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false,
+  message: { error: "Too many requests. Slow down." } }));
 app.use(["/api/token", "/api/mint-check"], rateLimit({ windowMs: 60 * 1000, max: 40, standardHeaders: true,
   legacyHeaders: false, message: { error: "Too many lookups. Slow down." } }));
 
@@ -442,6 +446,34 @@ app.post("/api/auth/verify", async (req, res) => {
   // non-holders pay; every Exclusive route still re-checks the balance on each visit.
   if (!status.authorized) return res.status(403).json({ error: "Not enough tokens", ...status, basicPass: issuePass(wallet) });
   res.json({ pass: issuePass(wallet), ...status });
+});
+
+/**
+ * Owner sign-in with a secret code — no wallet needed.
+ * The code lives ONLY in Railway → Variables → OWNER_CODE (never in GitHub, never in a page).
+ * It must be 12+ characters or this door stays shut. Wrong guesses are capped hard:
+ * 5 per 15 minutes per person, and after 25 wrong guesses from anyone in an hour
+ * the door locks for everyone for an hour. Compared in constant time.
+ */
+const OWNER_CODE = String(process.env.OWNER_CODE || "");
+const OWNER_CODE_HASH = OWNER_CODE.length >= 12 ? crypto.createHash("sha256").update(OWNER_CODE).digest() : null;
+let ownerFails = [], ownerLockedUntil = 0;
+app.post("/api/auth/owner", rateLimit({ windowMs: 15 * 60 * 1000, max: 5, standardHeaders: true, legacyHeaders: false,
+  message: { error: "Too many tries. Wait 15 minutes." } }), (req, res) => {
+  if (!OWNER_CODE_HASH || !MY_WALLET) return res.status(404).json({ error: "Owner sign-in isn't set up." });
+  const now = Date.now();
+  if (now < ownerLockedUntil) return res.status(429).json({ error: "Owner sign-in is locked for a while. Try later." });
+  const code = (req.body || {}).code;
+  if (typeof code !== "string" || code.length > 200) return res.status(400).json({ error: "Wrong code." });
+  const ok = crypto.timingSafeEqual(crypto.createHash("sha256").update(code).digest(), OWNER_CODE_HASH);
+  if (!ok) {
+    ownerFails = ownerFails.filter((t) => now - t < 3600e3); ownerFails.push(now);
+    if (ownerFails.length >= 25) { ownerLockedUntil = now + 3600e3; ownerFails = []; log("warn", "owner sign-in locked for 1 hour after repeated wrong codes"); }
+    log("access", `wrong owner code from ${String(req.ip).slice(0, 24)}`);
+    return res.status(401).json({ error: "Wrong code." });
+  }
+  log("access", "owner signed in with code");
+  res.json({ pass: issuePass(MY_WALLET), wallet: MY_WALLET, owner: true });
 });
 
 /** Guard for every exclusive endpoint — re-checks the balance on each visit */
@@ -1259,6 +1291,7 @@ async function ingestPool(pool) {
   for (const t of d?.data || []) {
     const a = t.attributes || {};
     if (!a.tx_hash || seen.has(a.tx_hash)) continue;
+    if (typeof alertBuySigs !== "undefined" && alertBuySigs.has(a.tx_hash)) { seen.add(a.tx_hash); continue; }   // already counted live
     seen.add(a.tx_hash);
     const w = a.tx_from_address, usd = +a.volume_in_usd || 0, buy = a.kind === "buy";
     if (!SOL_ADDR.test(String(w || "")) || !(usd > 0) || usd > 1e9) continue;   // real wallets, sane sizes only
@@ -1487,6 +1520,275 @@ app.get("/api/smart/wallet/:addr", requireSmart, (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════
+// ⑫ LIVE WALLET ALERTS — a buy by a top or followed wallet, within seconds
+// ═══════════════════════════════════════════════════════════════════════
+/**
+ * The leaderboard learns from pool trades, which can lag by minutes. Alerts don't:
+ * the bot opens a live line to Solana for each watched wallet (top wallets +
+ * wallets people follow) and hears every transaction the moment it confirms.
+ * It reads the transaction, and if the wallet's balance of some token went UP
+ * while its SOL or stablecoins went DOWN, that's a buy. It fires an alert.
+ *
+ * Stacking: when 2+ smart wallets buy the same token within 30 minutes, the alert
+ * says so. That's the closest thing to "before": it's usually early in a move.
+ */
+const ALERT_MAX_WALLETS = Math.max(5, parseInt(process.env.ALERT_MAX_WALLETS || "80", 10));
+const ALERT_TOP_N = Math.max(0, parseInt(process.env.ALERT_TOP_N || "25", 10));
+const NOT_A_BUY = new Set(["So11111111111111111111111111111111111111112",
+  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"]);
+const STABLES = new Set(["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"]);
+
+const liveSubs = new Map();      // wallet → subscription id
+const followDemand = new Map();  // wallet → last time someone asked to follow it
+const alertSeen = new Set();     // tx signatures already handled
+const alertBuySigs = new Set();  // buys recorded live, so pool reads don't count them twice
+const walletRate = new Map();    // wallet → { n, ts } — caps tx reads per wallet per minute
+let alerts = [];                 // { w, t, sym, usd, at, seen, tx, stack }
+let alertQueue = [], alertBusy = 0;
+const metaCache = new Map();
+
+async function symbolFor(mint) {
+  const i = tokenInfo.get(mint);
+  if (i && i.sym && i.sym !== "?") return i.sym;
+  if (metaCache.has(mint)) return metaCache.get(mint);
+  let sym = "?";
+  try { const md = await readMetadata(mint); if (md?.symbol) sym = String(md.symbol).replace(/[^\w$.\- ]/g, "").slice(0, 16) || "?"; } catch {}
+  metaCache.set(mint, sym);
+  if (metaCache.size > 3000) metaCache.delete(metaCache.keys().next().value);
+  return sym;
+}
+
+/** Pure: did this wallet buy something in this parsed transaction? */
+function readBuy(tx, w, solPrice) {
+  if (!tx || tx.meta?.err) return null;
+  const keys = (tx.transaction?.message?.accountKeys || []).map((k) => (k.pubkey ? k.pubkey.toBase58() : String(k)));
+  const i = keys.indexOf(w);
+  if (i < 0) return null;
+  const delta = new Map();
+  for (const b of tx.meta.preTokenBalances || []) if (b.owner === w) delta.set(b.mint, (delta.get(b.mint) || 0) - (+b.uiTokenAmount?.uiAmount || 0));
+  for (const b of tx.meta.postTokenBalances || []) if (b.owner === w) delta.set(b.mint, (delta.get(b.mint) || 0) + (+b.uiTokenAmount?.uiAmount || 0));
+  let got = null;
+  for (const [mint, d] of delta) if (d > 0 && !NOT_A_BUY.has(mint) && (!got || d > got.amount)) got = { mint, amount: d };
+  if (!got) return null;
+  const fee = i === 0 ? (tx.meta.fee || 0) : 0;
+  const lam = (tx.meta.postBalances?.[i] ?? 0) - (tx.meta.preBalances?.[i] ?? 0) + fee;   // SOL moved, fee excluded
+  let spent = lam < 0 ? (-lam / 1e9) * solPrice : 0;
+  const wsol = delta.get("So11111111111111111111111111111111111111112");
+  if (wsol < 0) spent += -wsol * solPrice;
+  for (const s of STABLES) if (delta.get(s) < 0) spent += -delta.get(s);
+  if (!(spent >= 20)) return null;          // dust, airdrops and transfers in aren't buys
+  return { mint: got.mint, amount: got.amount, usd: +spent.toFixed(2), at: (tx.blockTime || Math.floor(Date.now() / 1000)) * 1000 };
+}
+
+async function handleWalletTx(w, sig) {
+  try {
+    const read = () => withTimeout(connection.getParsedTransaction(sig, { maxSupportedTransactionVersion: 0, commitment: "confirmed" }), 9000, "alert tx");
+    let tx = await read();
+    if (!tx) { await new Promise((r) => setTimeout(r, 1500)); tx = await read(); }   // just-confirmed txs can take a moment to index
+    let sol = 0; try { sol = await getSolUsd(); } catch {}
+    const buy = readBuy(tx, w, sol || 150);
+    if (!buy) return;
+    const sym = await symbolFor(buy.mint);
+    const now = Date.now();
+    const stack = new Set(alerts.filter((a) => a.t === buy.mint && now - a.seen < 30 * 60e3).map((a) => a.w).concat(w)).size;
+    alerts.push({ w, t: buy.mint, sym, usd: buy.usd, at: buy.at, seen: now, tx: sig, stack });
+    alertBuySigs.add(sig); if (alertBuySigs.size > 20000) for (const x of [...alertBuySigs].slice(0, 10000)) alertBuySigs.delete(x);
+    if (alerts.length > 600) alerts = alerts.slice(-500);
+    // feed the learning ledger too, so live buys count toward the leaderboard
+    let m = ledger.get(w); if (!m) { m = new Map(); ledger.set(w, m); }
+    const p = m.get(buy.mint) || { b: 0, bt: 0, s: 0, st: 0, n: 0, f: buy.at, l: buy.at };
+    p.b += buy.usd; p.bt += buy.amount; p.n++; p.l = Math.max(p.l, buy.at); m.set(buy.mint, p);
+    if (!tokenInfo.has(buy.mint)) tokenInfo.set(buy.mint, { sym, price: buy.usd / buy.amount, pool: null, ts: now });
+    recentBuys.push({ w, t: buy.mint, usd: buy.usd, at: buy.at, tx: sig });
+    log("alert", `${w.slice(0, 4)}… bought ${sym} $${buy.usd}${stack > 1 ? ` — ${stack} smart wallets in` : ""} (${((now - buy.at) / 1000).toFixed(0)}s after the block)`);
+  } catch (e) { /* one unreadable tx never matters */ }
+}
+
+function pumpAlertQueue() {
+  while (alertBusy < 3 && alertQueue.length) {
+    const job = alertQueue.shift();
+    alertBusy++;
+    handleWalletTx(job.w, job.sig).finally(() => { alertBusy--; pumpAlertQueue(); });
+  }
+}
+
+function onWalletLogs(w, logs) {
+  const sig = logs?.signature;
+  if (!sig || logs.err || alertSeen.has(sig)) return;
+  alertSeen.add(sig);
+  if (alertSeen.size > 20000) for (const s of [...alertSeen].slice(0, 10000)) alertSeen.delete(s);
+  const r = walletRate.get(w) || { n: 0, ts: Date.now() };
+  if (Date.now() - r.ts > 60e3) { r.n = 0; r.ts = Date.now(); }
+  if (++r.n > 20) return;                     // a wallet spamming 20+ txs a minute is a bot, skip the rest
+  walletRate.set(w, r);
+  if (alertQueue.length < 300) { alertQueue.push({ w, sig }); pumpAlertQueue(); }
+}
+
+/** Keep live lines open to exactly the wallets that matter right now. */
+async function syncLiveWallets() {
+  const now = Date.now();
+  for (const [w, t] of followDemand) if (now - t > 6 * 3600e3) followDemand.delete(w);
+  const want = new Set();
+  for (const r of leaderboard().slice(0, ALERT_TOP_N)) { if (want.size >= ALERT_MAX_WALLETS) break; want.add(r.wallet); }
+  for (const w of [...followDemand.keys()].sort((a, b) => followDemand.get(b) - followDemand.get(a))) { if (want.size >= ALERT_MAX_WALLETS) break; want.add(w); }
+  for (const [w, id] of liveSubs) if (!want.has(w)) { liveSubs.delete(w); try { await connection.removeOnLogsListener(id); } catch {} }
+  for (const w of want) {
+    if (liveSubs.has(w)) continue;
+    try { liveSubs.set(w, connection.onLogs(new PublicKey(w), (l) => onWalletLogs(w, l), "confirmed")); }
+    catch (e) { log("error", `live line to ${w.slice(0, 4)}… failed: ${e.message}`); }
+  }
+}
+setTimeout(() => syncLiveWallets().catch(() => {}), 15000);
+setInterval(() => syncLiveWallets().catch((e) => log("error", `live wallets: ${e.message}`)), 60000);
+setInterval(() => { const cut = Date.now() - 24 * 3600e3; alerts = alerts.filter((a) => a.seen > cut); }, 10 * 60e3);
+
+/**
+ * GET /api/smart/alerts?since=<ms>&follow=a,b,c
+ * New buys by top wallets and the caller's followed wallets. Asking also tells
+ * the bot to keep a live line open to those followed wallets.
+ */
+app.get("/api/smart/alerts", requireSmart, (req, res) => {
+  const follow = String(req.query.follow || "").split(",").map((s) => s.trim()).filter((s) => SOL_ADDR.test(s)).slice(0, 25);
+  const now = Date.now();
+  let added = false;
+  for (const w of follow) { if (!followDemand.has(w)) added = true; followDemand.set(w, now); }
+  if (followDemand.size > 2000) for (const k of [...followDemand.keys()].slice(0, 1000)) followDemand.delete(k);
+  if (added) syncLiveWallets().catch(() => {});
+  const since = Math.max(now - 6 * 3600e3, +req.query.since || 0);
+  const ranks = new Map(leaderboard().map((r) => [r.wallet, r.rank]));
+  const mine = new Set(follow);
+  const out = alerts.filter((a) => a.seen > since && (ranks.has(a.w) || mine.has(a.w) || liveSubs.has(a.w)))
+    .slice(-60).reverse()
+    .map((a) => ({ wallet: a.w, rank: ranks.get(a.w) || null, followed: mine.has(a.w), token: a.t, sym: a.sym,
+                   usd: a.usd, at: a.at, seen: a.seen, tx: a.tx, stack: a.stack }));
+  res.json({ now, live: liveSubs.size, alerts: out });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// ⑬ LOW SUPPLY FINDER — small-supply tokens on every chain, like $SLAPGOLD
+// ═══════════════════════════════════════════════════════════════════════
+/**
+ * Nobody can list "every token on every chain" (there are millions, most dead).
+ * What the bot CAN do: keep sweeping the newest and trending pools across all
+ * networks, read each token's real total supply, and keep the ones at or under
+ * LOW_SUPPLY_MAX (default 1,000,000) that have real liquidity. One chain gets a
+ * deep look every round, so over time every network is covered.
+ *
+ * Zcash: ZEC is its own network, but it has no tokens or DEX pools to scan yet.
+ * Zcash Shielded Assets (custom tokens) are scheduled with Network Upgrade 7.
+ * The bot shows ZEC's price now and is ready to add Zcash tokens once they exist
+ * and are indexed.
+ */
+const LOW_SUPPLY_MAX = Math.max(1, parseFloat(process.env.LOW_SUPPLY_MAX || "1000000"));
+const LOW_MIN_LIQ = Math.max(0, parseFloat(process.env.LOW_MIN_LIQ || "1000"));
+const lowSupply = new Map();        // gid:addr → token record
+const supplyKnown = new Map();      // gid:addr → { supply, ts } (big ones too, so we don't re-ask)
+let lowRound = 0, lowChainIdx = 0, lowLastRun = 0;
+
+function poolRows(raw) {
+  const inc = raw.included || [], n = (v) => (Number.isFinite(+v) ? +v : 0);
+  return (raw.data || []).map((p) => {
+    const a = p.attributes || {}, btId = p.relationships?.base_token?.data?.id || "";
+    const bt = inc.find((x) => x.id === btId);
+    const gid = p.relationships?.network?.data?.id || btId.slice(0, btId.indexOf("_"));
+    return { gid, addr: btId.slice(btId.indexOf("_") + 1), pool: a.address || "",
+      sym: String(bt?.attributes?.symbol || (a.name || "").split("/")[0].trim() || "?").replace(/[^\w$.\- ]/g, "").slice(0, 16) || "?",
+      name: String(bt?.attributes?.name || "").replace(/[<>"'&]/g, "").slice(0, 40),
+      price: n(a.base_token_price_usd), mcap: n(a.market_cap_usd) || n(a.fdv_usd), liq: n(a.reserve_in_usd),
+      vol: n(a.volume_usd?.h24), ch24: n(a.price_change_percentage?.h24),
+      createdAt: a.pool_created_at ? new Date(a.pool_created_at).getTime() : null };
+  }).filter((r) => r.gid && r.addr && SAFE_ADDR.test(r.addr) && SAFE_ADDR.test(r.pool) && r.price > 0 && !WRAPPED_NOISE.has(r.sym.toUpperCase()));
+}
+
+async function sweepLowSupply() {
+  lowRound++; lowLastRun = Date.now();
+  const nets = await getGeckoNetworks();
+  const back = {}; for (const d of DEX_CHAINS) { const g = pickGecko(d, nets); if (g) back[g] = d; }
+  back.solana = "solana";
+  // global new + trending every round, plus one chain's new pools in depth (rotates through all)
+  const paths = ["/networks/new_pools?include=base_token,network&page=1", "/networks/trending_pools?include=base_token,network&page=1"];
+  if (lowRound % 2 === 0) paths.push("/networks/new_pools?include=base_token,network&page=2");
+  const chain = DEX_CHAINS[lowChainIdx++ % DEX_CHAINS.length], cg = await resolveGecko(chain).catch(() => null);
+  if (cg) paths.push(`/networks/${cg}/new_pools?include=base_token,network&page=1`);
+  const rows = [];
+  for (const p of paths) { try { rows.push(...poolRows(await geckoAny(p))); } catch {} }
+
+  // read supply for tokens we haven't seen, 30 per call, grouped by network
+  const need = new Map();
+  for (const r of rows) {
+    const k = r.gid + ":" + r.addr;
+    if (supplyKnown.has(k) || r.liq < LOW_MIN_LIQ) continue;
+    (need.get(r.gid) || need.set(r.gid, []).get(r.gid)).push(r.addr);
+  }
+  let calls = 0;
+  for (const [gid, addrs] of need) {
+    for (let i = 0; i < addrs.length && calls < 6; i += 30, calls++) {
+      try {
+        const d = await geckoAny(`/networks/${gid}/tokens/multi/${[...new Set(addrs.slice(i, i + 30))].join(",")}`);
+        for (const t of d.data || []) {
+          const a = t.attributes || {}, addr = String(a.address || t.id.slice(t.id.indexOf("_") + 1));
+          let sup = +a.normalized_total_supply;
+          if (!(sup > 0)) { const raw = +a.total_supply, dec = +a.decimals; sup = raw > 0 && dec >= 0 && dec < 40 ? raw / 10 ** dec : 0; }
+          if (sup > 0) supplyKnown.set(gid + ":" + addr, { supply: sup, ts: Date.now() });
+        }
+      } catch {}
+    }
+  }
+  if (supplyKnown.size > 50000) for (const k of [...supplyKnown.keys()].slice(0, 20000)) supplyKnown.delete(k);
+
+  // keep the small ones, best pool per token
+  let added = 0;
+  for (const r of rows) {
+    const k = r.gid + ":" + r.addr, s = supplyKnown.get(k);
+    if (!s || s.supply > LOW_SUPPLY_MAX || r.liq < LOW_MIN_LIQ) continue;
+    const prev = lowSupply.get(k);
+    if (prev && prev.liq > r.liq) { prev.lastSeen = Date.now(); continue; }
+    if (!prev) added++;
+    lowSupply.set(k, { ...r, chain: back[r.gid] || r.gid, supply: s.supply, mcap: r.mcap || +(r.price * s.supply).toFixed(2),
+      firstSeen: prev ? prev.firstSeen : Date.now(), lastSeen: Date.now(),
+      graded: r.gid === "solana" || !!GOPLUS[back[r.gid]] });
+  }
+  const cut = Date.now() - 7 * 24 * 3600e3;
+  for (const [k, t] of lowSupply) if (t.lastSeen < cut) lowSupply.delete(k);
+  if (lowSupply.size > 1500) [...lowSupply].sort((a, b) => a[1].lastSeen - b[1].lastSeen).slice(0, lowSupply.size - 1500).forEach(([k]) => lowSupply.delete(k));
+  if (added) log("lowsupply", `+${added} low-supply tokens (${lowSupply.size} total, deep look: ${chain})`);
+}
+setTimeout(() => sweepLowSupply().catch(() => {}), 20000);
+setInterval(() => sweepLowSupply().catch((e) => log("error", `low supply: ${e.message}`)), 120000);
+
+/** Zcash: price and network status. Cached 2 minutes. */
+let zecCache = { data: null, ts: 0 };
+async function zcashStatus() {
+  if (zecCache.data && Date.now() - zecCache.ts < 120000) return zecCache.data;
+  let price = null, ch24 = null;
+  try {
+    const r = await withTimeout(fetch("https://api.coingecko.com/api/v3/simple/price?ids=zcash&vs_currencies=usd&include_24hr_change=true"), 6000, "ZEC");
+    const z = (await r.json())?.zcash; price = +z?.usd || null; ch24 = Number.isFinite(+z?.usd_24h_change) ? +z.usd_24h_change : null;
+  } catch {}
+  const data = { symbol: "ZEC", network: "Zcash", price, ch24, tokens: 0,
+    note: "Zcash is its own network, but it has no tokens or DEX pools yet. Custom tokens (Zcash Shielded Assets) are scheduled with Network Upgrade 7. SLAPBOT adds them once they exist and are indexed." };
+  zecCache = { data, ts: Date.now() };
+  return data;
+}
+
+/**
+ * GET /api/lowsupply?max=1000000&chain=all&sort=new|vol|mcap|supply
+ * Public. Every low-supply token the bot has found, newest first by default.
+ */
+app.get("/api/lowsupply", async (req, res) => {
+  const max = Math.min(LOW_SUPPLY_MAX, Math.max(1, +req.query.max || LOW_SUPPLY_MAX));
+  const chain = String(req.query.chain || "all").toLowerCase();
+  const sort = ["new", "vol", "mcap", "supply", "liq"].includes(req.query.sort) ? req.query.sort : "new";
+  let list = [...lowSupply.values()].filter((t) => t.supply <= max && (chain === "all" || t.chain === chain));
+  const by = { new: (a, b) => (b.createdAt || b.firstSeen) - (a.createdAt || a.firstSeen), vol: (a, b) => b.vol - a.vol,
+               mcap: (a, b) => b.mcap - a.mcap, supply: (a, b) => a.supply - b.supply, liq: (a, b) => b.liq - a.liq }[sort];
+  list.sort(by);
+  const chains = {}; for (const t of lowSupply.values()) chains[t.chain] = (chains[t.chain] || 0) + 1;
+  res.json({ updated: lowLastRun, max, total: lowSupply.size, chains, zcash: await zcashStatus(),
+             tokens: list.slice(0, 200).map(({ gid, ...t }) => t) });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
 // health check
 // ═══════════════════════════════════════════════════════════════════════
 // ═══════════════════════════════════════════════════════════════════════
@@ -1627,7 +1929,8 @@ app.get("/api/health", (req, res) => {
     // What actually opens the Exclusive page:
     exclusiveGate: { goldKey: { token: GOLD_MINT, hold: GOLD_MIN_HOLD }, holderKey: { token: GATE_MINT, holdUsd: GATE_MIN_USD } },
     allocationList: { listed: claims.size, savedPermanently: claimsPersistent },
-    smartWallets: { tracked: ledger.size, watching: watchList.length, learningSince: new Date(smartSince).toISOString(), savedPermanently: smartPersistent, priceUsd: SMART_PRICE_USD },
+    lowSupply: { found: lowSupply.size, maxSupply: LOW_SUPPLY_MAX },
+    smartWallets: { tracked: ledger.size, watching: watchList.length, liveWallets: liveSubs.size, alerts24h: alerts.length, learningSince: new Date(smartSince).toISOString(), savedPermanently: smartPersistent, priceUsd: SMART_PRICE_USD },
     time: new Date().toISOString(),
   });
 });
@@ -1649,5 +1952,6 @@ app.listen(PORT, () => {
   log("init", `BIG MOUF SLAPBOT backend running on port ${PORT}`);
   if (ALLOWED_ORIGINS.includes("*")) log("warn", "ALLOWED_ORIGIN is * — any website can call this API. Set it to your site URL.");
   if (process.env.SESSION_SECRET && process.env.SESSION_SECRET.length < 32) log("warn", "SESSION_SECRET is short — use 32+ random characters.");
+  if (OWNER_CODE && OWNER_CODE.length < 12) log("warn", "OWNER_CODE is under 12 characters, so owner sign-in is switched OFF.");
   log("init", `Exclusive: Gold Key = ${GOLD_MIN_HOLD} of ${GOLD_MINT} · Holder Key = $${GATE_MIN_USD} of ${GATE_MINT}`);
 });
