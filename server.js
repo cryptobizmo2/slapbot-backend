@@ -98,12 +98,15 @@ app.use(express.json({ limit: "8kb", strict: true }));
 
 // Per-user now (thanks to trust proxy). A live dashboard + armed Micro Bot
 // + scans legitimately runs ~10-20 req/min, so 30 left no headroom.
+// The risk engine asks this same server for token data. Those internal calls come from
+// the machine itself, never through Railway's proxy, so outsiders can't fake them.
+const isLoopback = (req) => ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(req.socket?.remoteAddress) && !req.headers["x-forwarded-for"];
 const limiter = rateLimit({
   windowMs: 60 * 1000,
   max: 120,
   standardHeaders: true,
   legacyHeaders: false,
-  skip: (req) => req.path === "/api/health",
+  skip: (req) => req.path === "/api/health" || isLoopback(req),
   message: { error: "Rate limit exceeded. Slow down." },
 });
 app.use(limiter);
@@ -114,7 +117,9 @@ app.use("/api/claim", rateLimit({ windowMs: 60 * 1000, max: 12, standardHeaders:
 app.use("/api/lowsupply", rateLimit({ windowMs: 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false,
   message: { error: "Too many requests. Slow down." } }));
 app.use(["/api/token", "/api/mint-check"], rateLimit({ windowMs: 60 * 1000, max: 40, standardHeaders: true,
-  legacyHeaders: false, message: { error: "Too many lookups. Slow down." } }));
+  legacyHeaders: false, skip: isLoopback, message: { error: "Too many lookups. Slow down." } }));
+app.use("/api/risk", rateLimit({ windowMs: 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false,
+  message: { error: "Too many scans. Wait a minute." } }));
 
 function log(type, msg) {
   console.log(`[${new Date().toISOString()}] [${type.toUpperCase()}] ${msg}`);
@@ -1786,6 +1791,201 @@ app.get("/api/lowsupply", async (req, res) => {
   const chains = {}; for (const t of lowSupply.values()) chains[t.chain] = (chains[t.chain] || 0) + 1;
   res.json({ updated: lowLastRun, max, total: lowSupply.size, chains, zcash: await zcashStatus(),
              tokens: list.slice(0, 200).map(({ gid, ...t }) => t) });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// ⑭ RISK ENGINE — every scam check SLAPBOT can verify, one clear verdict
+// ═══════════════════════════════════════════════════════════════════════
+/**
+ * GET /api/risk/:chain/:address
+ *   verdict: "DANGER" (do not touch) | "RISKY" | "CAUTION" | "PASSED" | "UNVERIFIED"
+ *   flags:   [{ level: "danger"|"risk"|"caution", text }] in plain words
+ *
+ * Solana (read straight from the chain):
+ *   freeze authority · mint authority · Token-2022 traps (permanent delegate that can
+ *   take your tokens, transfer hooks, transfer fees, non-transferable, frozen-by-default)
+ *   · creator can rewrite name/logo · copycat of a famous coin · top-10 concentration
+ * EVM chains (13, contract scan): honeypot · can't sell · hidden owner · owner can take
+ *   back control or change balances · blacklist · pause · taxes and changeable taxes ·
+ *   self-destruct · proxy · unverified code · concentration
+ * Every chain with a market: liquidity pulled · thin liquidity · buys with zero sells
+ *   (can't-sell pattern) · fake volume · price crash in progress · brand new
+ *
+ * No scanner can promise a token is safe. PASSED means none of these checks fired.
+ */
+const REAL_SOLANA = { SOL: "So11111111111111111111111111111111111111112", WSOL: "So11111111111111111111111111111111111111112",
+  USDC: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", USDT: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+  JUP: "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN", BONK: "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+  WIF: "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm", TRUMP: "6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN",
+  PYTH: "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3", RAY: "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
+  POPCAT: "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr",
+  SLAPGOLD: "4R7Hbdhh3YeVqZaESRA3qPJ8Z3xh3Qedsw88RDjxL1Q9" };
+const FAMOUS = new Set(["USDC", "USDT", "ETH", "WETH", "BTC", "WBTC", "BNB", "SOL", "DAI", "PEPE", "SHIB"]);
+const TOKEN_2022 = "TokenzQdBNbLqP7VKhdWAWwN6r4LnNWTJ6cB5wT3wP";
+
+/** Pure: read update authority + "can it still be changed" from a Metaplex metadata account. */
+function decodeMetaMutability(data) {
+  try {
+    const updateAuthority = new PublicKey(data.subarray(1, 33)).toBase58();
+    let o = 65;
+    for (let i = 0; i < 3; i++) { const n = data.readUInt32LE(o); o += 4 + n; }   // name, symbol, uri
+    o += 2;                                                                       // seller fee
+    if (data[o++] === 1) { const n = data.readUInt32LE(o); o += 4 + n * 34; }    // creators
+    o += 1;                                                                       // primary sale
+    return { updateAuthority, isMutable: data[o] === 1 };
+  } catch { return null; }
+}
+
+/** Pure: turn raw findings into flags and a verdict. */
+function verdictOf(flags, verified) {
+  if (flags.some((f) => f.level === "danger")) return "DANGER";
+  if (flags.some((f) => f.level === "risk")) return "RISKY";
+  if (!verified) return "UNVERIFIED";
+  if (flags.some((f) => f.level === "caution")) return "CAUTION";
+  return "PASSED";
+}
+function marketFlags(m, flags) {
+  if (!m) return;
+  const liq = +m.liq || 0, mcap = +m.mcap || 0, vol = +m.vol24 || 0, buys = +m.buys24 || 0, sells = +m.sells24 || 0;
+  if (mcap > 5000 && liq > 0 && liq < mcap * 0.01) flags.push({ level: "danger", text: `Liquidity looks pulled ($${Math.round(liq).toLocaleString("en-US")} behind a $${Math.round(mcap).toLocaleString("en-US")} market cap)` });
+  else if (liq > 0 && liq < 5000) flags.push({ level: "risk", text: `Very thin liquidity ($${Math.round(liq).toLocaleString("en-US")}), so selling can crash the price` });
+  else if (liq > 0 && liq < 20000) flags.push({ level: "caution", text: `Thin liquidity ($${Math.round(liq).toLocaleString("en-US")})` });
+  if (buys >= 40 && sells === 0) flags.push({ level: "danger", text: `${buys} buys and zero sells today: classic can't-sell trap` });
+  else if (buys >= 60 && sells > 0 && sells / buys < 0.05) flags.push({ level: "risk", text: `Almost nobody is selling (${sells} sells vs ${buys} buys): selling may be blocked` });
+  if (liq > 0 && vol / liq > 60) flags.push({ level: "risk", text: `Volume is ${Math.round(vol / liq)}x the liquidity: likely fake (wash) trading` });
+  if (m.ch24 != null && m.ch24 <= -70) flags.push({ level: "risk", text: `Down ${Math.round(-m.ch24)}% in 24 hours: possible rug in progress` });
+  if (m.createdAt && Date.now() - m.createdAt < 6 * 3600e3) flags.push({ level: "caution", text: "Under 6 hours old" });
+  else if (m.createdAt && Date.now() - m.createdAt < 24 * 3600e3) flags.push({ level: "caution", text: "Under a day old" });
+}
+
+async function solanaRisk(mint) {
+  const flags = [];
+  const [acctR, metaR, chainR, profR] = await Promise.allSettled([
+    withTimeout(connection.getParsedAccountInfo(new PublicKey(mint)), 7000, "mint"),
+    withTimeout(connection.getAccountInfo(PublicKey.findProgramAddressSync(
+      [Buffer.from("metadata"), METADATA_PROGRAM.toBuffer(), new PublicKey(mint).toBuffer()], METADATA_PROGRAM)[0]), 6000, "meta"),
+    getMintCheck(mint),
+    fetch(`http://127.0.0.1:${PORT}/api/token/${mint}`).then((r) => r.json()),
+  ]);
+  const acct = acctR.status === "fulfilled" ? acctR.value?.value : null;
+  const chain = chainR.status === "fulfilled" ? chainR.value : null;
+  const prof = profR.status === "fulfilled" ? profR.value : null;
+  if (!acct || acct.data?.parsed?.type !== "mint" || !chain?.found)
+    return { verified: false, flags: [{ level: "risk", text: "Couldn't read this token from Solana. It may not exist, or the network is slow. Try again." }] };
+
+  if (!chain.freezeAuthorityRenounced) flags.push({ level: "danger", text: "Creator can freeze your tokens so you can't sell" });
+  if (!chain.mintAuthorityRenounced) flags.push({ level: "risk", text: "Creator can print more tokens and dump them on you" });
+
+  // Token-2022 traps
+  if (String(acct.owner?.toBase58?.() || acct.owner) === TOKEN_2022) {
+    for (const e of acct.data.parsed.info.extensions || []) {
+      const st = e.state || {};
+      if (e.extension === "permanentDelegate" && st.delegate) flags.push({ level: "danger", text: "Has a permanent delegate: someone can take or burn tokens from any wallet, including yours" });
+      if (e.extension === "nonTransferable") flags.push({ level: "danger", text: "Tokens can't be transferred or sold at all" });
+      if (e.extension === "defaultAccountState" && st.accountState === "frozen") flags.push({ level: "danger", text: "New holders start frozen: you may not be able to sell" });
+      if (e.extension === "pausableConfig" || e.extension === "pausable") flags.push({ level: "danger", text: "Creator can pause all transfers" });
+      if (e.extension === "transferHook" && st.programId) flags.push({ level: "risk", text: "Every transfer runs the creator's own program, which can block or tax sells" });
+      if (e.extension === "transferFeeConfig") {
+        const bps = +(st.newerTransferFee?.transferFeeBasisPoints ?? st.olderTransferFee?.transferFeeBasisPoints ?? 0);
+        if (bps >= 1000) flags.push({ level: "danger", text: `Takes a ${bps / 100}% fee on every transfer` });
+        else if (bps > 0) flags.push({ level: "risk", text: `Takes a ${bps / 100}% fee on every transfer` });
+        if (st.transferFeeConfigAuthority) flags.push({ level: "risk", text: "Creator can raise the transfer fee later" });
+      }
+    }
+  }
+
+  // Name / logo control and copycats
+  if (metaR.status === "fulfilled" && metaR.value) {
+    const mm = decodeMetaMutability(metaR.value.data);
+    if (mm && mm.isMutable && mm.updateAuthority !== "11111111111111111111111111111111")
+      flags.push({ level: "caution", text: "Creator can still change the name and logo" });
+  }
+  const sym = String(prof?.symbol || "").toUpperCase().replace(/^\$/, "");
+  if (sym && REAL_SOLANA[sym] && REAL_SOLANA[sym] !== mint)
+    flags.push({ level: "danger", text: `Pretends to be ${sym}, but it isn't the real ${sym} address: copycat` });
+
+  const w = chain.top10WalletPct ?? chain.top10HolderPct;
+  if (w != null && w >= 60) flags.push({ level: "risk", text: `Top 10 wallets hold ${Math.round(w)}%: they can dump on everyone` });
+  else if (w != null && w >= 35) flags.push({ level: "caution", text: `Top 10 wallets hold ${Math.round(w)}%` });
+
+  marketFlags(prof && { liq: prof.liq, mcap: prof.mcap, vol24: prof.vol24, buys24: prof.buys24, sells24: prof.sells24, ch24: prof.ch24, createdAt: prof.createdAt }, flags);
+  return { verified: true, flags, symbol: prof?.symbol || null, name: prof?.name || null };
+}
+
+async function evmRisk(chain, addr) {
+  const flags = [], cid = GOPLUS[chain];
+  let g = null, market = null;
+  const gid = await resolveGecko(chain).catch(() => null);
+  const [gR, mR] = await Promise.allSettled([
+    cid ? withTimeout(fetch(`https://api.gopluslabs.io/api/v1/token_security/${cid}?contract_addresses=${addr}`), 10000, "goplus").then((r) => r.json()) : Promise.resolve(null),
+    gid ? geckoAny(`/networks/${gid}/tokens/${addr}/pools?page=1`) : Promise.resolve(null),
+  ]);
+  if (gR.status === "fulfilled" && gR.value) {
+    const res0 = gR.value.result || {};
+    g = normalizeGoPlus(res0[addr] || Object.entries(res0).find(([k]) => k.toLowerCase() === addr)?.[1], chain);
+  }
+  if (mR.status === "fulfilled" && mR.value?.data?.length) {
+    const best = mR.value.data.reduce((a, b) => (+b.attributes?.reserve_in_usd || 0) > (+a.attributes?.reserve_in_usd || 0) ? b : a);
+    const a = best.attributes || {}, tx = a.transactions?.h24 || {};
+    market = { liq: +a.reserve_in_usd || 0, mcap: +a.market_cap_usd || +a.fdv_usd || 0, vol24: +a.volume_usd?.h24 || 0,
+               buys24: +tx.buys || 0, sells24: +tx.sells || 0, ch24: Number.isFinite(+a.price_change_percentage?.h24) ? +a.price_change_percentage.h24 : null,
+               createdAt: a.pool_created_at ? new Date(a.pool_created_at).getTime() : null, name: String(a.name || "") };
+  }
+  const verified = !!(g && g.ok);
+  if (verified) {
+    if (g.honeypot) flags.push({ level: "danger", text: "Honeypot: you can buy but you can't sell" });
+    if (g.cannotSellAll) flags.push({ level: "danger", text: "You can't sell your whole bag" });
+    if (g.cannotBuy) flags.push({ level: "risk", text: "Buying is blocked right now" });
+    if (g.ownerChangeBalance) flags.push({ level: "danger", text: "Owner can change anyone's balance, including yours" });
+    if (g.takeBackOwnership) flags.push({ level: "danger", text: "Owner can take back control after 'renouncing'" });
+    if (g.selfdestruct) flags.push({ level: "danger", text: "Contract can self-destruct" });
+    if (g.sellTax != null && g.sellTax >= 0.5) flags.push({ level: "danger", text: `Sell tax is ${Math.round(g.sellTax * 100)}%` });
+    else if (g.sellTax != null && g.sellTax >= 0.1) flags.push({ level: "risk", text: `Sell tax is ${Math.round(g.sellTax * 100)}%` });
+    if (g.buyTax != null && g.buyTax >= 0.1) flags.push({ level: "risk", text: `Buy tax is ${Math.round(g.buyTax * 100)}%` });
+    if (g.hiddenOwner) flags.push({ level: "risk", text: "Has a hidden owner" });
+    if (g.blacklist) flags.push({ level: "risk", text: "Owner can blacklist wallets from selling" });
+    if (g.pausable) flags.push({ level: "risk", text: "Owner can pause trading" });
+    if (g.taxModifiable) flags.push({ level: "risk", text: "Owner can change the taxes at any time" });
+    if (g.mintable && !g.ownerRenounced) flags.push({ level: "risk", text: "Owner can mint more tokens" });
+    if (g.openSource === false) flags.push({ level: "risk", text: "Contract code isn't public, so nobody can check it" });
+    if (g.proxy) flags.push({ level: "caution", text: "Upgradeable contract: the rules can be changed later" });
+    if (g.top10WalletPct != null && g.top10WalletPct >= 60) flags.push({ level: "risk", text: `Top 10 wallets hold ${Math.round(g.top10WalletPct)}%` });
+    if (g.symbol && FAMOUS.has(String(g.symbol).toUpperCase())) flags.push({ level: "risk", text: `Uses a famous name (${g.symbol}): make sure this is the real contract` });
+  } else {
+    flags.push({ level: "caution", text: GOPLUS[chain] ? "Contract safety data isn't available yet for this token" : "SLAPBOT can't verify contract safety on this chain, so treat it as risky" });
+  }
+  marketFlags(market, flags);
+  return { verified, flags, symbol: g?.symbol || null, name: g?.name || null };
+}
+
+const riskCache = new Map();
+app.get("/api/risk/:chain/:address", async (req, res) => {
+  const chain = String(req.params.chain || "").toLowerCase(), raw = String(req.params.address || "");
+  if (!DEX_CHAINS.includes(chain)) return res.status(400).json({ error: "Unknown chain" });
+  const isSol = chain === "solana";
+  const address = isSol ? raw : raw.toLowerCase();
+  if (isSol ? !SOL_ADDR.test(address) : !/^0x[0-9a-f]{40}$/.test(address)) {
+    if (!isSol && !/^0x/.test(raw)) return res.json({ chain, address: raw, verdict: "UNVERIFIED", score: null,
+      flags: [{ level: "caution", text: "SLAPBOT can't verify contract safety on this chain, so treat it as risky" }], checkedAt: Date.now() });
+    return res.status(400).json({ error: "Invalid token address" });
+  }
+  const key = chain + ":" + address, hit = riskCache.get(key);
+  if (hit && Date.now() - hit.checkedAt < 60000) return res.json(hit);
+  try {
+    const r = isSol ? await solanaRisk(address) : await evmRisk(chain, address);
+    const weight = { danger: 45, risk: 18, caution: 6 };
+    const score = Math.max(0, 100 - r.flags.reduce((s, f) => s + (weight[f.level] || 0), 0));   // 100 = cleanest
+    const order = { danger: 0, risk: 1, caution: 2 };
+    const out = { chain, address, symbol: r.symbol, name: r.name, verdict: verdictOf(r.flags, r.verified), score,
+                  flags: r.flags.sort((a, b) => order[a.level] - order[b.level]), checkedAt: Date.now() };
+    riskCache.set(key, out);
+    if (riskCache.size > 3000) riskCache.delete(riskCache.keys().next().value);
+    if (out.verdict === "DANGER") log("flagged_rug", `${chain} ${address.slice(0, 8)}… → ${out.flags.filter((f) => f.level === "danger").map((f) => f.text).join(" | ")}`);
+    res.json(out);
+  } catch (err) {
+    log("error", `risk ${chain} ${raw.slice(0, 8)}: ${err.message}`);
+    res.status(502).json({ error: "Couldn't finish the scan. Try again." });
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════════════
