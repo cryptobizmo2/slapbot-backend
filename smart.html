@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>SLAPBOT · Smart Wallets</title>
+<meta name="description" content="See which wallets keep winning on Solana memecoins, and what they're buying right now.">
+<meta name="theme-color" content="#F2C14E">
+<link rel="icon" href="favicon-48.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Anton&family=Archivo:wght@400;500;700;800&display=swap" rel="stylesheet">
+<style>
+:root{
+  --gold:#F2C14E; --gold2:#E6B23C; --gold3:#D9A22C; --ink:#0B0B0B; --ink2:#3A2F18; --line:rgba(11,11,11,.16);
+  --up:#0B6B3A; --down:#A3122A;
+  --display:'Anton','Impact','HelveticaNeue-CondensedBlack','Arial Narrow Bold',sans-serif;
+  --body:'Archivo',-apple-system,system-ui,sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{background:var(--gold);color:var(--ink);font-family:var(--body);line-height:1.5;-webkit-text-size-adjust:100%}
+a{color:inherit}
+button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
+:focus-visible{outline:2px solid var(--ink);outline-offset:3px;border-radius:6px}
+.wrap{max-width:760px;margin:0 auto;padding:0 18px}
+
+.bar{position:sticky;top:0;z-index:5;background:rgba(242,193,78,.92);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border-bottom:2px solid var(--ink)}
+.bar .wrap{display:flex;align-items:center;justify-content:space-between;height:56px}
+.brand{font-family:var(--display);font-size:22px;text-decoration:none;letter-spacing:.01em}
+.who{font-size:13px;font-weight:700;background:var(--ink);color:var(--gold);padding:6px 12px;border-radius:999px}
+
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;font-weight:800;font-size:16px;border-radius:999px;padding:14px 22px;text-decoration:none;transition:transform .1s}
+.btn:active{transform:scale(.98)}
+.btn-ink{background:var(--ink);color:var(--gold)}
+.btn-line{border:2px solid var(--ink);color:var(--ink)}
+.btn-sm{padding:8px 14px;font-size:14px}
+.btn[disabled]{opacity:.5;pointer-events:none}
+
+h1{font-family:var(--display);font-weight:400;text-transform:uppercase;font-size:clamp(48px,13vw,96px);line-height:.9;margin-top:34px}
+h2{font-family:var(--display);font-weight:400;text-transform:uppercase;font-size:30px;line-height:1}
+.lede{font-size:18px;margin-top:14px;max-width:36ch;font-weight:500}
+.muted{color:var(--ink2)}
+.small{font-size:13px}
+
+.box{background:var(--ink);color:var(--gold);border-radius:22px;padding:24px;margin-top:26px}
+.box p{color:#E9D9AE}
+.box .price{font-family:var(--display);font-size:56px;line-height:1;color:var(--gold);margin:14px 0 4px}
+.box .btn-ink{background:var(--gold);color:var(--ink)}
+.box .btn-line{border-color:var(--gold);color:var(--gold)}
+.steps{display:grid;gap:10px;margin-top:22px}
+.steps div{display:flex;gap:12px;align-items:flex-start;font-weight:500}
+.steps b{flex:none;width:28px;height:28px;border-radius:50%;background:var(--ink);color:var(--gold);display:grid;place-items:center;font-size:14px}
+
+.msg{margin-top:14px;font-weight:700;min-height:1.5em}
+.msg.err{color:var(--down)}
+.box .msg.err{color:#FF8C9A}
+
+/* app */
+.learn{margin-top:22px;border:2px solid var(--ink);border-radius:16px;padding:12px 16px;font-size:14px;font-weight:500}
+.tabs{display:flex;gap:6px;margin:22px 0 14px;background:var(--gold2);border-radius:999px;padding:5px}
+.tab{flex:1;padding:10px 6px;border-radius:999px;font-weight:800;font-size:15px}
+.tab[aria-selected="true"]{background:var(--ink);color:var(--gold)}
+.list{display:grid;gap:10px}
+.row{background:var(--gold2);border:2px solid var(--ink);border-radius:18px;padding:14px 16px}
+.row .top{display:flex;align-items:center;gap:12px}
+.rank{font-family:var(--display);font-size:30px;line-height:1;min-width:44px}
+.addr{font-weight:800;font-size:16px;font-variant-numeric:tabular-nums}
+.addr small{display:block;font-weight:500;font-size:13px;color:var(--ink2)}
+.grow{flex:1;min-width:0}
+.pnl{font-weight:800;font-size:18px;text-align:right;font-variant-numeric:tabular-nums}
+.pnl small{display:block;font-weight:600;font-size:12px;color:var(--ink2)}
+.up{color:var(--up)}.down{color:var(--down)}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.chip{background:var(--ink);color:var(--gold);border-radius:999px;padding:3px 10px;font-size:12.5px;font-weight:700}
+.chip.lite{background:transparent;color:var(--ink);border:1.5px solid var(--ink)}
+.acts{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
+.star{font-size:20px;line-height:1;padding:6px}
+.detail{margin-top:12px;border-top:1.5px solid var(--line);padding-top:10px;font-size:14px}
+.detail .pos{display:flex;justify-content:space-between;gap:10px;padding:5px 0;border-bottom:1px solid var(--line)}
+.buy .top{align-items:flex-start}
+.when{font-size:13px;color:var(--ink2);font-weight:600;white-space:nowrap}
+.empty{text-align:center;padding:30px 10px;font-weight:600;color:var(--ink2)}
+footer{margin:40px 0 50px;font-size:13px;color:var(--ink2)}
+footer a{font-weight:700;color:var(--ink)}
+.toast{position:fixed;left:50%;bottom:22px;transform:translate(-50%,20px);background:var(--ink);color:var(--gold);font-weight:800;padding:10px 18px;border-radius:999px;opacity:0;transition:.25s;pointer-events:none;z-index:9}
+.toast.on{opacity:1;transform:translate(-50%,0)}
+[hidden]{display:none!important}
+@media(prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<header class="bar">
+  <div class="wrap">
+    <a class="brand" href="https://cryptobizmo2.github.io/SLAPBOT/">SLAPBOT</a>
+    <span class="who" id="who" hidden></span>
+  </div>
+</header>
+
+<main class="wrap">
+  <h1>Smart Wallets</h1>
+  <p class="lede">See which wallets keep winning on Solana memecoins, and what they're buying right now.</p>
+
+  <!-- 1. sign in -->
+  <section id="vSign">
+    <div class="steps">
+      <div><b>1</b><span>Sign in with your wallet. It's a free signature, not a transaction.</span></div>
+      <div><b>2</b><span>Gold Key holders (5 $SLAPGOLD) get in free. Everyone else gets 24 hours for $30 in SOL.</span></div>
+      <div><b>3</b><span>Follow the wallets you like and watch their buys come in.</span></div>
+    </div>
+    <p style="margin-top:24px">
+      <button class="btn btn-ink" id="signBtn" type="button">Sign in with your wallet</button>
+      <a class="btn btn-line" id="openWallet" hidden>Open in your wallet app</a>
+    </p>
+    <p class="msg" id="signMsg" role="status"></p>
+  </section>
+
+  <!-- 2. paywall -->
+  <section id="vPay" hidden>
+    <div class="box">
+      <h2>Unlock Smart Wallets</h2>
+      <div class="price" id="payPrice">$30</div>
+      <p id="payTerms">24 hours of access, paid in SOL straight from your wallet.</p>
+      <p style="margin-top:18px"><button class="btn btn-ink" id="payBtn" type="button">Pay with SOL</button></p>
+      <p class="msg" id="payMsg" role="status"></p>
+      <p class="small" style="margin-top:14px">Hold 5 $SLAPGOLD and it's free, every day. <a href="https://slapitgold.tokly.io/" style="color:var(--gold);font-weight:700">Get the Gold Key</a></p>
+    </div>
+  </section>
+
+  <!-- 3. the app -->
+  <section id="vApp" hidden>
+    <p class="learn" id="learn">Learning…</p>
+    <div class="tabs" role="tablist">
+      <button class="tab" role="tab" aria-selected="true" data-tab="top">Top wallets</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="buys">Live buys</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="follow">Following</button>
+    </div>
+    <div class="list" id="list"></div>
+  </section>
+
+  <footer>
+    Results are worked out from trades SLAPBOT has seen on the chain, and past wins don't promise future ones. Not financial advice.
+    <br><br><a href="https://cryptobizmo2.github.io/SLAPBOT/">Scanner</a> &nbsp; <a href="https://cryptobizmo2.github.io/SLAPBOT/exclusive.html">Exclusive</a>
+  </footer>
+</main>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<script>
+(function(){
+  var API='https://slapbot-backend-production.up.railway.app';
+  var $=function(id){return document.getElementById(id)};
+  var S={pass:null,wallet:null,tab:'top',top:[],buys:[],open:{}};
+  var follows=JSON.parse(localStorage.getItem('smartFollow')||'[]');
+
+  function toast(t){var e=$('toast');e.textContent=t;e.classList.add('on');setTimeout(function(){e.classList.remove('on')},1800)}
+  function show(v){['vSign','vPay','vApp'].forEach(function(id){$(id).hidden=id!==v})}
+  function short(w){return w.slice(0,4)+'…'+w.slice(-4)}
+  function money(n){var a=Math.abs(n);var s=a>=1e6?(a/1e6).toFixed(2)+'M':a>=1e3?(a/1e3).toFixed(1)+'K':a.toFixed(0);return (n<0?'−$':'$')+s}
+  function ago(t){var m=Math.max(0,Math.round((Date.now()-t)/60000));return m<1?'just now':m<60?m+'m ago':Math.round(m/60)+'h ago'}
+  function esc(s){return String(s).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
+  function copy(t,label){(navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(function(){toast(label+' copied')},function(){toast('Copy failed')})}
+  function b64(u8){var s='';for(var i=0;i<u8.length;i++)s+=String.fromCharCode(u8[i]);return btoa(s)}
+  function provider(){return (window.phantom&&window.phantom.solana)||(window.solana&&window.solana.isPhantom?window.solana:null)||window.solana||null}
+
+  function api(path,opt){
+    opt=opt||{};opt.headers=Object.assign({'Content-Type':'application/json'},opt.headers||{});
+    if(S.pass)opt.headers.Authorization='Bearer '+S.pass;
+    return fetch(API+path,opt).then(function(r){return r.json().catch(function(){return{}}).then(function(j){j._status=r.status;return j})});
+  }
+
+  // ── sign in ──
+  var saved=JSON.parse(localStorage.getItem('smartSession')||'null');
+  if(saved&&saved.exp>Date.now()){S.pass=saved.pass;S.wallet=saved.wallet;setWho();loadStatus()}
+  else if(!provider()){
+    $('openWallet').hidden=false;
+    $('openWallet').href='https://phantom.app/ul/browse/'+encodeURIComponent(location.href)+'?ref='+encodeURIComponent(location.origin);
+  }
+
+  function setWho(){$('who').textContent=short(S.wallet);$('who').hidden=false}
+
+  $('signBtn').onclick=async function(){
+    var p=provider(),m=$('signMsg');m.className='msg';
+    if(!p){m.textContent='Open this page inside your wallet app to sign in.';m.className='msg err';$('openWallet').hidden=false;return}
+    this.disabled=true;m.textContent='Check your wallet…';
+    try{
+      var c=await p.connect();var w=c.publicKey.toString();
+      var ch=await api('/api/auth/challenge?wallet='+encodeURIComponent(w));
+      if(!ch.message)throw new Error(ch.error||'Couldn\'t start sign-in.');
+      var signed=await p.signMessage(new TextEncoder().encode(ch.message),'utf8');
+      var sig=b64(signed.signature||signed);
+      var v=await api('/api/auth/verify',{method:'POST',body:JSON.stringify({wallet:w,signature:sig})});
+      var pass=v.pass||v.basicPass;
+      if(!pass)throw new Error(v.error||'Sign-in failed. Try again.');
+      S.pass=pass;S.wallet=w;
+      localStorage.setItem('smartSession',JSON.stringify({pass:pass,wallet:w,exp:Date.now()+11.5*3600e3}));
+      setWho();m.textContent='';loadStatus();
+    }catch(e){m.textContent=(e&&e.message)||'Sign-in cancelled.';m.className='msg err'}
+    this.disabled=false;
+  };
+
+  async function loadStatus(){
+    var s=await api('/api/smart/status');
+    if(s._status===401){localStorage.removeItem('smartSession');S.pass=null;show('vSign');return}
+    if(s.access){startApp(s);return}
+    // Paid before? Re-check that payment (it can only restore the same window)
+    var last=localStorage.getItem('smartSig:'+S.wallet);
+    if(last){var r=await api('/api/smart/verify',{method:'POST',body:JSON.stringify({signature:last})});if(r.access){loadStatus();return}}
+    $('payPrice').textContent='$'+(s.priceUsd||30);
+    $('payTerms').textContent=(s.hours||24)+' hours of access, paid in SOL straight from your wallet.';
+    if(s.payable===false){$('payBtn').disabled=true;$('payMsg').textContent='Payments open soon.'}
+    show('vPay');
+  }
+
+  // ── pay ──
+  function loadWeb3(){return new Promise(function(ok,no){if(window.solanaWeb3)return ok();var s=document.createElement('script');
+    s.src='https://unpkg.com/@solana/web3.js@1.95.3/lib/index.iife.min.js';s.onload=ok;s.onerror=no;document.head.appendChild(s)})}
+  $('payBtn').onclick=async function(){
+    var p=provider(),m=$('payMsg');m.className='msg';
+    if(!p){m.textContent='Open this page inside your wallet app to pay.';m.className='msg err';return}
+    this.disabled=true;m.textContent='Preparing your payment…';
+    try{
+      await p.connect();
+      var q=await api('/api/smart/quote',{method:'POST',body:'{}'});
+      if(!q.message)throw new Error(q.error||'Couldn\'t prepare the payment.');
+      m.textContent='Approve '+q.sol+' SOL (about $'+q.usd+') in your wallet…';
+      var sig;
+      try{var r=await p.request({method:'signAndSendTransaction',params:{message:q.message}});sig=r.signature}
+      catch(e1){
+        if(e1&&(e1.code===4001||/reject|cancel/i.test(e1.message||'')))throw e1;
+        await loadWeb3();
+        var raw=Uint8Array.from(atob(q.transaction),function(c){return c.charCodeAt(0)});
+        var r2=await p.signAndSendTransaction(window.solanaWeb3.Transaction.from(raw));sig=r2.signature;
+      }
+      localStorage.setItem('smartSig:'+S.wallet,sig);
+      m.textContent='Payment sent. Confirming on-chain…';
+      for(var i=0;i<12;i++){
+        await new Promise(function(r){setTimeout(r,i?3000:2000)});
+        var v=await api('/api/smart/verify',{method:'POST',body:JSON.stringify({signature:sig})});
+        if(v.access){m.textContent='You\'re in.';loadStatus();this.disabled=false;return}
+        if(!v.retry){throw new Error(v.error||'Couldn\'t confirm the payment.')}
+      }
+      throw new Error('Still confirming. Refresh this page in a minute; your payment is saved.');
+    }catch(e){m.textContent=(e&&e.code===4001)?'Payment cancelled. Nothing was sent.':((e&&e.message)||'Payment didn\'t go through.');m.className='msg err'}
+    this.disabled=false;
+  };
+
+  // ── app ──
+  var timer=null;
+  function startApp(s){
+    show('vApp');
+    var via={owner:'Owner access',gold:'🥇 Gold Key: free',paid:'Paid access until '+(s.until?new Date(s.until).toLocaleString([], {weekday:'short',hour:'numeric',minute:'2-digit'}):'')}[s.via]||'';
+    $('learn').textContent=via+' · Learning since '+new Date(s.learningSince).toLocaleDateString([], {month:'short',day:'numeric'})+', tracking '+(s.tracked||0).toLocaleString()+' wallets. Rankings sharpen the longer SLAPBOT watches.';
+    refresh();clearInterval(timer);timer=setInterval(refresh,60000);
+  }
+  async function refresh(){
+    var a=await Promise.all([api('/api/smart/top'),api('/api/smart/feed?follow='+follows.join(','))]);
+    if(a[0]._status===402||a[1]._status===402){clearInterval(timer);loadStatus();return}
+    if(a[0]._status===401){localStorage.removeItem('smartSession');location.reload();return}
+    S.top=a[0].wallets||[];S.buys=a[1].buys||[];render();
+  }
+  document.querySelectorAll('.tab').forEach(function(t){t.onclick=function(){
+    S.tab=t.dataset.tab;document.querySelectorAll('.tab').forEach(function(x){x.setAttribute('aria-selected',x===t)});render();
+  }});
+
+  function walletRow(r){
+    var f=follows.indexOf(r.wallet)>=0;
+    return '<div class="row" data-w="'+esc(r.wallet)+'"><div class="top">'+
+      '<div class="rank">'+(r.rank?'#'+r.rank:'·')+'</div>'+
+      '<div class="grow"><div class="addr">'+short(r.wallet)+'<small>'+r.winRate+'% wins · '+r.positions+' tokens · active '+ago(r.last)+'</small></div></div>'+
+      '<div class="pnl '+(r.pnl>=0?'up':'down')+'">'+(r.pnl>=0?'+':'')+money(r.pnl)+'<small>'+(r.roi>=0?'+':'')+r.roi+'% return</small></div></div>'+
+      (r.best&&r.best.length?'<div class="chips">'+r.best.map(function(b){return '<span class="chip">'+esc(b.sym)+' '+(b.roi>=0?'+':'')+b.roi+'%</span>'}).join('')+'</div>':'')+
+      '<div class="acts"><button class="btn btn-ink btn-sm" data-act="follow">'+(f?'★ Following':'☆ Follow')+'</button>'+
+      '<button class="btn btn-line btn-sm" data-act="detail">'+(S.open[r.wallet]?'Hide':'Details')+'</button>'+
+      '<button class="btn btn-line btn-sm" data-act="copy">Copy</button></div>'+
+      (S.open[r.wallet]?'<div class="detail" data-detail>Loading…</div>':'')+'</div>';
+  }
+  function buyRow(b){
+    return '<div class="row buy" data-w="'+esc(b.wallet)+'" data-t="'+esc(b.token)+'"><div class="top">'+
+      '<div class="rank">'+(b.rank?'#'+b.rank:'★')+'</div>'+
+      '<div class="grow"><div class="addr">'+short(b.wallet)+' bought '+esc(b.sym)+'<small>'+money(b.usd)+' · '+ago(b.at)+(b.followed?' · following':'')+'</small></div></div></div>'+
+      '<div class="acts"><button class="btn btn-ink btn-sm" data-act="ca">Copy CA</button>'+
+      '<a class="btn btn-line btn-sm" href="https://cryptobizmo2.github.io/SLAPBOT/?token='+encodeURIComponent(b.token)+'">Scan it</a>'+
+      '<a class="btn btn-line btn-sm" target="_blank" rel="noopener" href="https://solscan.io/tx/'+encodeURIComponent(b.tx)+'">Explorer</a></div></div>';
+  }
+  function render(){
+    var L=$('list'),h='';
+    if(S.tab==='top'){
+      h=S.top.length?S.top.map(walletRow).join(''):'<p class="empty">SLAPBOT is still learning. Wallets show up here once they\'ve won on 3 or more tokens it watched. Check back in a few hours.</p>';
+    }else if(S.tab==='buys'){
+      h=S.buys.length?S.buys.map(buyRow).join(''):'<p class="empty">No buys from top wallets in the last 6 hours yet.</p>';
+    }else{
+      if(!follows.length)h='<p class="empty">You\'re not following anyone yet. Tap ☆ Follow on any wallet in Top wallets.</p>';
+      else{
+        var mine=S.buys.filter(function(b){return follows.indexOf(b.wallet)>=0});
+        h='<h2 style="margin:6px 0 10px">Their latest buys</h2>'+(mine.length?mine.map(buyRow).join(''):'<p class="empty">No buys from wallets you follow in the last 6 hours.</p>')+
+          '<h2 style="margin:22px 0 10px">Wallets you follow</h2>'+follows.map(function(w){
+            var r=S.top.find(function(x){return x.wallet===w})||{wallet:w,rank:null,winRate:'—',positions:'—',last:Date.now(),pnl:0,roi:0};
+            return walletRow(r)}).join('');
+      }
+    }
+    L.innerHTML=h;
+    L.querySelectorAll('[data-detail]').forEach(function(d){loadDetail(d.closest('.row').dataset.w,d)});
+  }
+  async function loadDetail(w,el){
+    var d=await api('/api/smart/wallet/'+encodeURIComponent(w));
+    if(!d.known){el.textContent='SLAPBOT hasn\'t seen this wallet trade yet.';return}
+    el.innerHTML='<b>'+d.positions+' tokens tracked · '+d.winRate+'% wins · '+(d.pnl>=0?'+':'')+money(d.pnl)+' on '+money(d.spent)+' spent</b>'+
+      d.list.slice(0,12).map(function(p){return '<div class="pos"><span>'+esc(p.sym)+(p.stillHolding?' <span class="chip lite">holding</span>':'')+'</span><span class="'+(p.pnl>=0?'up':'down')+'"><b>'+(p.pnl>=0?'+':'')+money(p.pnl)+'</b> ('+(p.roi>=0?'+':'')+p.roi+'%)</span></div>'}).join('');
+  }
+  $('list').onclick=function(e){
+    var b=e.target.closest('[data-act]');if(!b)return;
+    var row=b.closest('.row'),w=row.dataset.w,act=b.dataset.act;
+    if(act==='follow'){var i=follows.indexOf(w);if(i>=0)follows.splice(i,1);else follows.push(w);follows=follows.slice(-50);
+      localStorage.setItem('smartFollow',JSON.stringify(follows));toast(i>=0?'Unfollowed':'Following '+short(w));render();refresh()}
+    else if(act==='detail'){S.open[w]=!S.open[w];render()}
+    else if(act==='copy')copy(w,'Wallet');
+    else if(act==='ca')copy(row.dataset.t,'Contract address');
+  };
+})();
+</script>
+</body>
+</html>
