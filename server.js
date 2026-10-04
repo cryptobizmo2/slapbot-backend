@@ -78,7 +78,7 @@ function securityHeaders(req, res, next) {
   res.setHeader("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'");
   res.setHeader("Permissions-Policy", "geolocation=(), camera=(), microphone=()");
   res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
-  if (req.path.startsWith("/api/auth") || req.path.startsWith("/api/exclusive")) res.setHeader("Cache-Control", "no-store");
+  if (req.path.startsWith("/api/auth") || req.path.startsWith("/api/exclusive") || req.path.startsWith("/api/smart")) res.setHeader("Cache-Control", "no-store");
   next();
 }
 app.use(securityHeaders);
@@ -438,7 +438,9 @@ app.post("/api/auth/verify", async (req, res) => {
     return res.status(503).json({ error: "Couldn't reach Solana to check your balance. Please try again.", retry: true });
   }
   log("access", `${wallet.slice(0, 4)}…${wallet.slice(-4)} balance=${status.balance} authorized=${status.authorized}`);
-  if (!status.authorized) return res.status(403).json({ error: "Not enough tokens", ...status });
+  // basicPass: proves the wallet, opens nothing on its own. Smart Wallets uses it to let
+  // non-holders pay; every Exclusive route still re-checks the balance on each visit.
+  if (!status.authorized) return res.status(403).json({ error: "Not enough tokens", ...status, basicPass: issuePass(wallet) });
   res.json({ pass: issuePass(wallet), ...status });
 });
 
@@ -1161,6 +1163,316 @@ app.post("/api/claim/export", async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════
+// ⑪ SMART WALLETS — find wallets that keep winning, watch what they buy
+// ═══════════════════════════════════════════════════════════════════════
+/**
+ * How it learns: every ~20 seconds the bot reads the latest trades from one of
+ * the busiest Solana pools (trending + new, refreshed every 10 minutes), and
+ * keeps a ledger of what each wallet bought and sold, per token.
+ *
+ * How it scores: a wallet's result on a token = what it got back from sells
+ * + what it still holds at today's price − what it spent. Only positions the
+ * bot saw being BOUGHT count, so nobody is credited for a bag we never saw them
+ * pay for. A wallet makes the board once it has 3+ real positions ($50+ each),
+ * wins at least half of them, and is up overall.
+ *
+ * Who gets filtered: trading bots and MEV (40+ trades on one token, or 300+
+ * overall), and wallets that only ever sell. Rankings sharpen the longer it runs.
+ *
+ * Access: free for the owner and Gold Key holders (5 $SLAPGOLD). Everyone else
+ * pays SMART_PRICE_USD in SOL to the owner wallet for SMART_HOURS of access.
+ * The server builds the payment, the user's own wallet signs and sends it, the
+ * server reads it back from the chain. No card processor, no ID, no custody.
+ */
+const { Transaction, SystemProgram, Keypair } = require("@solana/web3.js");
+const SMART_PRICE_USD = Math.max(1, parseFloat(process.env.SMART_PRICE_USD || "30"));
+const SMART_MS = Math.max(1, parseFloat(process.env.SMART_HOURS || "24")) * 3600e3;
+const SMART_FILE = VOLUME_DIR ? nodePath.join(VOLUME_DIR, "smart-wallets.json") : "";
+
+const smartPaid = new Map();     // wallet → { until, sigs: [] }
+const smartQuotes = new Map();   // payment reference → { wallet, lamports, exp }
+const ledger = new Map();        // wallet → Map(token → { b, bt, s, st, n, f, l })
+const tokenInfo = new Map();     // token → { sym, price, pool, ts }
+const poolSeen = new Map();      // pool → Set(tx hashes already counted)
+let recentBuys = [];             // { w, t, usd, at, tx }
+let watchList = [], watchIdx = 0, smartSince = Date.now(), smartPersistent = false;
+
+function b58encode(buf) {
+  let n = BigInt("0x" + (Buffer.from(buf).toString("hex") || "0")), s = "";
+  while (n > 0n) { s = B58[Number(n % 58n)] + s; n /= 58n; }
+  for (const b of buf) { if (b === 0) s = "1" + s; else break; }
+  return s;
+}
+
+// ── storage: survives restarts only with a Railway Volume ──
+if (SMART_FILE) {
+  try {
+    if (nodeFs.existsSync(SMART_FILE)) {
+      const d = JSON.parse(nodeFs.readFileSync(SMART_FILE, "utf8"));
+      smartSince = d.since || smartSince;
+      for (const [w, p] of d.paid || []) smartPaid.set(w, p);
+      for (const [t, i] of d.tokens || []) tokenInfo.set(t, i);
+      for (const [w, ps] of d.wallets || []) ledger.set(w, new Map(ps));
+      recentBuys = d.buys || [];
+    }
+    smartPersistent = true;
+    log("init", `Smart Wallets: ${ledger.size} wallets loaded from the volume`);
+  } catch (e) { log("error", `Smart Wallets storage unavailable (${e.message}) — memory only`); }
+}
+function saveSmart() {
+  if (!smartPersistent) return;
+  try {
+    const tmp = SMART_FILE + ".tmp";
+    nodeFs.writeFileSync(tmp, JSON.stringify({
+      since: smartSince, paid: [...smartPaid], tokens: [...tokenInfo],
+      wallets: [...ledger].map(([w, m]) => [w, [...m]]), buys: recentBuys,
+    }));
+    nodeFs.renameSync(tmp, SMART_FILE);
+  } catch (e) { log("error", `Saving Smart Wallets failed: ${e.message}`); }
+}
+
+// ── learning ──
+async function refreshWatchList() {
+  const [fresh, trending] = await Promise.all([
+    geckoFeed("new_pools").catch(() => []), geckoFeed("trending_pools").catch(() => [])]);
+  const seen = new Set(), list = [];
+  for (const p of [...trending, ...fresh]) {
+    if (!p.pairAddress || seen.has(p.addr) || p.liq < 5000 || p.txns < 50) continue;
+    seen.add(p.addr);
+    list.push({ addr: p.addr, pair: p.pairAddress, sym: p.sym });
+    tokenInfo.set(p.addr, { sym: p.sym, price: p.price, pool: p.pairAddress, ts: Date.now() });
+  }
+  if (list.length) watchList = list.slice(0, 30);
+}
+
+async function ingestPool(pool) {
+  const d = await gecko(`/pools/${pool.pair}/trades`, 9000);
+  let seen = poolSeen.get(pool.pair);
+  if (!seen) { seen = new Set(); poolSeen.set(pool.pair, seen); }
+  let added = 0;
+  for (const t of d?.data || []) {
+    const a = t.attributes || {};
+    if (!a.tx_hash || seen.has(a.tx_hash)) continue;
+    seen.add(a.tx_hash);
+    const w = a.tx_from_address, usd = +a.volume_in_usd || 0, buy = a.kind === "buy";
+    if (!w || !(usd > 0)) continue;
+    if (buy && a.to_token_address && a.to_token_address !== pool.addr) continue;
+    if (!buy && a.from_token_address && a.from_token_address !== pool.addr) continue;
+    const tok = buy ? +a.to_token_amount : +a.from_token_amount;
+    if (!(tok > 0)) continue;
+    const at = a.block_timestamp ? Date.parse(a.block_timestamp) : Date.now();
+    let m = ledger.get(w);
+    if (!m) { m = new Map(); ledger.set(w, m); }
+    const p = m.get(pool.addr) || { b: 0, bt: 0, s: 0, st: 0, n: 0, f: at, l: at };
+    if (buy) { p.b += usd; p.bt += tok; } else { p.s += usd; p.st += tok; }
+    p.n++; p.f = Math.min(p.f, at); p.l = Math.max(p.l, at);
+    m.set(pool.addr, p);
+    const px = buy ? +a.price_to_in_usd : +a.price_from_in_usd;
+    if (px > 0) { const i = tokenInfo.get(pool.addr) || { sym: pool.sym, pool: pool.pair }; tokenInfo.set(pool.addr, { ...i, price: px, ts: Date.now() }); }
+    if (buy) recentBuys.push({ w, t: pool.addr, usd: +usd.toFixed(2), at, tx: a.tx_hash });
+    added++;
+  }
+  if (seen.size > 3000) poolSeen.set(pool.pair, new Set([...seen].slice(-1500)));
+  return added;
+}
+
+function pruneSmart() {
+  const now = Date.now();
+  recentBuys = recentBuys.filter((b) => now - b.at < 24 * 3600e3).slice(-5000);
+  for (const [w, m] of ledger) {
+    for (const [t, p] of m) if (now - p.l > 30 * 24 * 3600e3) m.delete(t);
+    if (!m.size) ledger.delete(w);
+  }
+  if (ledger.size > 40000) {            // drop one-token, oldest wallets first
+    const thin = [...ledger].filter(([, m]) => m.size === 1)
+      .sort((a, b) => [...a[1].values()][0].l - [...b[1].values()][0].l);
+    for (const [w] of thin.slice(0, ledger.size - 40000)) ledger.delete(w);
+  }
+  for (const [pair] of poolSeen) if (!watchList.some((p) => p.pair === pair)) poolSeen.delete(pair);
+  for (const [ref, q] of smartQuotes) if (q.exp < now) smartQuotes.delete(ref);
+}
+
+/** Pure: one wallet's record from its ledger. */
+function walletStats(m) {
+  let cost = 0, value = 0, wins = 0, counted = 0, trades = 0, last = 0;
+  const positions = [];
+  for (const [t, p] of m) {
+    trades += p.n; last = Math.max(last, p.l);
+    if (p.bt <= 0 || p.b < 50) continue;                     // only positions we saw them pay for
+    const price = tokenInfo.get(t)?.price || 0;
+    const realized = p.st <= p.bt ? p.s : p.s * (p.bt / p.st);
+    const held = Math.max(0, p.bt - p.st) * price;
+    const pnl = realized + held - p.b;
+    cost += p.b; value += realized + held; counted++; if (pnl > 0) wins++;
+    positions.push({ token: t, sym: tokenInfo.get(t)?.sym || "?", spent: +p.b.toFixed(2),
+      pnl: +pnl.toFixed(2), roi: +((pnl / p.b) * 100).toFixed(1), stillHolding: p.bt - p.st > p.bt * 0.05, last: p.l });
+  }
+  const bot = trades > 300 || [...m.values()].some((p) => p.n > 40);
+  positions.sort((a, b) => b.pnl - a.pnl);
+  return { pnl: +(value - cost).toFixed(2), spent: +cost.toFixed(2), roi: cost ? +(((value - cost) / cost) * 100).toFixed(1) : 0,
+           winRate: counted ? Math.round((wins / counted) * 100) : 0, wins, positions: counted, trades, last, bot, list: positions };
+}
+
+let boardCache = { data: null, ts: 0 };
+function leaderboard() {
+  if (boardCache.data && Date.now() - boardCache.ts < 120000) return boardCache.data;
+  const rows = [];
+  for (const [w, m] of ledger) {
+    if (m.size < 3) continue;
+    const s = walletStats(m);
+    if (s.bot || s.positions < 3 || s.winRate < 50 || s.pnl <= 0) continue;
+    rows.push({ wallet: w, pnl: s.pnl, roi: s.roi, winRate: s.winRate, wins: s.wins, positions: s.positions, last: s.last,
+                best: s.list.slice(0, 3).map((p) => ({ sym: p.sym, roi: p.roi })) });
+  }
+  rows.sort((a, b) => b.pnl - a.pnl);
+  const data = rows.slice(0, 100).map((r, i) => ({ rank: i + 1, ...r }));
+  boardCache = { data, ts: Date.now() };
+  return data;
+}
+
+// The learning loop: one pool every 20 s (3 calls a minute — gentle on the data source)
+let smartTick = 0;
+setTimeout(() => refreshWatchList().catch(() => {}), 5000);
+setInterval(async () => {
+  smartTick++;
+  try {
+    if (smartTick % 30 === 0 || !watchList.length) await refreshWatchList();
+    if (!watchList.length) return;
+    const pool = watchList[watchIdx++ % watchList.length];
+    await ingestPool(pool);
+  } catch (e) { if (smartTick % 15 === 0) log("error", `smart wallets: ${e.message}`); }
+  if (smartTick % 30 === 0) { pruneSmart(); saveSmart(); }
+}, 20000);
+
+// ── access ──
+async function smartAccess(wallet) {
+  if (MY_WALLET && wallet === MY_WALLET) return { ok: true, via: "owner" };
+  const paid = smartPaid.get(wallet);
+  if (paid && paid.until > Date.now()) return { ok: true, via: "paid", until: paid.until };
+  try {
+    const s = await getHolderStatus(wallet);
+    if (s.gold && s.gold.ok) return { ok: true, via: "gold" };
+  } catch {}
+  return { ok: false };
+}
+function smartPass(req, res) {
+  const p = readPass(String(req.headers.authorization || "").replace(/^Bearer\s+/i, ""));
+  if (!p) { res.status(401).json({ error: "Please sign in." }); return null; }
+  return p.w;
+}
+async function requireSmart(req, res, next) {
+  const w = smartPass(req, res); if (!w) return;
+  const a = await smartAccess(w);
+  if (!a.ok) return res.status(402).json({ error: "Smart Wallets is locked.", priceUsd: SMART_PRICE_USD, hours: SMART_MS / 3600e3 });
+  req.smart = { wallet: w, ...a };
+  next();
+}
+
+app.use("/api/smart", rateLimit({ windowMs: 60 * 1000, max: 60, standardHeaders: true, legacyHeaders: false,
+  message: { error: "Too many requests. Slow down." } }));
+
+/** Who am I, and am I in? */
+app.get("/api/smart/status", async (req, res) => {
+  const w = smartPass(req, res); if (!w) return;
+  const a = await smartAccess(w);
+  res.json({ wallet: w, access: a.ok, via: a.via || null, until: a.until || null, priceUsd: SMART_PRICE_USD,
+             hours: SMART_MS / 3600e3, payable: !!MY_WALLET, learningSince: smartSince, tracked: ledger.size });
+});
+
+/** Build the payment for the user's wallet to sign. The server never signs or holds anything. */
+app.post("/api/smart/quote", async (req, res) => {
+  const w = smartPass(req, res); if (!w) return;
+  if (!MY_WALLET) return res.status(503).json({ error: "Payments aren't set up yet." });
+  try {
+    const sol = await getSolUsd();
+    const lamports = Math.ceil((SMART_PRICE_USD / sol) * 1e9);
+    const reference = Keypair.generate().publicKey;
+    const ix = SystemProgram.transfer({ fromPubkey: new PublicKey(w), toPubkey: new PublicKey(MY_WALLET), lamports });
+    ix.keys.push({ pubkey: reference, isSigner: false, isWritable: false });   // tags this payment
+    const { blockhash } = await withTimeout(connection.getLatestBlockhash("finalized"), 8000, "blockhash");
+    const tx = new Transaction({ feePayer: new PublicKey(w), recentBlockhash: blockhash }).add(ix);
+    smartQuotes.set(reference.toBase58(), { wallet: w, lamports, exp: Date.now() + 15 * 60e3 });
+    res.json({ message: b58encode(tx.serializeMessage()),
+               transaction: tx.serialize({ requireAllSignatures: false, verifySignatures: false }).toString("base64"),
+               lamports, sol: +(lamports / 1e9).toFixed(4), usd: SMART_PRICE_USD, hours: SMART_MS / 3600e3 });
+  } catch (err) {
+    log("error", `smart quote failed: ${err.message}`);
+    res.status(502).json({ error: "Couldn't prepare the payment. Try again." });
+  }
+});
+
+/**
+ * Read the payment back from the chain. Access runs SMART_HOURS from the moment
+ * the payment landed, so re-sending the same signature (say, after a restart)
+ * only restores the same window; it can never stack.
+ */
+app.post("/api/smart/verify", async (req, res) => {
+  const w = smartPass(req, res); if (!w) return;
+  const sig = String((req.body || {}).signature || "");
+  if (!/^[1-9A-HJ-NP-Za-km-z]{64,90}$/.test(sig)) return res.status(400).json({ error: "That isn't a valid transaction signature." });
+  if (!MY_WALLET) return res.status(503).json({ error: "Payments aren't set up yet." });
+  try {
+    const tx = await withTimeout(connection.getParsedTransaction(sig, { maxSupportedTransactionVersion: 0, commitment: "confirmed" }), 10000, "payment");
+    if (!tx) return res.status(404).json({ error: "Payment not confirmed yet. Give it a few seconds.", retry: true });
+    if (tx.meta?.err) return res.status(400).json({ error: "That payment failed on-chain, so nothing was charged." });
+    let lamports = 0;
+    for (const ix of tx.transaction.message.instructions || [])
+      if (ix.program === "system" && ix.parsed?.type === "transfer" && ix.parsed.info?.source === w && ix.parsed.info?.destination === MY_WALLET)
+        lamports += Number(ix.parsed.info.lamports) || 0;
+    if (!lamports) return res.status(400).json({ error: "That transaction isn't a payment from your wallet to SLAPBOT." });
+    const at = (tx.blockTime || Math.floor(Date.now() / 1000)) * 1000;
+    if (Date.now() - at > SMART_MS) return res.status(400).json({ error: "That payment's access window has already ended." });
+    const keys = (tx.transaction.message.accountKeys || []).map((k) => (k.pubkey ? k.pubkey.toBase58() : String(k)));
+    const quote = keys.map((k) => smartQuotes.get(k)).find((q) => q && q.wallet === w);
+    let enough = quote ? lamports >= quote.lamports : false;
+    if (!enough) enough = (lamports / 1e9) * (await getSolUsd()) >= SMART_PRICE_USD * 0.85;   // price drift allowance
+    if (!enough) return res.status(400).json({ error: `That payment is less than $${SMART_PRICE_USD}.` });
+    const prev = smartPaid.get(w) || { until: 0, sigs: [] };
+    if (!prev.sigs.includes(sig)) {
+      prev.until = Math.max(prev.until, at) + SMART_MS;
+      prev.sigs = [...prev.sigs, sig].slice(-10);
+      smartPaid.set(w, prev);
+      saveSmart();
+      log("smart", `${w.slice(0, 4)}…${w.slice(-4)} paid ${(lamports / 1e9).toFixed(4)} SOL — access until ${new Date(prev.until).toISOString()}`);
+    }
+    res.json({ access: prev.until > Date.now(), until: prev.until });
+  } catch (err) {
+    log("error", `smart verify failed: ${err.message}`);
+    res.status(502).json({ error: "Couldn't reach Solana to check the payment. Try again.", retry: true });
+  }
+});
+
+/** The leaderboard */
+app.get("/api/smart/top", requireSmart, (req, res) => {
+  res.json({ updated: Date.now(), learningSince: smartSince, tracked: ledger.size, watching: watchList.length, wallets: leaderboard() });
+});
+
+/** Live buys from top wallets, plus any wallets the user follows (?follow=a,b,c) */
+app.get("/api/smart/feed", requireSmart, (req, res) => {
+  const follow = new Set(String(req.query.follow || "").split(",").map((s) => s.trim())
+    .filter((s) => /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(s)).slice(0, 50));
+  const ranks = new Map(leaderboard().map((r) => [r.wallet, r.rank]));
+  const since = Date.now() - 6 * 3600e3;
+  const buys = recentBuys.filter((b) => b.at >= since && (ranks.has(b.w) || follow.has(b.w)))
+    .sort((a, b) => b.at - a.at).slice(0, 80)
+    .map((b) => ({ wallet: b.w, rank: ranks.get(b.w) || null, followed: follow.has(b.w), token: b.t,
+                   sym: tokenInfo.get(b.t)?.sym || "?", usd: b.usd, at: b.at, tx: b.tx }));
+  res.json({ updated: Date.now(), buys });
+});
+
+/** One wallet's full record */
+app.get("/api/smart/wallet/:addr", requireSmart, (req, res) => {
+  const w = String(req.params.addr || "");
+  if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(w)) return res.status(400).json({ error: "Invalid wallet" });
+  const m = ledger.get(w);
+  if (!m) return res.json({ wallet: w, known: false });
+  const s = walletStats(m);
+  res.json({ wallet: w, known: true, rank: leaderboard().find((r) => r.wallet === w)?.rank || null, ...s,
+             recentBuys: recentBuys.filter((b) => b.w === w).slice(-20).reverse()
+               .map((b) => ({ token: b.t, sym: tokenInfo.get(b.t)?.sym || "?", usd: b.usd, at: b.at, tx: b.tx })) });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
 // health check
 // ═══════════════════════════════════════════════════════════════════════
 // ═══════════════════════════════════════════════════════════════════════
@@ -1301,6 +1613,7 @@ app.get("/api/health", (req, res) => {
     // What actually opens the Exclusive page:
     exclusiveGate: { goldKey: { token: GOLD_MINT, hold: GOLD_MIN_HOLD }, holderKey: { token: GATE_MINT, holdUsd: GATE_MIN_USD } },
     allocationList: { listed: claims.size, savedPermanently: claimsPersistent },
+    smartWallets: { tracked: ledger.size, watching: watchList.length, learningSince: new Date(smartSince).toISOString(), savedPermanently: smartPersistent, priceUsd: SMART_PRICE_USD },
     time: new Date().toISOString(),
   });
 });
