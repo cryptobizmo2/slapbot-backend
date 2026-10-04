@@ -1366,7 +1366,7 @@ function walletStats(m) {
 
 let boardCache = { data: null, ts: 0 };
 function leaderboard() {
-  if (boardCache.data && Date.now() - boardCache.ts < 120000) return boardCache.data;
+  if (boardCache.data && Date.now() - boardCache.ts < (boardCache.data.length < 25 ? 30000 : 120000)) return boardCache.data;
   const rows = [];
   for (const [w, m] of ledger) {
     if (m.size < 3) continue;
@@ -1376,24 +1376,46 @@ function leaderboard() {
                 best: s.list.slice(0, 3).map((p) => ({ sym: p.sym, roi: p.roi })) });
   }
   rows.sort((a, b) => b.pnl - a.pnl);
-  const data = rows.slice(0, 100).map((r, i) => ({ rank: i + 1, ...r }));
+  // Early read: while the proven list is short (right after a restart), also show
+  // wallets with at least one strong, real win. Clearly labeled, ranked after proven ones.
+  if (rows.length < 25) {
+    const early = [];
+    for (const [w, m] of ledger) {
+      const s = walletStats(m);
+      if (s.bot || s.positions < 1 || s.pnl < 100 || s.roi < 25 || rows.some((r) => r.wallet === w)) continue;
+      early.push({ wallet: w, pnl: s.pnl, roi: s.roi, winRate: s.winRate, wins: s.wins, positions: s.positions, last: s.last,
+                   best: s.list.slice(0, 3).map((p) => ({ sym: p.sym, roi: p.roi })), tier: "early" });
+    }
+    early.sort((a, b) => b.pnl - a.pnl);
+    rows.push(...early.slice(0, 60 - rows.length));
+  }
+  const data = rows.slice(0, 100).map((r, i) => ({ rank: i + 1, tier: r.tier || "proven", ...r }));
   boardCache = { data, ts: Date.now() };
   return data;
 }
 
 // The learning loop: one pool every 20 s (3 calls a minute — gentle on the data source)
 let smartTick = 0;
-setTimeout(() => refreshWatchList().catch(() => {}), 5000);
+// Warm-up burst: read every watched pool once, right after start, ~2.5 s apart
+setTimeout(async () => {
+  try { await refreshWatchList(); } catch {}
+  for (const pool of watchList.slice()) {
+    try { await ingestPool(pool); } catch {}
+    await new Promise((r) => setTimeout(r, 2500));
+  }
+  boardCache = { data: null, ts: 0 };
+  log("smart", `warm-up done: ${ledger.size} wallets from ${watchList.length} pools`);
+}, 5000);
 setInterval(async () => {
   smartTick++;
   try {
-    if (smartTick % 30 === 0 || !watchList.length) await refreshWatchList();
+    if (smartTick % 50 === 0 || !watchList.length) await refreshWatchList();
     if (!watchList.length) return;
     const pool = watchList[watchIdx++ % watchList.length];
     await ingestPool(pool);
   } catch (e) { if (smartTick % 15 === 0) log("error", `smart wallets: ${e.message}`); }
-  if (smartTick % 30 === 0) { try { pruneSmart(); saveSmart(); } catch (e) { log("error", `smart upkeep: ${e.message}`); } }
-}, 20000);
+  if (smartTick % 50 === 0) { try { pruneSmart(); saveSmart(); } catch (e) { log("error", `smart upkeep: ${e.message}`); } }
+}, 12000);
 
 // ── access ──
 async function smartAccess(wallet) {
@@ -1509,6 +1531,14 @@ app.get("/api/smart/feed", requireSmart, (req, res) => {
     .sort((a, b) => b.at - a.at).slice(0, 80)
     .map((b) => ({ wallet: b.w, rank: ranks.get(b.w) || null, followed: follow.has(b.w), token: b.t,
                    sym: tokenInfo.get(b.t)?.sym || "?", usd: b.usd, at: b.at, tx: b.tx }));
+  if (buys.length < 15) {                     // big buys fill in while smart money is still being learned
+    const have = new Set(buys.map((b) => b.tx));
+    recentBuys.filter((b) => b.at >= Date.now() - 2 * 3600e3 && b.usd >= 500 && !have.has(b.tx))
+      .sort((a, b) => b.at - a.at).slice(0, 30)
+      .forEach((b) => buys.push({ wallet: b.w, rank: null, big: true, followed: false, token: b.t,
+        sym: tokenInfo.get(b.t)?.sym || "?", usd: b.usd, at: b.at, tx: b.tx }));
+    buys.sort((a, b) => b.at - a.at);
+  }
   res.json({ updated: Date.now(), buys });
 });
 
@@ -1846,6 +1876,14 @@ function verdictOf(flags, verified) {
 }
 function marketFlags(m, flags) {
   if (!m) return;
+  if (m.onCurve) {
+    // Pre-graduation pump.fun: you sell back to the bonding curve, not a pool, so
+    // "pool liquidity" numbers don't apply. The honest risk is how early it is.
+    flags.push({ level: "caution", text: `Still on its launch curve (${m.progress != null ? m.progress.toFixed(1) + "% to graduation" : "not graduated"}): early and small, so prices swing hard` });
+    if (m.ch24 != null && m.ch24 <= -70) flags.push({ level: "risk", text: `Down ${Math.round(-m.ch24)}% in 24 hours` });
+    if (m.createdAt && Date.now() - m.createdAt < 6 * 3600e3) flags.push({ level: "caution", text: "Under 6 hours old" });
+    return;
+  }
   const liq = +m.liq || 0, mcap = +m.mcap || 0, vol = +m.vol24 || 0, buys = +m.buys24 || 0, sells = +m.sells24 || 0;
   if (mcap > 5000 && liq > 0 && liq < mcap * 0.01) flags.push({ level: "danger", text: `Liquidity looks pulled ($${Math.round(liq).toLocaleString("en-US")} behind a $${Math.round(mcap).toLocaleString("en-US")} market cap)` });
   else if (liq > 0 && liq < 5000) flags.push({ level: "risk", text: `Very thin liquidity ($${Math.round(liq).toLocaleString("en-US")}), so selling can crash the price` });
@@ -1908,7 +1946,9 @@ async function solanaRisk(mint) {
   if (w != null && w >= 60) flags.push({ level: "risk", text: `Top 10 wallets hold ${Math.round(w)}%: they can dump on everyone` });
   else if (w != null && w >= 35) flags.push({ level: "caution", text: `Top 10 wallets hold ${Math.round(w)}%` });
 
-  marketFlags(prof && { liq: prof.liq, mcap: prof.mcap, vol24: prof.vol24, buys24: prof.buys24, sells24: prof.sells24, ch24: prof.ch24, createdAt: prof.createdAt }, flags);
+  const onCurve = !!(prof && prof.curve && !prof.curve.complete);
+  marketFlags(prof && { onCurve, progress: onCurve ? +prof.curve.progress : null, liq: prof.liq, mcap: prof.mcap, vol24: prof.vol24,
+    buys24: prof.buys24, sells24: prof.sells24, ch24: prof.ch24, createdAt: prof.createdAt }, flags);
   return { verified: true, flags, symbol: prof?.symbol || null, name: prof?.name || null };
 }
 
