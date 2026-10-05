@@ -1274,11 +1274,18 @@ function saveSmart() {
 
 // ── learning ──
 async function refreshWatchList() {
-  const [fresh, trending] = await Promise.all([
-    geckoFeed("new_pools").catch(() => []), geckoFeed("trending_pools").catch(() => [])]);
+  // Wider net = more variety: trending + new, two pages each, plus pump.fun's busiest pools
+  const page = (path) => gecko(path, 9000).then(mapGecko).catch(() => []);
+  const sets = await Promise.all([
+    geckoFeed("trending_pools").catch(() => []), page("/trending_pools?include=base_token&page=2"),
+    geckoFeed("new_pools").catch(() => []), page("/new_pools?include=base_token&page=2"),
+    page("/dexes/pump-fun/pools?include=base_token&page=1"), page("/dexes/pumpswap/pools?include=base_token&page=1")]);
+  // interleave the sources so no single list crowds out the rest
+  const merged = [];
+  for (let i = 0; i < 20; i++) for (const s of sets) if (s[i]) merged.push(s[i]);
   const seen = new Set(), list = [];
-  for (const p of [...trending, ...fresh]) {
-    if (!p.pairAddress || seen.has(p.addr) || p.liq < 5000 || p.txns < 50) continue;
+  for (const p of merged) {
+    if (!p.pairAddress || seen.has(p.addr) || p.liq < 3000 || p.txns < 40) continue;
     seen.add(p.addr);
     if (!SOL_ADDR.test(p.addr) || !SOL_ADDR.test(p.pairAddress)) continue;
     const sym = String(p.sym || "?").replace(/[^\w$.\- ]/g, "").slice(0, 16) || "?";
@@ -1286,7 +1293,7 @@ async function refreshWatchList() {
     list.push({ addr: p.addr, pair: p.pairAddress, sym });
     tokenInfo.set(p.addr, { sym: p.sym, price: p.price, pool: p.pairAddress, ts: Date.now() });
   }
-  if (list.length) watchList = list.slice(0, 30);
+  if (list.length) watchList = list.slice(0, 60);
 }
 
 async function ingestPool(pool) {
@@ -1397,7 +1404,13 @@ function leaderboard() {
                    best: s.list.slice(0, 3).map((p) => ({ sym: p.sym, token: p.token, roi: p.roi, status: p.status })), tier: "early" });
     }
     early.sort((a, b) => b.pnl - a.pnl);
-    rows.push(...early.slice(0, 60 - rows.length));
+    const perToken = new Map(), varied = [];
+    for (const e of early) {
+      const k = e.best[0]?.token || e.wallet, n = perToken.get(k) || 0;
+      if (n >= 3) continue;
+      perToken.set(k, n + 1); varied.push(e);
+    }
+    rows.push(...varied.slice(0, 60 - rows.length));
   }
   const data = rows.slice(0, 100).map((r, i) => ({ rank: i + 1, tier: r.tier || "proven", ...r }));
   boardCache = { data, ts: Date.now() };
