@@ -170,7 +170,7 @@ async function getMintCheck(address) {
     // every pre-graduation token as 90%+ concentrated. Wallets are points on
     // the Ed25519 curve; program-derived addresses are deliberately off it —
     // that is exactly how Solana tells the two apart.
-    let top10Pct = null, top10WalletPct = null;
+    let top10Pct = null, top10WalletPct = null, top1WalletPct = null;
     try {
       const largest = await withTimeout(connection.getTokenLargestAccounts(mintPubkey), 5000, "getTokenLargestAccounts");
       const top = largest.value.slice(0, 20);
@@ -182,7 +182,9 @@ async function getMintCheck(address) {
         top.forEach((a, i) => {
           const owner = infos.value[i]?.data?.parsed?.info?.owner;
           if (!owner || counted >= 10) return;
-          if (PublicKey.isOnCurve(new PublicKey(owner).toBytes())) { walletSum += a.uiAmount || 0; counted++; }
+          if (PublicKey.isOnCurve(new PublicKey(owner).toBytes())) {
+            if (!counted && supply > 0) top1WalletPct = ((a.uiAmount || 0) / supply) * 100;   // largest real wallet
+            walletSum += a.uiAmount || 0; counted++; }
         });
         top10WalletPct = supply > 0 ? (walletSum / supply) * 100 : null;
       } catch (e) {
@@ -202,6 +204,7 @@ async function getMintCheck(address) {
       decimals: parsed.decimals,
       top10HolderPct: top10Pct !== null ? parseFloat(top10Pct.toFixed(2)) : null,
       top10WalletPct: top10WalletPct !== null ? parseFloat(top10WalletPct.toFixed(2)) : null,
+      top1WalletPct: top1WalletPct !== null ? parseFloat(top1WalletPct.toFixed(2)) : null,
       criticalHoneypot: !!freezeAuthority,
     };
 
@@ -2014,6 +2017,49 @@ function marketFlags(m, flags) {
   else if (m.createdAt && Date.now() - m.createdAt < 24 * 3600e3) flags.push({ level: "caution", text: "Under a day old" });
 }
 
+/**
+ * Pure: read the recent trade tape for the patterns that come before rugs.
+ *   wash trading  — the same few wallets trading back and forth, robot-identical sizes
+ *   bundled launch — many different wallets buying in the very same block (usually one person)
+ *   dump underway — big sells in the last 15 minutes versus the pool's liquidity
+ * trades: [{ kind, usd, wallet, block, at }]
+ */
+function tapeFlags(trades, liq, createdAt, now = Date.now()) {
+  const f = [], stats = {};
+  const tr = (trades || []).filter((t) => t && t.usd > 0 && t.wallet);
+  const n = tr.length;
+  if (n >= 40) {
+    const wallets = new Map();
+    for (const t of tr) { const w = wallets.get(t.wallet) || { b: 0, s: 0, usd: 0 }; t.kind === "sell" ? w.s++ : w.b++; w.usd += t.usd; wallets.set(t.wallet, w); }
+    const uniq = wallets.size, ratio = uniq / n, total = tr.reduce((a, t) => a + t.usd, 0);
+    stats.trades = n; stats.wallets = uniq;
+    if (ratio < 0.1) f.push({ level: "danger", text: `Only ${uniq} wallets made the last ${n} trades: fake volume (wash trading)` });
+    else if (ratio < 0.2) f.push({ level: "risk", text: `Only ${uniq} wallets made the last ${n} trades: likely wash trading` });
+    let loopUsd = 0, loopers = 0;
+    for (const w of wallets.values()) if (w.b >= 2 && w.s >= 2) { loopUsd += w.usd; loopers++; }
+    const loopShare = total > 0 ? loopUsd / total : 0; stats.loopShare = Math.round(loopShare * 100);
+    if (loopers >= 2 && loopShare >= 0.5) f.push({ level: "risk", text: `${loopers} wallets keep buying and selling to each other: ${Math.round(loopShare * 100)}% of the volume is them (wash trading)` });
+    const sizes = new Map(); for (const t of tr) { const k = Math.round(t.usd * 2) / 2; sizes.set(k, (sizes.get(k) || 0) + 1); }
+    const top = Math.max(...sizes.values());
+    if (top >= 8 && top / n >= 0.25) f.push({ level: "risk", text: `${top} of the last ${n} trades are the exact same size: bot-made volume` });
+  }
+  // bundled launch: only visible while the launch is still on the tape
+  if (createdAt && now - createdAt < 3 * 3600e3) {
+    const blocks = new Map();
+    for (const t of tr) if (t.kind === "buy" && t.block) { const s = blocks.get(t.block) || new Set(); s.add(t.wallet); blocks.set(t.block, s); }
+    let maxB = 0; for (const s of blocks.values()) maxB = Math.max(maxB, s.size);
+    stats.maxSameBlock = maxB;
+    if (maxB >= 8) f.push({ level: "danger", text: `${maxB} wallets bought in the very same block: bundled launch, usually one person holding many wallets` });
+    else if (maxB >= 4) f.push({ level: "risk", text: `${maxB} wallets bought in the same block: possible bundled launch` });
+  }
+  // dump in progress
+  const recentSells = tr.filter((t) => t.kind === "sell" && t.at && now - t.at < 15 * 60e3).reduce((a, t) => a + t.usd, 0);
+  stats.sells15m = Math.round(recentSells);
+  if (liq > 0 && recentSells >= liq * 0.25) f.push({ level: "danger", text: `$${Math.round(recentSells).toLocaleString("en-US")} sold in the last 15 minutes (${Math.round(recentSells / liq * 100)}% of the liquidity): a dump is happening` });
+  else if (liq > 0 && recentSells >= liq * 0.1) f.push({ level: "risk", text: `Heavy selling in the last 15 minutes ($${Math.round(recentSells).toLocaleString("en-US")})` });
+  return { flags: f, stats };
+}
+
 async function solanaRisk(mint) {
   const flags = [];
   const [acctR, metaR, chainR, profR] = await Promise.allSettled([
@@ -2067,7 +2113,40 @@ async function solanaRisk(mint) {
   const onCurve = !!(prof && prof.curve && !prof.curve.complete);
   marketFlags(prof && { onCurve, progress: onCurve ? +prof.curve.progress : null, liq: prof.liq, mcap: prof.mcap, vol24: prof.vol24,
     buys24: prof.buys24, sells24: prof.sells24, ch24: prof.ch24, createdAt: prof.createdAt }, flags);
-  return { verified: true, flags, symbol: prof?.symbol || null, name: prof?.name || null };
+
+  // one wallet sitting on a big bag
+  const t1 = chain.top1WalletPct;
+  if (t1 != null && t1 >= 40) flags.push({ level: "danger", text: `One wallet holds ${Math.round(t1)}% of the supply and can dump it on everyone` });
+  else if (t1 != null && t1 >= 20) flags.push({ level: "risk", text: `One wallet holds ${Math.round(t1)}% of the supply` });
+
+  // fast crash
+  if (prof && prof.ch1 != null && prof.ch1 <= -50) flags.push({ level: "danger", text: `Down ${Math.round(-prof.ch1)}% in the last hour: rug or dump in progress` });
+
+  // graduation: the riskiest hours on pump.fun
+  let graduation = null;
+  if (onCurve) {
+    const pr = +prof.curve.progress;
+    graduation = { status: "on curve", progress: pr };
+    if (pr >= 85) flags.push({ level: "caution", text: `${pr.toFixed(0)}% to graduation: snipers often dump right as it graduates` });
+  } else if (/pump$/.test(mint) && prof && prof.source === "pool") {
+    const ago = prof.createdAt ? Date.now() - prof.createdAt : null;
+    graduation = { status: "graduated", pool: prof.dex || null, since: prof.createdAt || null };
+    if (ago != null && ago < 3 * 3600e3) flags.push({ level: "caution", text: `Graduated ${Math.max(1, Math.round(ago / 60000))} minutes ago: the hours after graduation are when early buyers usually cash out` });
+  }
+
+  // the trade tape: wash trading, bundles, dumps
+  let tape = null;
+  if (prof && prof.poolAddress) {
+    try {
+      const d = await gecko(`/pools/${prof.poolAddress}/trades`, 8000);
+      const trades = (d?.data || []).map((x) => { const a = x.attributes || {};
+        return { kind: a.kind === "sell" ? "sell" : "buy", usd: +a.volume_in_usd || 0, wallet: a.tx_from_address || null,
+                 block: a.block_number || null, at: a.block_timestamp ? Date.parse(a.block_timestamp) : null }; });
+      tape = tapeFlags(trades, prof.liq || 0, prof.createdAt || null);
+      flags.push(...tape.flags);
+    } catch {}
+  }
+  return { verified: true, flags, symbol: prof?.symbol || null, name: prof?.name || null, graduation, tape: tape ? tape.stats : null };
 }
 
 async function evmRisk(chain, addr) {
@@ -2113,7 +2192,18 @@ async function evmRisk(chain, addr) {
     flags.push({ level: "caution", text: GOPLUS[chain] ? "Contract safety data isn't available yet for this token" : "SLAPBOT can't verify contract safety on this chain, so treat it as risky" });
   }
   marketFlags(market, flags);
-  return { verified, flags, symbol: g?.symbol || null, name: g?.name || null };
+  let tape = null;                                  // same tape checks on Ethereum-style chains
+  if (gid && mR.status === "fulfilled" && mR.value?.data?.length) {
+    try {
+      const best = mR.value.data.reduce((x, y) => (+y.attributes?.reserve_in_usd || 0) > (+x.attributes?.reserve_in_usd || 0) ? y : x);
+      const d = await geckoAny(`/networks/${gid}/pools/${best.attributes.address}/trades`, 8000);
+      const trades = (d?.data || []).map((x) => { const a = x.attributes || {};
+        return { kind: a.kind === "sell" ? "sell" : "buy", usd: +a.volume_in_usd || 0, wallet: a.tx_from_address || null,
+                 block: a.block_number || null, at: a.block_timestamp ? Date.parse(a.block_timestamp) : null }; });
+      tape = tapeFlags(trades, market?.liq || 0, market?.createdAt || null); flags.push(...tape.flags);
+    } catch {}
+  }
+  return { verified, flags, symbol: g?.symbol || null, name: g?.name || null, tape: tape ? tape.stats : null };
 }
 
 const riskCache = new Map();
@@ -2135,6 +2225,7 @@ app.get("/api/risk/:chain/:address", async (req, res) => {
     const score = Math.max(0, 100 - r.flags.reduce((s, f) => s + (weight[f.level] || 0), 0));   // 100 = cleanest
     const order = { danger: 0, risk: 1, caution: 2 };
     const out = { chain, address, symbol: r.symbol, name: r.name, verdict: verdictOf(r.flags, r.verified), score,
+                  graduation: r.graduation || null, tape: r.tape || null,
                   flags: r.flags.sort((a, b) => order[a.level] - order[b.level]), checkedAt: Date.now() };
     riskCache.set(key, out);
     if (riskCache.size > 3000) riskCache.delete(riskCache.keys().next().value);
