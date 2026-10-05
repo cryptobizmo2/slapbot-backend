@@ -761,6 +761,7 @@ app.get("/api/token/:mint", async (req, res) => {
     mintAuthority: chain?.mintAuthority ?? null, freezeAuthority: chain?.freezeAuthority ?? null,
     top10Pct: chain?.top10HolderPct ?? null, top10WalletPct: chain?.top10WalletPct ?? null,
     onchainOk: !!chain?.found,
+    marketLookupFailed: poolsR.status === "rejected", curveLookupFailed: curveR.status === "rejected",
   };
 
   // Graduated / indexed. "Biggest pool wins" is exploitable: junk pools pair a real
@@ -2025,8 +2026,10 @@ function marketFlags(m, flags) {
     flags.push({ level: "danger", text: `Liquidity is basically gone ($${Math.round(m.liq)}): it was pulled or drained. Rugged.` });
     return;
   }
-  if (m.mcap > 0 && m.vol24 > m.mcap * 4)
-    flags.push({ level: m.vol24 > m.mcap * 10 ? "danger" : "risk", text: `24h volume is ${Math.round(m.vol24 / m.mcap)}x the whole market cap: that much trading on a coin this size is almost always fake` });
+  if (m.mcap > 0 && m.vol24 > m.mcap * 15)
+    flags.push({ level: "risk", text: `24h volume is ${Math.round(m.vol24 / m.mcap)}x the whole market cap: that much trading on a coin this size is usually fake` });
+  else if (m.mcap > 0 && m.vol24 > m.mcap * 6)
+    flags.push({ level: "caution", text: `24h volume is ${Math.round(m.vol24 / m.mcap)}x the market cap: very heavy trading for its size, check the trade tape` });
   if (m.onCurve) {
     // Pre-graduation pump.fun: you sell back to the bonding curve, not a pool, so
     // "pool liquidity" numbers don't apply. The honest risk is how early it is.
@@ -2037,8 +2040,8 @@ function marketFlags(m, flags) {
   }
   const liq = +m.liq || 0, mcap = +m.mcap || 0, vol = +m.vol24 || 0, buys = +m.buys24 || 0, sells = +m.sells24 || 0;
   if (mcap > 5000 && liq > 0 && liq < mcap * 0.01) flags.push({ level: "danger", text: `Liquidity looks pulled ($${Math.round(liq).toLocaleString("en-US")} behind a $${Math.round(mcap).toLocaleString("en-US")} market cap)` });
-  else if (liq > 0 && liq < 5000) flags.push({ level: "risk", text: `Very thin liquidity ($${Math.round(liq).toLocaleString("en-US")}), so selling can crash the price` });
-  else if (liq > 0 && liq < 20000) flags.push({ level: "caution", text: `Thin liquidity ($${Math.round(liq).toLocaleString("en-US")})` });
+  else if (liq > 0 && liq < 1000) flags.push({ level: "risk", text: `Very thin liquidity ($${Math.round(liq).toLocaleString("en-US")}), so selling can crash the price` });
+  else if (liq > 0 && liq < 5000) flags.push({ level: "caution", text: `Thin liquidity ($${Math.round(liq).toLocaleString("en-US")}): big sells will move the price a lot` });
   if (buys >= 40 && sells === 0) flags.push({ level: "danger", text: `${buys} buys and zero sells today: classic can't-sell trap` });
   else if (buys >= 60 && sells > 0 && sells / buys < 0.05) flags.push({ level: "risk", text: `Almost nobody is selling (${sells} sells vs ${buys} buys): selling may be blocked` });
   if (liq > 0 && vol / liq > 60) flags.push({ level: "risk", text: `Volume is ${Math.round(vol / liq)}x the liquidity: likely fake (wash) trading` });
@@ -2069,8 +2072,8 @@ function tapeFlags(trades, liq, createdAt, now = Date.now()) {
     for (const w of wallets.values()) if (w.b >= 2 && w.s >= 2) { loopUsd += w.usd; loopers++; }
     const loopShare = total > 0 ? loopUsd / total : 0; stats.loopShare = Math.round(loopShare * 100);
     if (loopers >= 2 && loopShare >= 0.5) f.push({ level: "risk", text: `${loopers} wallets keep buying and selling to each other: ${Math.round(loopShare * 100)}% of the volume is them (wash trading)` });
-    const sizes = new Map(); for (const t of tr) { const k = Math.round(t.usd * 2) / 2; sizes.set(k, (sizes.get(k) || 0) + 1); }
-    const top = Math.max(...sizes.values());
+    const sizes = new Map(); for (const t of tr) { if (t.usd < 5) continue; const k = Math.round(t.usd * 2) / 2; sizes.set(k, (sizes.get(k) || 0) + 1); }
+    const top = sizes.size ? Math.max(...sizes.values()) : 0;      // tiny trades naturally cluster, so only $5+ sizes count
     if (top >= 8 && top / n >= 0.25) f.push({ level: "risk", text: `${top} of the last ${n} trades are the exact same size: bot-made volume` });
 
     // flips: a wallet buys then sells (or the reverse) about the same amount within 2 minutes.
@@ -2090,13 +2093,13 @@ function tapeFlags(trades, liq, createdAt, now = Date.now()) {
       if (flipped) flippers++;
     }
     const flipShare = flipTrades / n; stats.flipShare = Math.round(flipShare * 100); stats.flippers = flippers;
-    if (flipShare >= 0.6) f.push({ level: "danger", text: `${Math.round(flipShare * 100)}% of trades are wallets buying and instantly selling the same amount: a volume bot is faking the activity` });
-    else if (flipShare >= 0.3) f.push({ level: "risk", text: `${Math.round(flipShare * 100)}% of trades are quick buy-then-sell flips of the same amount: likely a volume bot` });
+    if (flipShare >= 0.65) f.push({ level: "danger", text: `${Math.round(flipShare * 100)}% of trades are wallets buying and instantly selling the same amount: a volume bot is faking the activity` });
+    else if (flipShare >= 0.4) f.push({ level: "risk", text: `${Math.round(flipShare * 100)}% of trades are quick buy-then-sell flips of the same amount: likely a volume bot` });
     if (sameBlock >= 3) f.push({ level: "risk", text: `${sameBlock} wallets bought and sold in the same block: self-trading for fake volume` });
 
     // micro-trade spam: lots of tiny trades to pump the trade count
     const tiny = tr.filter((t) => t.usd < 3).length; stats.tinyShare = Math.round((tiny / n) * 100);
-    if (n >= 60 && tiny / n >= 0.6) f.push({ level: "risk", text: `${Math.round((tiny / n) * 100)}% of trades are under $3: a bot is spamming tiny trades to fake activity` });
+    if (n >= 60 && tiny / n >= 0.6) f.push({ level: flipShare >= 0.3 ? "risk" : "caution", text: `${Math.round((tiny / n) * 100)}% of trades are under $3${flipShare >= 0.3 ? ": a bot is spamming tiny trades to fake activity" : ": lots of tiny trades, possibly a volume bot"}` });
 
     // churn: heavy two-way trading but the price barely moves
     const prices = tr.map((t) => t.price).filter((p) => p > 0);
@@ -2192,9 +2195,33 @@ async function solanaRisk(mint) {
   else if (w != null && w >= 35) flags.push({ level: "caution", text: `Top 10 wallets hold ${Math.round(w)}%` });
 
   const onCurve = !!(prof && prof.curve && !prof.curve.complete);
-  const coverage = { onchain: true, market: !!(prof && (prof.source === "pool" || prof.source === "curve")), trades: false, second: false };
-  marketFlags(prof && { onCurve, progress: onCurve ? +prof.curve.progress : null, liq: prof.liq, mcap: prof.mcap, vol24: prof.vol24,
-    buys24: prof.buys24, sells24: prof.sells24, ch24: prof.ch24, createdAt: prof.createdAt }, flags);
+  // second market source: the same one the scanner's liquidity box uses
+  let ds = null, dsOk = false;
+  try {
+    const d = await (await withTimeout(fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`), 8000, "dex market")).json();
+    dsOk = true;
+    const p = trustedDexPair(d.pairs, mint);
+    if (p) { const tx = p.txns?.h24 || {};
+      ds = { liq: +p.liquidity?.usd || 0, mcap: +p.marketCap || +p.fdv || 0, vol24: +p.volume?.h24 || 0, buys24: +tx.buys || 0, sells24: +tx.sells || 0,
+             ch24: Number.isFinite(+p.priceChange?.h24) ? +p.priceChange.h24 : null, ch1: Number.isFinite(+p.priceChange?.h1) ? +p.priceChange.h1 : null,
+             createdAt: p.pairCreatedAt || null, pair: p.pairAddress || null }; }
+  } catch {}
+  const profOk = !!prof && !prof.marketLookupFailed;
+  const seen = (prof && (prof.source === "pool" || prof.source === "curve")) || !!ds;
+  const coverage = { onchain: true, market: seen || (profOk && dsOk), trades: false, second: false };
+  if (seen) {
+    const m = { onCurve, progress: onCurve ? +prof.curve.progress : null,
+      liq: Math.max(prof?.liq || 0, ds?.liq || 0), mcap: prof?.mcap || ds?.mcap || 0,
+      vol24: Math.max(prof?.vol24 || 0, ds?.vol24 || 0),
+      buys24: Math.max(prof?.buys24 || 0, ds?.buys24 || 0), sells24: Math.max(prof?.sells24 || 0, ds?.sells24 || 0),
+      ch24: prof?.ch24 ?? ds?.ch24 ?? null, createdAt: prof?.createdAt || ds?.createdAt || null };
+    marketFlags(m, flags);
+    if (prof && !prof.poolAddress && ds?.pair) prof.poolAddress = ds.pair;
+    if (prof && prof.ch1 == null && ds?.ch1 != null) prof.ch1 = ds.ch1;
+  } else if (profOk && dsOk && !onCurve && !prof?.curveLookupFailed) {
+    // both sources answered and neither has a market: that's real, not a lookup glitch
+    marketFlags({ onCurve: false, liq: 0, mcap: 0 }, flags);
+  }
 
   // one wallet sitting on a big bag
   const t1 = chain.top1WalletPct;
@@ -2239,11 +2266,12 @@ async function solanaRisk(mint) {
     coverage.second = true;
     for (const x of so.risks) {
       if (!x.name) continue;
-      const lvl = x.level === "danger" ? "danger" : x.level === "warn" ? "risk" : "caution";
+      const lvl = x.level === "danger" ? "risk" : "caution";
       flags.push({ level: lvl, text: `Second opinion: ${x.name}${x.text ? ": " + x.text : ""}` });
     }
-    if (!onCurve && !/pump$/.test(mint) && so.lpLockedPct != null && so.lpLockedPct < 50)
-      flags.push({ level: so.lpLockedPct < 10 ? "danger" : "risk", text: `Only ${Math.round(so.lpLockedPct)}% of the liquidity is locked: the creator can pull it and run` });
+    const lpWarned = so.risks.some((x) => /lp|liquidity/i.test(x.name) && /unlock/i.test(x.name + " " + x.text));
+    if (!onCurve && !/pump$/.test(mint) && lpWarned && so.lpLockedPct != null && so.lpLockedPct < 10)
+      flags.push({ level: "risk", text: `Only ${Math.round(so.lpLockedPct)}% of the liquidity is locked: the creator could pull it` });
   }
   const missing = Object.entries(coverage).filter(([, v]) => !v).map(([k]) => ({ market: "market", trades: "trade tape", second: "second opinion", onchain: "on-chain" }[k]));
   if (missing.length) flags.push({ level: "caution", text: `Not fully checked: couldn't run the ${missing.join(", ")} check${missing.length > 1 ? "s" : ""}. Treat it as unverified.` });
