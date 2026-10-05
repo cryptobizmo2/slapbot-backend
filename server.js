@@ -1235,6 +1235,7 @@ const ledger = new Map();        // wallet → Map(token → { b, bt, s, st, n, 
 const tokenInfo = new Map();     // token → { sym, price, pool, ts }
 const poolSeen = new Map();      // pool → Set(tx hashes already counted)
 let recentBuys = [];             // { w, t, usd, at, tx }
+let recentSells = [];            // same shape, for exits
 let watchList = [], watchIdx = 0, smartSince = Date.now(), smartPersistent = false;
 
 function b58encode(buf) {
@@ -1253,7 +1254,7 @@ if (SMART_FILE) {
       for (const [w, p] of d.paid || []) smartPaid.set(w, p);
       for (const [t, i] of d.tokens || []) tokenInfo.set(t, i);
       for (const [w, ps] of d.wallets || []) ledger.set(w, new Map(ps));
-      recentBuys = d.buys || [];
+      recentBuys = d.buys || []; recentSells = d.sells || [];
     }
     smartPersistent = true;
     log("init", `Smart Wallets: ${ledger.size} wallets loaded from the volume`);
@@ -1265,7 +1266,7 @@ function saveSmart() {
     const tmp = SMART_FILE + ".tmp";
     nodeFs.writeFileSync(tmp, JSON.stringify({
       since: smartSince, paid: [...smartPaid], tokens: [...tokenInfo],
-      wallets: [...ledger].map(([w, m]) => [w, [...m]]), buys: recentBuys,
+      wallets: [...ledger].map(([w, m]) => [w, [...m]]), buys: recentBuys, sells: recentSells,
     }));
     nodeFs.renameSync(tmp, SMART_FILE);
   } catch (e) { log("error", `Saving Smart Wallets failed: ${e.message}`); }
@@ -1309,12 +1310,12 @@ async function ingestPool(pool) {
     let m = ledger.get(w);
     if (!m) { m = new Map(); ledger.set(w, m); }
     const p = m.get(pool.addr) || { b: 0, bt: 0, s: 0, st: 0, n: 0, f: at, l: at };
-    if (buy) { p.b += usd; p.bt += tok; } else { p.s += usd; p.st += tok; }
+    if (buy) { p.b += usd; p.bt += tok; p.lb = Math.max(p.lb || 0, at); } else { p.s += usd; p.st += tok; p.ls = Math.max(p.ls || 0, at); }
     p.n++; p.f = Math.min(p.f, at); p.l = Math.max(p.l, at);
     m.set(pool.addr, p);
     const px = buy ? +a.price_to_in_usd : +a.price_from_in_usd;
     if (px > 0) { const i = tokenInfo.get(pool.addr) || { sym: pool.sym, pool: pool.pair }; tokenInfo.set(pool.addr, { ...i, price: px, ts: Date.now() }); }
-    if (buy) recentBuys.push({ w, t: pool.addr, usd: +usd.toFixed(2), at, tx: a.tx_hash });
+    (buy ? recentBuys : recentSells).push({ w, t: pool.addr, usd: +usd.toFixed(2), at, tx: a.tx_hash });
     added++;
   }
   if (seen.size > 3000) poolSeen.set(pool.pair, new Set([...seen].slice(-1500)));
@@ -1324,6 +1325,7 @@ async function ingestPool(pool) {
 function pruneSmart() {
   const now = Date.now();
   recentBuys = recentBuys.filter((b) => now - b.at < 24 * 3600e3).slice(-5000);
+  recentSells = recentSells.filter((b) => now - b.at < 24 * 3600e3).slice(-5000);
   for (const [w, m] of ledger) {
     for (const [t, p] of m) if (now - p.l > 30 * 24 * 3600e3) m.delete(t);
     if (!m.size) ledger.delete(w);
@@ -1345,7 +1347,7 @@ function pruneSmart() {
 
 /** Pure: one wallet's record from its ledger. */
 function walletStats(m) {
-  let cost = 0, value = 0, wins = 0, counted = 0, trades = 0, last = 0;
+  let cost = 0, value = 0, wins = 0, counted = 0, trades = 0, last = 0, realizedPnl = 0, openValue = 0, holding = 0;
   const positions = [];
   for (const [t, p] of m) {
     trades += p.n; last = Math.max(last, p.l);
@@ -1355,13 +1357,19 @@ function walletStats(m) {
     const held = Math.max(0, p.bt - p.st) * price;
     const pnl = realized + held - p.b;
     cost += p.b; value += realized + held; counted++; if (pnl > 0) wins++;
-    positions.push({ token: t, sym: tokenInfo.get(t)?.sym || "?", spent: +p.b.toFixed(2),
-      pnl: +pnl.toFixed(2), roi: +((pnl / p.b) * 100).toFixed(1), stillHolding: p.bt - p.st > p.bt * 0.05, last: p.l });
+    const soldPct = Math.min(100, Math.round((p.st / p.bt) * 100));
+    const soldCost = p.b * Math.min(1, p.st / p.bt);
+    realizedPnl += realized - soldCost; openValue += held; if (soldPct < 95) holding++;
+    positions.push({ token: t, sym: tokenInfo.get(t)?.sym || "?", spent: +p.b.toFixed(2), gotBack: +realized.toFixed(2), stillWorth: +held.toFixed(2),
+      pnl: +pnl.toFixed(2), roi: +((pnl / p.b) * 100).toFixed(1), soldPct,
+      status: soldPct >= 95 ? "sold all" : soldPct > 5 ? "sold part" : "holding", stillHolding: soldPct < 95,
+      lastBuy: p.lb || p.f, lastSell: p.ls || null, last: p.l });
   }
   const bot = trades > 300 || [...m.values()].some((p) => p.n > 40);
   positions.sort((a, b) => b.pnl - a.pnl);
   return { pnl: +(value - cost).toFixed(2), spent: +cost.toFixed(2), roi: cost ? +(((value - cost) / cost) * 100).toFixed(1) : 0,
-           winRate: counted ? Math.round((wins / counted) * 100) : 0, wins, positions: counted, trades, last, bot, list: positions };
+           winRate: counted ? Math.round((wins / counted) * 100) : 0, wins, positions: counted, trades, last, bot, list: positions,
+           realized: +realizedPnl.toFixed(2), openValue: +openValue.toFixed(2), holding };
 }
 
 let boardCache = { data: null, ts: 0 };
@@ -1373,7 +1381,8 @@ function leaderboard() {
     const s = walletStats(m);
     if (s.bot || s.positions < 3 || s.winRate < 50 || s.pnl <= 0) continue;
     rows.push({ wallet: w, pnl: s.pnl, roi: s.roi, winRate: s.winRate, wins: s.wins, positions: s.positions, last: s.last,
-                best: s.list.slice(0, 3).map((p) => ({ sym: p.sym, roi: p.roi })) });
+                realized: s.realized, openValue: s.openValue, holding: s.holding,
+                best: s.list.slice(0, 3).map((p) => ({ sym: p.sym, token: p.token, roi: p.roi, status: p.status })) });
   }
   rows.sort((a, b) => b.pnl - a.pnl);
   // Early read: while the proven list is short (right after a restart), also show
@@ -1384,7 +1393,8 @@ function leaderboard() {
       const s = walletStats(m);
       if (s.bot || s.positions < 1 || s.pnl < 100 || s.roi < 25 || rows.some((r) => r.wallet === w)) continue;
       early.push({ wallet: w, pnl: s.pnl, roi: s.roi, winRate: s.winRate, wins: s.wins, positions: s.positions, last: s.last,
-                   best: s.list.slice(0, 3).map((p) => ({ sym: p.sym, roi: p.roi })), tier: "early" });
+                   realized: s.realized, openValue: s.openValue, holding: s.holding,
+                   best: s.list.slice(0, 3).map((p) => ({ sym: p.sym, token: p.token, roi: p.roi, status: p.status })), tier: "early" });
     }
     early.sort((a, b) => b.pnl - a.pnl);
     rows.push(...early.slice(0, 60 - rows.length));
@@ -1522,24 +1532,47 @@ app.get("/api/smart/top", requireSmart, (req, res) => {
 });
 
 /** Live buys from top wallets, plus any wallets the user follows (?follow=a,b,c) */
+/** What happened after a buy: has this wallet sold this token since? */
+function exitOf(w, t, after) {
+  const p = ledger.get(w)?.get(t);
+  if (!p || !p.ls || p.ls < after || !(p.bt > 0)) return null;
+  return { soldPct: Math.min(100, Math.round((p.st / p.bt) * 100)), at: p.ls };
+}
+/** Tokens smart wallets are dumping right now: the "don't chase it" list. */
+function dontChase(ranks, follow, hours) {
+  const since = Date.now() - hours * 3600e3, by = new Map();
+  const smart = (w) => ranks.has(w) || follow.has(w);
+  for (const x of recentSells) if (x.at >= since && smart(x.w)) {
+    const k = by.get(x.t) || { token: x.t, sym: tokenInfo.get(x.t)?.sym || "?", sellers: new Set(), soldUsd: 0, buyers: new Set(), boughtUsd: 0, last: 0 };
+    k.sellers.add(x.w); k.soldUsd += x.usd; k.last = Math.max(k.last, x.at); by.set(x.t, k);
+  }
+  for (const x of recentBuys) if (x.at >= since && smart(x.w) && by.has(x.t)) { const k = by.get(x.t); k.buyers.add(x.w); k.boughtUsd += x.usd; }
+  return [...by.values()].filter((k) => k.soldUsd > k.boughtUsd * 0.6 || k.sellers.size >= 2)
+    .map((k) => ({ token: k.token, sym: k.sym, sellers: k.sellers.size, soldUsd: +k.soldUsd.toFixed(2), buyers: k.buyers.size,
+                   boughtUsd: +k.boughtUsd.toFixed(2), last: k.last, price: tokenInfo.get(k.token)?.price || null }))
+    .sort((a, b) => b.soldUsd - a.soldUsd).slice(0, 30);
+}
+
+/** Live feed: buys AND sells from top + followed wallets, each buy marked if they've since exited */
 app.get("/api/smart/feed", requireSmart, (req, res) => {
   const follow = new Set(String(req.query.follow || "").split(",").map((s) => s.trim())
     .filter((s) => /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(s)).slice(0, 50));
   const ranks = new Map(leaderboard().map((r) => [r.wallet, r.rank]));
   const since = Date.now() - 6 * 3600e3;
-  const buys = recentBuys.filter((b) => b.at >= since && (ranks.has(b.w) || follow.has(b.w)))
-    .sort((a, b) => b.at - a.at).slice(0, 80)
-    .map((b) => ({ wallet: b.w, rank: ranks.get(b.w) || null, followed: follow.has(b.w), token: b.t,
-                   sym: tokenInfo.get(b.t)?.sym || "?", usd: b.usd, at: b.at, tx: b.tx }));
-  if (buys.length < 15) {                     // big buys fill in while smart money is still being learned
-    const have = new Set(buys.map((b) => b.tx));
-    recentBuys.filter((b) => b.at >= Date.now() - 2 * 3600e3 && b.usd >= 500 && !have.has(b.tx))
-      .sort((a, b) => b.at - a.at).slice(0, 30)
-      .forEach((b) => buys.push({ wallet: b.w, rank: null, big: true, followed: false, token: b.t,
-        sym: tokenInfo.get(b.t)?.sym || "?", usd: b.usd, at: b.at, tx: b.tx }));
-    buys.sort((a, b) => b.at - a.at);
+  const smart = (w) => ranks.has(w) || follow.has(w);
+  const row = (b, kind, extra) => ({ kind, wallet: b.w, rank: ranks.get(b.w) || null, followed: follow.has(b.w), token: b.t,
+    sym: tokenInfo.get(b.t)?.sym || "?", usd: b.usd, at: b.at, tx: b.tx, price: tokenInfo.get(b.t)?.price || null,
+    exit: kind === "buy" ? exitOf(b.w, b.t, b.at) : null, ...(extra || {}) });
+  const items = recentBuys.filter((b) => b.at >= since && smart(b.w)).map((b) => row(b, "buy"))
+    .concat(recentSells.filter((b) => b.at >= since && smart(b.w)).map((b) => row(b, "sell")));
+  if (items.length < 15) {                     // big trades fill in while smart money is still being learned
+    const have = new Set(items.map((b) => b.tx)), cut = Date.now() - 2 * 3600e3;
+    recentBuys.filter((b) => b.at >= cut && b.usd >= 500 && !have.has(b.tx)).forEach((b) => items.push(row(b, "buy", { big: true })));
+    recentSells.filter((b) => b.at >= cut && b.usd >= 500 && !have.has(b.tx)).forEach((b) => items.push(row(b, "sell", { big: true })));
   }
-  res.json({ updated: Date.now(), buys });
+  items.sort((a, b) => b.at - a.at);
+  const list = items.slice(0, 100);
+  res.json({ updated: Date.now(), buys: list.filter((x) => x.kind === "buy"), trades: list, dontChase: dontChase(ranks, follow, 3) });
 });
 
 /** One wallet's full record */
@@ -1551,6 +1584,8 @@ app.get("/api/smart/wallet/:addr", requireSmart, (req, res) => {
   const s = walletStats(m);
   res.json({ wallet: w, known: true, rank: leaderboard().find((r) => r.wallet === w)?.rank || null, ...s,
              recentBuys: recentBuys.filter((b) => b.w === w).slice(-20).reverse()
+               .map((b) => ({ token: b.t, sym: tokenInfo.get(b.t)?.sym || "?", usd: b.usd, at: b.at, tx: b.tx, exit: exitOf(w, b.t, b.at) })),
+             recentSells: recentSells.filter((b) => b.w === w).slice(-20).reverse()
                .map((b) => ({ token: b.t, sym: tokenInfo.get(b.t)?.sym || "?", usd: b.usd, at: b.at, tx: b.tx })) });
 });
 
@@ -1593,8 +1628,8 @@ async function symbolFor(mint) {
   return sym;
 }
 
-/** Pure: did this wallet buy something in this parsed transaction? */
-function readBuy(tx, w, solPrice) {
+/** Pure: did this wallet buy or sell a token in this parsed transaction? */
+function readTrade(tx, w, solPrice) {
   if (!tx || tx.meta?.err) return null;
   const keys = (tx.transaction?.message?.accountKeys || []).map((k) => (k.pubkey ? k.pubkey.toBase58() : String(k)));
   const i = keys.indexOf(w);
@@ -1602,18 +1637,24 @@ function readBuy(tx, w, solPrice) {
   const delta = new Map();
   for (const b of tx.meta.preTokenBalances || []) if (b.owner === w) delta.set(b.mint, (delta.get(b.mint) || 0) - (+b.uiTokenAmount?.uiAmount || 0));
   for (const b of tx.meta.postTokenBalances || []) if (b.owner === w) delta.set(b.mint, (delta.get(b.mint) || 0) + (+b.uiTokenAmount?.uiAmount || 0));
-  let got = null;
-  for (const [mint, d] of delta) if (d > 0 && !NOT_A_BUY.has(mint) && (!got || d > got.amount)) got = { mint, amount: d };
-  if (!got) return null;
+  let up = null, down = null;
+  for (const [mint, d] of delta) {
+    if (NOT_A_BUY.has(mint)) continue;
+    if (d > 0 && (!up || d > up.amount)) up = { mint, amount: d };
+    if (d < 0 && (!down || -d > down.amount)) down = { mint, amount: -d };
+  }
   const fee = i === 0 ? (tx.meta.fee || 0) : 0;
   const lam = (tx.meta.postBalances?.[i] ?? 0) - (tx.meta.preBalances?.[i] ?? 0) + fee;   // SOL moved, fee excluded
-  let spent = lam < 0 ? (-lam / 1e9) * solPrice : 0;
-  const wsol = delta.get("So11111111111111111111111111111111111111112");
-  if (wsol < 0) spent += -wsol * solPrice;
-  for (const s of STABLES) if (delta.get(s) < 0) spent += -delta.get(s);
-  if (!(spent >= 20)) return null;          // dust, airdrops and transfers in aren't buys
-  return { mint: got.mint, amount: got.amount, usd: +spent.toFixed(2), at: (tx.blockTime || Math.floor(Date.now() / 1000)) * 1000 };
+  const wsol = delta.get("So11111111111111111111111111111111111111112") || 0;
+  let spent = (lam < 0 ? -lam / 1e9 : 0) * solPrice + (wsol < 0 ? -wsol * solPrice : 0);
+  let got = (lam > 0 ? lam / 1e9 : 0) * solPrice + (wsol > 0 ? wsol * solPrice : 0);
+  for (const s of STABLES) { const d = delta.get(s) || 0; if (d < 0) spent += -d; else got += d; }
+  const at = (tx.blockTime || Math.floor(Date.now() / 1000)) * 1000;
+  if (up && spent >= 20) return { side: "buy", mint: up.mint, amount: up.amount, usd: +spent.toFixed(2), at };
+  if (down && got >= 20) return { side: "sell", mint: down.mint, amount: down.amount, usd: +got.toFixed(2), at };
+  return null;                              // dust, airdrops and plain transfers aren't trades
 }
+const readBuy = (tx, w, solPrice) => { const t = readTrade(tx, w, solPrice); return t && t.side === "buy" ? t : null; };
 
 async function handleWalletTx(w, sig) {
   try {
@@ -1621,18 +1662,29 @@ async function handleWalletTx(w, sig) {
     let tx = await read();
     if (!tx) { await new Promise((r) => setTimeout(r, 1500)); tx = await read(); }   // just-confirmed txs can take a moment to index
     let sol = 0; try { sol = await getSolUsd(); } catch {}
-    const buy = readBuy(tx, w, sol || 150);
+    const buy = readTrade(tx, w, sol || 150);
     if (!buy) return;
     const sym = await symbolFor(buy.mint);
     const now = Date.now();
-    const stack = new Set(alerts.filter((a) => a.t === buy.mint && now - a.seen < 30 * 60e3).map((a) => a.w).concat(w)).size;
-    alerts.push({ w, t: buy.mint, sym, usd: buy.usd, at: buy.at, seen: now, tx: sig, stack });
+    if (buy.side === "sell") {               // an exit: record it and raise a "don't chase" alert
+      let m = ledger.get(w); if (!m) { m = new Map(); ledger.set(w, m); }
+      const p = m.get(buy.mint) || { b: 0, bt: 0, s: 0, st: 0, n: 0, f: buy.at, l: buy.at };
+      p.s += buy.usd; p.st += buy.amount; p.n++; p.ls = Math.max(p.ls || 0, buy.at); p.l = Math.max(p.l, buy.at); m.set(buy.mint, p);
+      recentSells.push({ w, t: buy.mint, usd: buy.usd, at: buy.at, tx: sig });
+      alerts.push({ kind: "sell", w, t: buy.mint, sym, usd: buy.usd, at: buy.at, seen: now, tx: sig, stack: 0,
+                    soldPct: p.bt > 0 ? Math.min(100, Math.round((p.st / p.bt) * 100)) : null });
+      alertBuySigs.add(sig);
+      log("alert", `${w.slice(0, 4)}… SOLD ${sym} $${buy.usd}`);
+      return;
+    }
+    const stack = new Set(alerts.filter((a) => a.kind !== "sell" && a.t === buy.mint && now - a.seen < 30 * 60e3).map((a) => a.w).concat(w)).size;
+    alerts.push({ kind: "buy", w, t: buy.mint, sym, usd: buy.usd, at: buy.at, seen: now, tx: sig, stack });
     alertBuySigs.add(sig); if (alertBuySigs.size > 20000) for (const x of [...alertBuySigs].slice(0, 10000)) alertBuySigs.delete(x);
     if (alerts.length > 600) alerts = alerts.slice(-500);
     // feed the learning ledger too, so live buys count toward the leaderboard
     let m = ledger.get(w); if (!m) { m = new Map(); ledger.set(w, m); }
     const p = m.get(buy.mint) || { b: 0, bt: 0, s: 0, st: 0, n: 0, f: buy.at, l: buy.at };
-    p.b += buy.usd; p.bt += buy.amount; p.n++; p.l = Math.max(p.l, buy.at); m.set(buy.mint, p);
+    p.b += buy.usd; p.bt += buy.amount; p.n++; p.lb = Math.max(p.lb || 0, buy.at); p.l = Math.max(p.l, buy.at); m.set(buy.mint, p);
     if (!tokenInfo.has(buy.mint)) tokenInfo.set(buy.mint, { sym, price: buy.usd / buy.amount, pool: null, ts: now });
     recentBuys.push({ w, t: buy.mint, usd: buy.usd, at: buy.at, tx: sig });
     log("alert", `${w.slice(0, 4)}… bought ${sym} $${buy.usd}${stack > 1 ? ` — ${stack} smart wallets in` : ""} (${((now - buy.at) / 1000).toFixed(0)}s after the block)`);
@@ -1694,8 +1746,9 @@ app.get("/api/smart/alerts", requireSmart, (req, res) => {
   const mine = new Set(follow);
   const out = alerts.filter((a) => a.seen > since && (ranks.has(a.w) || mine.has(a.w) || liveSubs.has(a.w)))
     .slice(-60).reverse()
-    .map((a) => ({ wallet: a.w, rank: ranks.get(a.w) || null, followed: mine.has(a.w), token: a.t, sym: a.sym,
-                   usd: a.usd, at: a.at, seen: a.seen, tx: a.tx, stack: a.stack }));
+    .map((a) => ({ kind: a.kind || "buy", wallet: a.w, rank: ranks.get(a.w) || null, followed: mine.has(a.w), token: a.t, sym: a.sym,
+                   usd: a.usd, at: a.at, seen: a.seen, tx: a.tx, stack: a.stack, soldPct: a.soldPct ?? null,
+                   exit: (a.kind || "buy") === "buy" ? exitOf(a.w, a.t, a.at) : null }));
   res.json({ now, live: liveSubs.size, alerts: out });
 });
 
