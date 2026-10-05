@@ -1291,9 +1291,22 @@ async function refreshWatchList() {
     const sym = String(p.sym || "?").replace(/[^\w$.\- ]/g, "").slice(0, 16) || "?";
     p.sym = sym;
     list.push({ addr: p.addr, pair: p.pairAddress, sym });
-    tokenInfo.set(p.addr, { sym: p.sym, price: p.price, pool: p.pairAddress, ts: Date.now() });
+    tokenInfo.set(p.addr, { sym: p.sym, price: p.price, pool: p.pairAddress, ts: Date.now(),
+      mcap: p.fdv || null, vol: p.vol, liq: p.liq, createdAt: p.createdAt, buys: p.buys, sells: p.sells });
   }
-  if (list.length) watchList = list.slice(0, 60);
+  // Early lane: brand-new, still-tiny pools, kept in their own slots so big movers can't crowd them out
+  const early = [];
+  for (const p of [...sets[2], ...sets[3], ...sets[4]]) {
+    if (!p.pairAddress || seen.has(p.addr) || !SOL_ADDR.test(p.addr) || !SOL_ADDR.test(p.pairAddress)) continue;
+    const young = p.createdAt && Date.now() - p.createdAt < 12 * 3600e3;
+    if (!young || p.liq < 1000 || p.txns < 10 || p.vol > 150000) continue;
+    seen.add(p.addr);
+    const sym = String(p.sym || "?").replace(/[^\w$.\- ]/g, "").slice(0, 16) || "?";
+    early.push({ addr: p.addr, pair: p.pairAddress, sym, early: true });
+    tokenInfo.set(p.addr, { sym, price: p.price, pool: p.pairAddress, ts: Date.now(),
+      mcap: p.fdv || null, vol: p.vol, liq: p.liq, createdAt: p.createdAt, buys: p.buys, sells: p.sells, early: true });
+  }
+  if (list.length || early.length) watchList = list.slice(0, 55).concat(early.slice(0, 25));
 }
 
 async function ingestPool(pool) {
@@ -1438,7 +1451,7 @@ setInterval(async () => {
     await ingestPool(pool);
   } catch (e) { if (smartTick % 15 === 0) log("error", `smart wallets: ${e.message}`); }
   if (smartTick % 50 === 0) { try { pruneSmart(); saveSmart(); } catch (e) { log("error", `smart upkeep: ${e.message}`); } }
-}, 12000);
+}, 9000);   // ~80 pools, each re-read about every 12 minutes
 
 // ── access ──
 async function smartAccess(wallet) {
@@ -1540,6 +1553,45 @@ app.post("/api/smart/verify", async (req, res) => {
 });
 
 /** The leaderboard */
+/**
+ * GET /api/smart/early — tiny, young tokens smart wallets are buying, smallest first.
+ * Falls back to the freshest low-volume launches with real buy pressure when no smart wallet is in yet.
+ * Each one gets the on-chain basics checked (can the creator print or freeze?).
+ */
+app.get("/api/smart/early", requireSmart, async (req, res) => {
+  const follow = new Set(String(req.query.follow || "").split(",").map((x) => x.trim()).filter((x) => SOL_ADDR.test(x)).slice(0, 50));
+  const ranks = new Map(leaderboard().map((r) => [r.wallet, r.rank]));
+  const smart = (w) => ranks.has(w) || follow.has(w);
+  const now = Date.now(), since = now - 6 * 3600e3;
+  const isEarly = (i) => i && i.createdAt && now - i.createdAt < 24 * 3600e3 && ((i.mcap && i.mcap < 150000) || (i.vol != null && i.vol < 75000));
+  const by = new Map();
+  for (const b of recentBuys) {
+    if (b.at < since || !smart(b.w)) continue;
+    const i = tokenInfo.get(b.t); if (!isEarly(i)) continue;
+    const k = by.get(b.t) || { token: b.t, buyers: new Set(), usd: 0, last: 0, first: b.at }; k.buyers.add(b.w); k.usd += b.usd; k.last = Math.max(k.last, b.at); k.first = Math.min(k.first, b.at); by.set(b.t, k);
+  }
+  const sold = new Set(recentSells.filter((x) => x.at >= since && smart(x.w)).map((x) => x.t));
+  let rows = [...by.values()].map((k) => ({ ...k, smartBuyers: k.buyers.size, backed: true }));
+  if (rows.length < 10) {                       // nobody smart in yet: show the freshest launches with real buying
+    for (const [t, i] of tokenInfo) {
+      if (by.has(t) || !i.early || !isEarly(i)) continue;
+      const tx = (i.buys || 0) + (i.sells || 0);
+      if (tx < 15 || (i.buys || 0) / Math.max(1, tx) < 0.55) continue;
+      rows.push({ token: t, buyers: new Set(), usd: 0, last: i.ts, first: i.createdAt, smartBuyers: 0, backed: false });
+    }
+  }
+  rows = rows.map((r) => { const i = tokenInfo.get(r.token) || {};
+    return { token: r.token, sym: i.sym || "?", mcap: i.mcap || null, vol: i.vol ?? null, liq: i.liq ?? null, price: i.price || null,
+      createdAt: i.createdAt || null, buys: i.buys || 0, sells: i.sells || 0, smartBuyers: r.smartBuyers, smartUsd: +r.usd.toFixed(2),
+      firstSmartBuy: r.backed ? r.first : null, smartSelling: sold.has(r.token), backed: r.backed }; })
+    .sort((a, b) => (b.smartBuyers - a.smartBuyers) || ((a.mcap || 9e9) - (b.mcap || 9e9))).slice(0, 25);
+  // on-chain basics for each (cached 5 min per token, so this stays quick)
+  const checks = await Promise.allSettled(rows.map((r) => withTimeout(getMintCheck(r.token), 6000, "early check")));
+  rows.forEach((r, i) => { const c = checks[i].status === "fulfilled" ? checks[i].value : null;
+    r.safety = c && c.found ? { canPrint: !c.mintAuthorityRenounced, canFreeze: !c.freezeAuthorityRenounced, top10: c.top10WalletPct ?? c.top10HolderPct ?? null } : null; });
+  res.json({ updated: now, tokens: rows });
+});
+
 app.get("/api/smart/top", requireSmart, (req, res) => {
   res.json({ updated: Date.now(), learningSince: smartSince, tracked: ledger.size, watching: watchList.length, wallets: leaderboard() });
 });
