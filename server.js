@@ -148,11 +148,17 @@ function withTimeout(promise, ms, label) {
  * uses what's left (it keeps 8 slots free for users), and if the service says "slow down" (429)
  * the background backs off for a minute instead of making things worse.
  */
-const GT_PER_MIN = Math.max(10, parseInt(process.env.GT_PER_MIN || "28", 10));
+// With a free CoinGecko Demo key (Railway variable CG_API_KEY) the same data comes through CoinGecko's
+// /onchain doorway with ~30 calls a minute that belong to YOU. Without a key, every app on Railway's shared
+// address competes for ~10 calls a minute, which is why pools went to "fallback".
+const CG_API_KEY = String(process.env.CG_API_KEY || "").trim();
+const CG_PRO = /^pro$/i.test(String(process.env.CG_PLAN || ""));
+const CG_BASE = CG_PRO ? "https://pro-api.coingecko.com/api/v3/onchain" : "https://api.coingecko.com/api/v3/onchain";
+const GT_PER_MIN = Math.max(5, parseInt(process.env.GT_PER_MIN || (CG_API_KEY ? (CG_PRO ? "450" : "28") : "9"), 10));
 let gtTimes = [], gtBackoffUntil = 0;
 const gtStats = { ok: 0, limited: 0, failed: 0, skipped: 0, last429: null };
 async function gtFetch(url, prio = "user") {
-  const reserve = prio === "user" ? 0 : 8, start = Date.now();
+  const reserve = prio === "user" ? 0 : Math.ceil(GT_PER_MIN * 0.35), start = Date.now();   // ~35% always kept for people
   for (;;) {
     const now = Date.now();
     gtTimes = gtTimes.filter((t) => now - t < 60000);
@@ -163,7 +169,15 @@ async function gtFetch(url, prio = "user") {
     await new Promise((r) => setTimeout(r, 300));
   }
   gtTimes.push(Date.now());
-  const r = await fetch(url, { headers: { accept: "application/json" } });
+  let r;
+  if (CG_API_KEY) {
+    const keyed = url.replace("https://api.geckoterminal.com/api/v2", CG_BASE);
+    r = await fetch(keyed, { headers: { accept: "application/json", [CG_PRO ? "x-cg-pro-api-key" : "x-cg-demo-api-key"]: CG_API_KEY } });
+    if (r.status === 401 || r.status === 403 || r.status === 404) {   // not in this plan: use the free doorway for this one
+      gtStats.keyFallback = (gtStats.keyFallback || 0) + 1;
+      r = await fetch(url, { headers: { accept: "application/json" } });
+    }
+  } else r = await fetch(url, { headers: { accept: "application/json" } });
   if (r.status === 429) { gtStats.limited++; gtStats.last429 = Date.now(); gtBackoffUntil = Date.now() + 60000; throw new Error("GeckoTerminal 429"); }
   if (!r.ok) { gtStats.failed++; throw new Error("GeckoTerminal " + r.status); }
   gtStats.ok++;
@@ -1474,7 +1488,7 @@ setInterval(async () => {
     await ingestPool(pool);
   } catch (e) { if (smartTick % 15 === 0) log("error", `smart wallets: ${e.message}`); }
   if (smartTick % 50 === 0) { try { pruneSmart(); saveSmart(); } catch (e) { log("error", `smart upkeep: ${e.message}`); } }
-}, 9000);   // ~80 pools, each re-read about every 12 minutes
+}, GT_PER_MIN >= 25 ? 9000 : 30000);   // keyed: every 9 s · keyless: every 30 s so users keep the budget
 
 // ── access ──
 async function smartAccess(wallet) {
@@ -2488,7 +2502,8 @@ app.get("/api/health", (req, res) => {
     // What actually opens the Exclusive page:
     exclusiveGate: { goldKey: { token: GOLD_MINT, hold: GOLD_MIN_HOLD }, holderKey: { token: GATE_MINT, holdUsd: GATE_MIN_USD } },
     allocationList: { listed: claims.size, savedPermanently: claimsPersistent },
-    marketData: { callsLastMinute: gtTimes.filter((t) => Date.now() - t < 60000).length, budgetPerMinute: GT_PER_MIN, ...gtStats,
+    marketData: { keyed: !!CG_API_KEY, plan: CG_API_KEY ? (CG_PRO ? "pro" : "demo") : "keyless (shared, ~10/min)",
+                  callsLastMinute: gtTimes.filter((t) => Date.now() - t < 60000).length, budgetPerMinute: GT_PER_MIN, ...gtStats,
                   coolingDown: Date.now() < gtBackoffUntil, newPoolsAgeSec: poolCache.new.ts ? Math.round((Date.now() - poolCache.new.ts) / 1000) : null },
     lowSupply: { found: lowSupply.size, maxSupply: LOW_SUPPLY_MAX },
     smartWallets: { tracked: ledger.size, watching: watchList.length, liveWallets: liveSubs.size, alerts24h: alerts.length, learningSince: new Date(smartSince).toISOString(), savedPermanently: smartPersistent, priceUsd: SMART_PRICE_USD },
