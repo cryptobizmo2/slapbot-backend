@@ -142,6 +142,34 @@ function withTimeout(promise, ms, label) {
   ]);
 }
 
+/**
+ * Market-data gate. The free market-data service allows roughly 30 calls a minute per server.
+ * Every call goes through here: what users are looking at goes first, background learning only
+ * uses what's left (it keeps 8 slots free for users), and if the service says "slow down" (429)
+ * the background backs off for a minute instead of making things worse.
+ */
+const GT_PER_MIN = Math.max(10, parseInt(process.env.GT_PER_MIN || "28", 10));
+let gtTimes = [], gtBackoffUntil = 0;
+const gtStats = { ok: 0, limited: 0, failed: 0, skipped: 0, last429: null };
+async function gtFetch(url, prio = "user") {
+  const reserve = prio === "user" ? 0 : 8, start = Date.now();
+  for (;;) {
+    const now = Date.now();
+    gtTimes = gtTimes.filter((t) => now - t < 60000);
+    if (prio !== "user" && now < gtBackoffUntil) { gtStats.skipped++; throw new Error("market data cooling down"); }
+    if (gtTimes.length < GT_PER_MIN - reserve) break;
+    if (prio !== "user") { gtStats.skipped++; throw new Error("market data budget in use"); }
+    if (now - start > 6000) break;                    // a user never waits more than ~6 s
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  gtTimes.push(Date.now());
+  const r = await fetch(url, { headers: { accept: "application/json" } });
+  if (r.status === 429) { gtStats.limited++; gtStats.last429 = Date.now(); gtBackoffUntil = Date.now() + 60000; throw new Error("GeckoTerminal 429"); }
+  if (!r.ok) { gtStats.failed++; throw new Error("GeckoTerminal " + r.status); }
+  gtStats.ok++;
+  return r;
+}
+
 // Authority + holder data changes slowly — cache it so repeat scans are instant.
 const mintCache = new Map();
 const MINT_TTL = 5 * 60 * 1000;
@@ -526,11 +554,8 @@ function mapGecko(raw) {
     };
   }).filter((x) => x.addr && x.price > 0 && !NOISE.has(String(x.sym).toUpperCase()) && !String(x.sym).includes("-"));
 }
-async function geckoFeed(kind) {
-  const r = await withTimeout(fetch(
-    `https://api.geckoterminal.com/api/v2/networks/solana/${kind}?include=base_token`,
-    { headers: { accept: "application/json" } }), 10000, kind);
-  if (!r.ok) throw new Error(`GeckoTerminal ${r.status}`);
+async function geckoFeed(kind, prio = "user") {
+  const r = await withTimeout(gtFetch(`https://api.geckoterminal.com/api/v2/networks/solana/${kind}?include=base_token`, prio), 10000, kind);
   return mapGecko(await r.json());
 }
 
@@ -700,10 +725,8 @@ async function readMetadata(mint) {
   return acct ? decodeMetadata(acct.data) : null;
 }
 
-async function gecko(path, ms = 9000) {
-  const r = await withTimeout(fetch("https://api.geckoterminal.com/api/v2/networks/solana" + path,
-    { headers: { accept: "application/json" } }), ms, "gecko " + path.split("?")[0]);
-  if (!r.ok) throw new Error("GeckoTerminal " + r.status);
+async function gecko(path, ms = 9000, prio = "user") {
+  const r = await withTimeout(gtFetch("https://api.geckoterminal.com/api/v2/networks/solana" + path, prio), ms, "gecko " + path.split("?")[0]);
   return r.json();
 }
 
@@ -915,9 +938,7 @@ async function getGeckoNetworks() {
   for (let page = 1; page <= 15; page++) {
     let rows = [];
     try {
-      const r = await withTimeout(fetch(`https://api.geckoterminal.com/api/v2/networks?page=${page}`,
-        { headers: { accept: "application/json" } }), 9000, "networks");
-      if (!r.ok) break;
+      const r = await withTimeout(gtFetch(`https://api.geckoterminal.com/api/v2/networks?page=${page}`, "user"), 9000, "networks");
       rows = (await r.json()).data || [];
     } catch { break; }
     let fresh = 0;
@@ -938,10 +959,8 @@ async function resolveGecko(dexChain) {
   resolvedNets.set(dexChain, gid);
   return gid;
 }
-async function geckoAny(fullPath, ms = 9000) {
-  const r = await withTimeout(fetch("https://api.geckoterminal.com/api/v2" + fullPath,
-    { headers: { accept: "application/json" } }), ms, "gecko " + fullPath.split("?")[0]);
-  if (!r.ok) throw new Error("GeckoTerminal " + r.status);
+async function geckoAny(fullPath, ms = 9000, prio = "user") {
+  const r = await withTimeout(gtFetch("https://api.geckoterminal.com/api/v2" + fullPath, prio), ms, "gecko " + fullPath.split("?")[0]);
   return r.json();
 }
 
@@ -1278,10 +1297,10 @@ function saveSmart() {
 // ── learning ──
 async function refreshWatchList() {
   // Wider net = more variety: trending + new, two pages each, plus pump.fun's busiest pools
-  const page = (path) => gecko(path, 9000).then(mapGecko).catch(() => []);
+  const page = (path) => gecko(path, 9000, "bg").then(mapGecko).catch(() => []);
   const sets = await Promise.all([
-    geckoFeed("trending_pools").catch(() => []), page("/trending_pools?include=base_token&page=2"),
-    geckoFeed("new_pools").catch(() => []), page("/new_pools?include=base_token&page=2"),
+    geckoFeed("trending_pools", "bg").catch(() => []), page("/trending_pools?include=base_token&page=2"),
+    geckoFeed("new_pools", "bg").catch(() => []), page("/new_pools?include=base_token&page=2"),
     page("/dexes/pump-fun/pools?include=base_token&page=1"), page("/dexes/pumpswap/pools?include=base_token&page=1")]);
   // interleave the sources so no single list crowds out the rest
   const merged = [];
@@ -1313,7 +1332,7 @@ async function refreshWatchList() {
 }
 
 async function ingestPool(pool) {
-  const d = await gecko(`/pools/${pool.pair}/trades`, 9000);
+  const d = await gecko(`/pools/${pool.pair}/trades`, 9000, "bg");
   let seen = poolSeen.get(pool.pair);
   if (!seen) { seen = new Set(); poolSeen.set(pool.pair, seen); }
   let added = 0;
@@ -1867,7 +1886,7 @@ async function sweepLowSupply() {
   const chain = DEX_CHAINS[lowChainIdx++ % DEX_CHAINS.length], cg = await resolveGecko(chain).catch(() => null);
   if (cg) paths.push(`/networks/${cg}/new_pools?include=base_token,network&page=1`);
   const rows = [];
-  for (const p of paths) { try { rows.push(...poolRows(await geckoAny(p))); } catch {} }
+  for (const p of paths) { try { rows.push(...poolRows(await geckoAny(p, 9000, "bg"))); } catch {} }
 
   // read supply for tokens we haven't seen, 30 per call, grouped by network
   const need = new Map();
@@ -1880,7 +1899,7 @@ async function sweepLowSupply() {
   for (const [gid, addrs] of need) {
     for (let i = 0; i < addrs.length && calls < 6; i += 30, calls++) {
       try {
-        const d = await geckoAny(`/networks/${gid}/tokens/multi/${[...new Set(addrs.slice(i, i + 30))].join(",")}`);
+        const d = await geckoAny(`/networks/${gid}/tokens/multi/${[...new Set(addrs.slice(i, i + 30))].join(",")}`, 9000, "bg");
         for (const t of d.data || []) {
           const a = t.attributes || {}, addr = String(a.address || t.id.slice(t.id.indexOf("_") + 1));
           let sup = +a.normalized_total_supply;
@@ -1988,15 +2007,26 @@ function decodeMetaMutability(data) {
 }
 
 /** Pure: turn raw findings into flags and a verdict. */
-function verdictOf(flags, verified) {
+function verdictOf(flags, verified, complete = true) {
   if (flags.some((f) => f.level === "danger")) return "DANGER";
   if (flags.some((f) => f.level === "risk")) return "RISKY";
   if (!verified) return "UNVERIFIED";
+  if (!complete) return "UNVERIFIED";            // a check didn't run: never call that clean
   if (flags.some((f) => f.level === "caution")) return "CAUTION";
   return "PASSED";
 }
 function marketFlags(m, flags) {
   if (!m) return;
+  if (!m.onCurve && !(m.liq > 0) && !(m.mcap > 0)) {
+    flags.push({ level: "danger", text: "No working market: the liquidity is gone or was never there. You likely can't sell. (This is what a rugged token looks like.)" });
+    return;
+  }
+  if (!m.onCurve && m.liq > 0 && m.liq < 500) {
+    flags.push({ level: "danger", text: `Liquidity is basically gone ($${Math.round(m.liq)}): it was pulled or drained. Rugged.` });
+    return;
+  }
+  if (m.mcap > 0 && m.vol24 > m.mcap * 4)
+    flags.push({ level: m.vol24 > m.mcap * 10 ? "danger" : "risk", text: `24h volume is ${Math.round(m.vol24 / m.mcap)}x the whole market cap: that much trading on a coin this size is almost always fake` });
   if (m.onCurve) {
     // Pre-graduation pump.fun: you sell back to the bonding curve, not a pool, so
     // "pool liquidity" numbers don't apply. The honest risk is how early it is.
@@ -2042,6 +2072,39 @@ function tapeFlags(trades, liq, createdAt, now = Date.now()) {
     const sizes = new Map(); for (const t of tr) { const k = Math.round(t.usd * 2) / 2; sizes.set(k, (sizes.get(k) || 0) + 1); }
     const top = Math.max(...sizes.values());
     if (top >= 8 && top / n >= 0.25) f.push({ level: "risk", text: `${top} of the last ${n} trades are the exact same size: bot-made volume` });
+
+    // flips: a wallet buys then sells (or the reverse) about the same amount within 2 minutes.
+    // Volume bots rotate through hundreds of fresh wallets, so this catches them even when "unique wallets" looks healthy.
+    const byW = new Map(); for (const t of tr) { if (!byW.has(t.wallet)) byW.set(t.wallet, []); byW.get(t.wallet).push(t); }
+    let flipTrades = 0, flippers = 0, sameBlock = 0;
+    for (const list of byW.values()) {
+      if (list.length < 2) continue;
+      list.sort((a, b) => (a.at || 0) - (b.at || 0));
+      let flipped = false, blocks = new Map();
+      for (let i = 1; i < list.length; i++) {
+        const a = list[i - 1], b = list[i];
+        if (a.kind !== b.kind && a.at && b.at && Math.abs(b.at - a.at) <= 120000 && Math.abs(a.usd - b.usd) / Math.max(a.usd, b.usd) <= 0.2) { flipTrades += 2; flipped = true; i++; }
+      }
+      for (const t of list) if (t.block) { const k = blocks.get(t.block) || new Set(); k.add(t.kind); blocks.set(t.block, k); }
+      for (const k of blocks.values()) if (k.size === 2) { sameBlock++; break; }
+      if (flipped) flippers++;
+    }
+    const flipShare = flipTrades / n; stats.flipShare = Math.round(flipShare * 100); stats.flippers = flippers;
+    if (flipShare >= 0.6) f.push({ level: "danger", text: `${Math.round(flipShare * 100)}% of trades are wallets buying and instantly selling the same amount: a volume bot is faking the activity` });
+    else if (flipShare >= 0.3) f.push({ level: "risk", text: `${Math.round(flipShare * 100)}% of trades are quick buy-then-sell flips of the same amount: likely a volume bot` });
+    if (sameBlock >= 3) f.push({ level: "risk", text: `${sameBlock} wallets bought and sold in the same block: self-trading for fake volume` });
+
+    // micro-trade spam: lots of tiny trades to pump the trade count
+    const tiny = tr.filter((t) => t.usd < 3).length; stats.tinyShare = Math.round((tiny / n) * 100);
+    if (n >= 60 && tiny / n >= 0.6) f.push({ level: "risk", text: `${Math.round((tiny / n) * 100)}% of trades are under $3: a bot is spamming tiny trades to fake activity` });
+
+    // churn: heavy two-way trading but the price barely moves
+    const prices = tr.map((t) => t.price).filter((p) => p > 0);
+    const buys = tr.filter((t) => t.kind === "buy").length, balance = Math.abs(buys - (n - buys)) / n;
+    if (n >= 80 && prices.length >= 40 && balance <= 0.08) {
+      const lo = Math.min(...prices), hi = Math.max(...prices);
+      if (lo > 0 && (hi - lo) / lo < 0.03) f.push({ level: "risk", text: `${n} trades split almost exactly 50/50 and the price hasn't moved: churned, fake volume` });
+    }
   }
   // bundled launch: only visible while the launch is still on the tape
   if (createdAt && now - createdAt < 3 * 3600e3) {
@@ -2060,6 +2123,23 @@ function tapeFlags(trades, liq, createdAt, now = Date.now()) {
   return { flags: f, stats };
 }
 
+/** Independent second opinion from RugCheck's public report (LP lock, creator holdings, insider networks). */
+const secondCache = new Map();
+async function secondOpinion(mint) {
+  const hit = secondCache.get(mint);
+  if (hit && Date.now() - hit.ts < 5 * 60e3) return hit.data;
+  const r = await withTimeout(fetch(`https://api.rugcheck.xyz/v1/tokens/${mint}/report/summary`, { headers: { accept: "application/json" } }), 8000, "second opinion");
+  if (!r.ok) throw new Error("second opinion " + r.status);
+  const d = await r.json();
+  const risks = (Array.isArray(d?.risks) ? d.risks : []).slice(0, 12).map((x) => ({
+    name: String(x?.name || "").replace(/[<>]/g, "").slice(0, 80), text: String(x?.description || "").replace(/[<>]/g, "").slice(0, 160),
+    level: String(x?.level || "").toLowerCase() }));
+  const data = { risks, lpLockedPct: Number.isFinite(+d?.lpLockedPct) ? +d.lpLockedPct : null, score: Number.isFinite(+d?.score_normalised) ? +d.score_normalised : null };
+  secondCache.set(mint, { data, ts: Date.now() });
+  if (secondCache.size > 3000) secondCache.delete(secondCache.keys().next().value);
+  return data;
+}
+
 async function solanaRisk(mint) {
   const flags = [];
   const [acctR, metaR, chainR, profR] = await Promise.allSettled([
@@ -2069,6 +2149,7 @@ async function solanaRisk(mint) {
     getMintCheck(mint),
     fetch(`http://127.0.0.1:${PORT}/api/token/${mint}`).then((r) => r.json()),
   ]);
+  const secondP = secondOpinion(mint).catch(() => null);   // runs alongside everything else
   const acct = acctR.status === "fulfilled" ? acctR.value?.value : null;
   const chain = chainR.status === "fulfilled" ? chainR.value : null;
   const prof = profR.status === "fulfilled" ? profR.value : null;
@@ -2111,6 +2192,7 @@ async function solanaRisk(mint) {
   else if (w != null && w >= 35) flags.push({ level: "caution", text: `Top 10 wallets hold ${Math.round(w)}%` });
 
   const onCurve = !!(prof && prof.curve && !prof.curve.complete);
+  const coverage = { onchain: true, market: !!(prof && (prof.source === "pool" || prof.source === "curve")), trades: false, second: false };
   marketFlags(prof && { onCurve, progress: onCurve ? +prof.curve.progress : null, liq: prof.liq, mcap: prof.mcap, vol24: prof.vol24,
     buys24: prof.buys24, sells24: prof.sells24, ch24: prof.ch24, createdAt: prof.createdAt }, flags);
 
@@ -2136,17 +2218,36 @@ async function solanaRisk(mint) {
 
   // the trade tape: wash trading, bundles, dumps
   let tape = null;
+  if (prof && !prof.poolAddress) {
+    try { const d = await gecko(`/tokens/${mint}/pools?page=1`, 8000);
+      const p = (d?.data || []).find((x) => x?.attributes?.address); if (p) prof.poolAddress = p.attributes.address; } catch {}
+  }
   if (prof && prof.poolAddress) {
     try {
       const d = await gecko(`/pools/${prof.poolAddress}/trades`, 8000);
       const trades = (d?.data || []).map((x) => { const a = x.attributes || {};
         return { kind: a.kind === "sell" ? "sell" : "buy", usd: +a.volume_in_usd || 0, wallet: a.tx_from_address || null,
-                 block: a.block_number || null, at: a.block_timestamp ? Date.parse(a.block_timestamp) : null }; });
+                 block: a.block_number || null, at: a.block_timestamp ? Date.parse(a.block_timestamp) : null,
+                 price: +(a.kind === "sell" ? a.price_from_in_usd : a.price_to_in_usd) || null }; });
       tape = tapeFlags(trades, prof.liq || 0, prof.createdAt || null);
-      flags.push(...tape.flags);
+      flags.push(...tape.flags); coverage.trades = true;
     } catch {}
   }
-  return { verified: true, flags, symbol: prof?.symbol || null, name: prof?.name || null, graduation, tape: tape ? tape.stats : null };
+
+  const so = await secondP;
+  if (so) {
+    coverage.second = true;
+    for (const x of so.risks) {
+      if (!x.name) continue;
+      const lvl = x.level === "danger" ? "danger" : x.level === "warn" ? "risk" : "caution";
+      flags.push({ level: lvl, text: `Second opinion: ${x.name}${x.text ? ": " + x.text : ""}` });
+    }
+    if (!onCurve && !/pump$/.test(mint) && so.lpLockedPct != null && so.lpLockedPct < 50)
+      flags.push({ level: so.lpLockedPct < 10 ? "danger" : "risk", text: `Only ${Math.round(so.lpLockedPct)}% of the liquidity is locked: the creator can pull it and run` });
+  }
+  const missing = Object.entries(coverage).filter(([, v]) => !v).map(([k]) => ({ market: "market", trades: "trade tape", second: "second opinion", onchain: "on-chain" }[k]));
+  if (missing.length) flags.push({ level: "caution", text: `Not fully checked: couldn't run the ${missing.join(", ")} check${missing.length > 1 ? "s" : ""}. Treat it as unverified.` });
+  return { verified: true, complete: !missing.length, coverage, flags, symbol: prof?.symbol || null, name: prof?.name || null, graduation, tape: tape ? tape.stats : null };
 }
 
 async function evmRisk(chain, addr) {
@@ -2224,7 +2325,7 @@ app.get("/api/risk/:chain/:address", async (req, res) => {
     const weight = { danger: 45, risk: 18, caution: 6 };
     const score = Math.max(0, 100 - r.flags.reduce((s, f) => s + (weight[f.level] || 0), 0));   // 100 = cleanest
     const order = { danger: 0, risk: 1, caution: 2 };
-    const out = { chain, address, symbol: r.symbol, name: r.name, verdict: verdictOf(r.flags, r.verified), score,
+    const out = { chain, address, symbol: r.symbol, name: r.name, verdict: verdictOf(r.flags, r.verified, r.complete !== false), score, coverage: r.coverage || null,
                   graduation: r.graduation || null, tape: r.tape || null,
                   flags: r.flags.sort((a, b) => order[a.level] - order[b.level]), checkedAt: Date.now() };
     riskCache.set(key, out);
@@ -2256,58 +2357,43 @@ app.get("/api/risk/:chain/:address", async (req, res) => {
 const poolCache = { new: { data: null, ts: 0 }, trending: { data: null, ts: 0 } };
 const POOL_TTL = 45_000;
 
+function mapPoolRows(raw) {
+  const included = raw.included || [], n = (v) => (Number.isFinite(+v) ? +v : 0);
+  return (raw.data || []).map((p) => {
+    const a = p.attributes || {}, btId = p.relationships?.base_token?.data?.id || "", bt = included.find((x) => x.id === btId);
+    const tx = a.transactions?.h24 || {}, buys = n(tx.buys), sells = n(tx.sells);
+    return { addr: (btId.split("_")[1]) || "", pairAddress: a.address || "",
+      sym: bt?.attributes?.symbol || (a.name || "").split("/")[0].trim() || "?", name: bt?.attributes?.name || "",
+      logo: bt?.attributes?.image_url || null, price: n(a.base_token_price_usd), ch1: n(a.price_change_percentage?.h1),
+      ch24: n(a.price_change_percentage?.h24), vol: n(a.volume_usd?.h24), liq: n(a.reserve_in_usd), fdv: n(a.fdv_usd),
+      buys, sells, txns: buys + sells, createdAt: a.pool_created_at ? new Date(a.pool_created_at).getTime() : null,
+      dex: p.relationships?.dex?.data?.id || "" };
+  }).filter((x) => x.addr && x.price > 0);
+}
+const poolBusy = {};
+async function refreshPools(type) {
+  if (poolBusy[type]) return poolBusy[type];
+  poolBusy[type] = (async () => {
+    const r = await withTimeout(gtFetch(`https://api.geckoterminal.com/api/v2/networks/solana/${type === "new" ? "new_pools" : "trending_pools"}?include=base_token`, "user"), 9000, "pools");
+    const pools = mapPoolRows(await r.json());
+    poolCache[type] = { data: { source: "geckoterminal", type, count: pools.length, pools }, ts: Date.now() };
+    return poolCache[type].data;
+  })().finally(() => { poolBusy[type] = null; });
+  return poolBusy[type];
+}
+// keep both lists warm so the dashboard never waits (and never falls back)
+setTimeout(() => { refreshPools("new").catch(() => {}); refreshPools("trending").catch(() => {}); }, 1500);
+setInterval(() => { refreshPools("new").catch(() => {}); refreshPools("trending").catch(() => {}); }, 40000);
+
 app.get("/api/pools/:type", async (req, res) => {
   const type = req.params.type === "new" ? "new" : "trending";
-  const now = Date.now();
   const hit = poolCache[type];
-  if (hit.data && now - hit.ts < POOL_TTL) return res.json(hit.data);
-
-  const endpoint = type === "new" ? "new_pools" : "trending_pools";
-
-  try {
-    const r = await fetch(
-      `https://api.geckoterminal.com/api/v2/networks/solana/${endpoint}?include=base_token`,
-      { headers: { accept: "application/json" } }
-    );
-    if (!r.ok) throw new Error(`GeckoTerminal ${r.status}`);
-    const raw = await r.json();
-
-    const included = raw.included || [];
-    const pools = (raw.data || []).map((p) => {
-      const a = p.attributes || {};
-      const btId = p.relationships?.base_token?.data?.id || "";
-      const bt = included.find((x) => x.id === btId);
-      const n = (v) => (Number.isFinite(+v) ? +v : 0);
-      const tx = a.transactions?.h24 || {};
-      const buys = n(tx.buys), sells = n(tx.sells);
-      return {
-        addr: (btId.split("_")[1]) || "",
-        pairAddress: a.address || "",
-        sym: bt?.attributes?.symbol || (a.name || "").split("/")[0].trim() || "?",
-        name: bt?.attributes?.name || "",
-        logo: bt?.attributes?.image_url || null,
-        price: n(a.base_token_price_usd),
-        ch1: n(a.price_change_percentage?.h1),
-        ch24: n(a.price_change_percentage?.h24),
-        vol: n(a.volume_usd?.h24),
-        liq: n(a.reserve_in_usd),
-        fdv: n(a.fdv_usd),
-        buys, sells,
-        txns: buys + sells,
-        createdAt: a.pool_created_at ? new Date(a.pool_created_at).getTime() : null,
-        dex: p.relationships?.dex?.data?.id || "",
-      };
-    }).filter((x) => x.addr && x.price > 0);
-
-    const payload = { source: "geckoterminal", type, count: pools.length, pools };
-    poolCache[type] = { data: payload, ts: now };
-    log("discovery", `${type}: ${pools.length} pools`);
-    res.json(payload);
-  } catch (err) {
-    log("error", `pool discovery (${type}) failed: ${err.message}`);
-    if (hit.data) return res.json(hit.data); // serve stale over failing
-    res.status(502).json({ error: "Market data unavailable right now.", pools: [] });
+  if (hit.data) {
+    if (Date.now() - hit.ts >= POOL_TTL) refreshPools(type).catch(() => {});   // refresh behind the scenes
+    return res.json(hit.data);                                                  // always answer instantly
   }
+  try { res.json(await refreshPools(type)); }
+  catch (err) { log("error", `pool discovery (${type}) failed: ${err.message}`); res.status(502).json({ error: "Market data unavailable right now.", pools: [] }); }
 });
 
 /**
@@ -2328,11 +2414,7 @@ app.get("/api/pools/dex/:dexId", async (req, res) => {
   if (hit && now - hit.ts < POOL_TTL) return res.json(hit.data);
 
   try {
-    const r = await fetch(
-      `https://api.geckoterminal.com/api/v2/networks/solana/dexes/${dexId}/pools?include=base_token&page=1`,
-      { headers: { accept: "application/json" } }
-    );
-    if (!r.ok) throw new Error(`GeckoTerminal ${r.status}`);
+    const r = await withTimeout(gtFetch(`https://api.geckoterminal.com/api/v2/networks/solana/dexes/${dexId}/pools?include=base_token&page=1`, "user"), 9000, "dex pools");
     const raw = await r.json();
     const included = raw.included || [];
     const n = (v) => (Number.isFinite(+v) ? +v : 0);
@@ -2378,6 +2460,8 @@ app.get("/api/health", (req, res) => {
     // What actually opens the Exclusive page:
     exclusiveGate: { goldKey: { token: GOLD_MINT, hold: GOLD_MIN_HOLD }, holderKey: { token: GATE_MINT, holdUsd: GATE_MIN_USD } },
     allocationList: { listed: claims.size, savedPermanently: claimsPersistent },
+    marketData: { callsLastMinute: gtTimes.filter((t) => Date.now() - t < 60000).length, budgetPerMinute: GT_PER_MIN, ...gtStats,
+                  coolingDown: Date.now() < gtBackoffUntil, newPoolsAgeSec: poolCache.new.ts ? Math.round((Date.now() - poolCache.new.ts) / 1000) : null },
     lowSupply: { found: lowSupply.size, maxSupply: LOW_SUPPLY_MAX },
     smartWallets: { tracked: ledger.size, watching: watchList.length, liveWallets: liveSubs.size, alerts24h: alerts.length, learningSince: new Date(smartSince).toISOString(), savedPermanently: smartPersistent, priceUsd: SMART_PRICE_USD },
     time: new Date().toISOString(),
