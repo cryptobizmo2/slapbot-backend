@@ -2726,12 +2726,27 @@ function mapPoolRows(raw) {
       dex: p.relationships?.dex?.data?.id || "" };
   }).filter((x) => x.addr && x.price > 0);
 }
+/** Pure: keep trending fresh. Pools over 7 days old drop off, unless that would leave fewer than 10. */
+function freshTrending(pools, now = Date.now()) {
+  const young = pools.filter((p) => p.createdAt && now - p.createdAt < 7 * 864e5);
+  return young.length >= 10 ? young : pools;
+}
 const poolBusy = {};
 async function refreshPools(type) {
   if (poolBusy[type]) return poolBusy[type];
   poolBusy[type] = (async () => {
-    const r = await withTimeout(gtFetch(`https://api.geckoterminal.com/api/v2/networks/solana/${type === "new" ? "new_pools" : "trending_pools"}?include=base_token`, "user"), 9000, "pools");
-    const pools = mapPoolRows(await r.json());
+    const base = "https://api.geckoterminal.com/api/v2/networks/solana/";
+    let pools;
+    if (type === "new") {
+      pools = mapPoolRows(await (await withTimeout(gtFetch(base + "new_pools?include=base_token", "user"), 9000, "pools")).json());
+    } else {
+      // Trending used the default 24-hour window, which keeps old, steady tokens on top for weeks.
+      // Rank by the last hour instead, and drop pools over a week old as long as enough fresh ones remain.
+      let raw;
+      try { raw = await (await withTimeout(gtFetch(base + "trending_pools?include=base_token&duration=1h", "user"), 9000, "pools")).json(); }
+      catch { raw = await (await withTimeout(gtFetch(base + "trending_pools?include=base_token", "user"), 9000, "pools")).json(); }
+      pools = freshTrending(mapPoolRows(raw));
+    }
     poolCache[type] = { data: { source: "geckoterminal", type, count: pools.length, pools }, ts: Date.now() };
     return poolCache[type].data;
   })().finally(() => { poolBusy[type] = null; });
