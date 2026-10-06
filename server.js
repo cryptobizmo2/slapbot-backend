@@ -212,7 +212,7 @@ async function getMintCheck(address) {
     // every pre-graduation token as 90%+ concentrated. Wallets are points on
     // the Ed25519 curve; program-derived addresses are deliberately off it —
     // that is exactly how Solana tells the two apart.
-    let top10Pct = null, top10WalletPct = null, top1WalletPct = null;
+    let top10Pct = null, top10WalletPct = null, top1WalletPct = null; const topOwners = [];
     try {
       const largest = await withTimeout(connection.getTokenLargestAccounts(mintPubkey), 5000, "getTokenLargestAccounts");
       const top = largest.value.slice(0, 20);
@@ -226,6 +226,7 @@ async function getMintCheck(address) {
           if (!owner || counted >= 10) return;
           if (PublicKey.isOnCurve(new PublicKey(owner).toBytes())) {
             if (!counted && supply > 0) top1WalletPct = ((a.uiAmount || 0) / supply) * 100;   // largest real wallet
+            if (supply > 0) topOwners.push({ owner, pct: +(((a.uiAmount || 0) / supply) * 100).toFixed(2) });
             walletSum += a.uiAmount || 0; counted++; }
         });
         top10WalletPct = supply > 0 ? (walletSum / supply) * 100 : null;
@@ -246,7 +247,7 @@ async function getMintCheck(address) {
       decimals: parsed.decimals,
       top10HolderPct: top10Pct !== null ? parseFloat(top10Pct.toFixed(2)) : null,
       top10WalletPct: top10WalletPct !== null ? parseFloat(top10WalletPct.toFixed(2)) : null,
-      top1WalletPct: top1WalletPct !== null ? parseFloat(top1WalletPct.toFixed(2)) : null,
+      top1WalletPct: top1WalletPct !== null ? parseFloat(top1WalletPct.toFixed(2)) : null, topOwners,
       criticalHoneypot: !!freezeAuthority,
     };
 
@@ -689,6 +690,7 @@ function decodeBondingCurve(data) {
     vTok: data.readBigUInt64LE(8),  vSol: data.readBigUInt64LE(16),
     rTok: data.readBigUInt64LE(24), rSol: data.readBigUInt64LE(32),
     supply: data.readBigUInt64LE(40), complete: data[48] === 1,
+    creator: data.length >= 81 ? new PublicKey(data.subarray(49, 81)).toBase58() : null,
   };
 }
 /** Turn curve reserves into USD figures. Pure — no network. */
@@ -2065,6 +2067,38 @@ function marketFlags(m, flags) {
 }
 
 /**
+ * RUG REGISTRY — SLAPBOT's own record of wallets tied to rugs. It never forgets (once the
+ * server has a disk), and it grows from three places:
+ *   1. its own scans: a token whose liquidity was pulled marks its creator; bundle wallets
+ *      on a token that's being dumped get marked too
+ *   2. MasterPeace's launch watcher: a creator whose token got dumped while they sold out
+ *   3. the second opinion: when it calls a token a rug, the creator is noted
+ */
+const RUG_FILE = VOLUME_DIR ? nodePath.join(VOLUME_DIR, "rug-registry.json") : "";
+const rugReg = new Map();          // wallet → { role, rugs: [{ mint, sym, at, how }], first }
+if (RUG_FILE) { try { if (nodeFs.existsSync(RUG_FILE)) for (const [w, v] of JSON.parse(nodeFs.readFileSync(RUG_FILE, "utf8"))) rugReg.set(w, v); } catch {} }
+let rugDirty = false;
+function markRug(wallet, info) {
+  if (!wallet || !SOL_ADDR_RX.test(wallet)) return;
+  const e = rugReg.get(wallet) || { role: info.role, rugs: [], first: Date.now() };
+  if (info.role === "creator") e.role = "creator";                       // creator outranks bundler
+  if (!e.rugs.some((r) => r.mint === info.mint)) e.rugs.push({ mint: info.mint, sym: String(info.sym || "?").slice(0, 16), at: Date.now(), how: String(info.how || "").slice(0, 120) });
+  e.rugs = e.rugs.slice(-20);
+  rugReg.set(wallet, e); rugDirty = true;
+  if (rugReg.size > 100000) rugReg.delete(rugReg.keys().next().value);
+}
+const SOL_ADDR_RX = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+setInterval(() => {
+  if (!rugDirty || !RUG_FILE) return;
+  try { const tmp = RUG_FILE + ".tmp"; nodeFs.writeFileSync(tmp, JSON.stringify([...rugReg])); nodeFs.renameSync(tmp, RUG_FILE); rugDirty = false; }
+  catch (e) { log("error", `saving rug registry: ${e.message}`); }
+}, 5 * 60000);
+function rugLine(e) {
+  const last = e.rugs[e.rugs.length - 1], days = Math.max(0, Math.round((Date.now() - last.at) / 864e5));
+  return `${e.rugs.length} rug${e.rugs.length === 1 ? "" : "s"} on record, last one ${last.sym} ${days ? days + " day" + (days === 1 ? "" : "s") + " ago" : "today"} (${last.how})`;
+}
+
+/**
  * Pure: read the recent trade tape for the patterns that come before rugs.
  *   wash trading  — the same few wallets trading back and forth, robot-identical sizes
  *   bundled launch — many different wallets buying in the very same block (usually one person)
@@ -2131,6 +2165,7 @@ function tapeFlags(trades, liq, createdAt, now = Date.now()) {
     for (const t of tr) if (t.kind === "buy" && t.block) { const s = blocks.get(t.block) || new Set(); s.add(t.wallet); blocks.set(t.block, s); }
     let maxB = 0; for (const s of blocks.values()) maxB = Math.max(maxB, s.size);
     stats.maxSameBlock = maxB;
+    if (maxB >= 4) for (const s of blocks.values()) if (s.size === maxB) { stats.bundleWallets = [...s].slice(0, 20); break; }
     if (maxB >= 8) f.push({ level: "danger", text: `${maxB} wallets bought in the very same block: bundled launch, usually one person holding many wallets` });
     else if (maxB >= 4) f.push({ level: "risk", text: `${maxB} wallets bought in the same block: possible bundled launch` });
   }
@@ -2279,6 +2314,25 @@ async function solanaRisk(mint) {
     } catch {}
   }
 
+  // who launched it: pump.fun curve creator, otherwise whoever controls the metadata
+  let creator = null;
+  try { const cv = await readBondingCurve(mint); if (cv && cv.creator) creator = cv.creator; } catch {}
+  if (!creator && metaR.status === "fulfilled" && metaR.value) {
+    const mm = decodeMetaMutability(metaR.value.data);
+    if (mm && mm.updateAuthority && mm.updateAuthority !== "11111111111111111111111111111111" && PublicKey.isOnCurve(new PublicKey(mm.updateAuthority).toBytes())) creator = mm.updateAuthority;
+  }
+  const cRec = creator ? rugReg.get(creator) : null;
+  if (cRec) flags.push({ level: "danger", text: `The creator's wallet is a known rugger: ${rugLine(cRec)}` });
+  if (creator && typeof MP !== "undefined" && MP.creators.get(creator)?.length >= 5)
+    flags.push({ level: "risk", text: `The creator launched ${MP.creators.get(creator).length} tokens in the last 24 hours: serial launcher` });
+  // top holders checked against the rug list
+  const bad = (chain.topOwners || []).filter((h) => h.owner !== creator && rugReg.has(h.owner));
+  if (bad.length) {
+    const big = bad.reduce((a, h) => (h.pct > a.pct ? h : a), bad[0]);
+    flags.push({ level: big.pct >= 5 ? "danger" : "risk",
+      text: `${bad.length} of the top holders ${bad.length === 1 ? "is a wallet" : "are wallets"} tied to past rugs (biggest holds ${big.pct}%: ${rugLine(rugReg.get(big.owner))})` });
+  }
+
   const so = await secondP;
   if (so) {
     coverage.second = true;
@@ -2286,14 +2340,34 @@ async function solanaRisk(mint) {
       if (!x.name) continue;
       const lvl = x.level === "danger" ? "risk" : "caution";
       flags.push({ level: lvl, text: `Second opinion: ${x.name}${x.text ? ": " + x.text : ""}` });
+      if (creator && /rug/i.test(x.name + " " + x.text)) markRug(creator, { role: "creator", mint, sym: prof?.symbol, how: "second opinion: " + x.name });
     }
     const lpWarned = so.risks.some((x) => /lp|liquidity/i.test(x.name) && /unlock/i.test(x.name + " " + x.text));
     if (!onCurve && !/pump$/.test(mint) && lpWarned && so.lpLockedPct != null && so.lpLockedPct < 10)
       flags.push({ level: "risk", text: `Only ${Math.round(so.lpLockedPct)}% of the liquidity is locked: the creator could pull it` });
   }
+  // what this scan proves goes into the registry
+  const pulled = flags.some((f) => f.level === "danger" && /Liquidity (looks pulled|is basically gone)|No working market/.test(f.text));
+  const dumping = flags.some((f) => /a dump is happening|rug or dump in progress|possible rug in progress/.test(f.text));
+  if (pulled && creator && prof && (prof.source === "pool")) markRug(creator, { role: "creator", mint, sym: prof?.symbol, how: "liquidity pulled" });
+  if (dumping && tape?.stats?.bundleWallets) for (const w of tape.stats.bundleWallets) markRug(w, { role: "bundler", mint, sym: prof?.symbol, how: "bundled the launch, then the dump" });
+
+  // brand-new launches: thin liquidity and a few big wallets are normal before the creator finishes setting up
+  const ageMs = (prof?.createdAt || ds?.createdAt) ? Date.now() - (prof?.createdAt || ds?.createdAt) : null;
+  const early = onCurve || (ageMs != null && ageMs < 6 * 3600e3);
+  if (early) {
+    for (const f of flags) {
+      if (f.level === "caution") continue;
+      const holderish = /^Top 10 wallets hold|^Second opinion: (Low Liquidity|Top 10 holders|Single holder|High ownership|Low amount of LP Providers|High market cap per holder)/.test(f.text)
+        || (/^One wallet holds/.test(f.text) && f.level !== "danger") || /^Very thin liquidity/.test(f.text);
+      if (holderish) { f.level = "caution"; f.text += " (common in the first hours of a launch)"; }
+    }
+  }
+
   const missing = Object.entries(coverage).filter(([, v]) => !v).map(([k]) => ({ market: "market", trades: "trade tape", second: "second opinion", onchain: "on-chain" }[k]));
   if (missing.length) flags.push({ level: "caution", text: `Not fully checked: couldn't run the ${missing.join(", ")} check${missing.length > 1 ? "s" : ""}. Treat it as unverified.` });
-  return { verified: true, complete: !missing.length, coverage, flags, symbol: prof?.symbol || null, name: prof?.name || null, graduation, tape: tape ? tape.stats : null };
+  return { verified: true, complete: !missing.length, coverage, flags, symbol: prof?.symbol || null, name: prof?.name || null, graduation,
+           tape: tape ? { ...tape.stats, bundleWallets: undefined } : null, creator: creator || null, early };
 }
 
 async function evmRisk(chain, addr) {
@@ -2372,7 +2446,7 @@ app.get("/api/risk/:chain/:address", async (req, res) => {
     const score = Math.max(0, 100 - r.flags.reduce((s, f) => s + (weight[f.level] || 0), 0));   // 100 = cleanest
     const order = { danger: 0, risk: 1, caution: 2 };
     const out = { chain, address, symbol: r.symbol, name: r.name, verdict: verdictOf(r.flags, r.verified, r.complete !== false), score, coverage: r.coverage || null,
-                  graduation: r.graduation || null, tape: r.tape || null,
+                  graduation: r.graduation || null, tape: r.tape || null, creator: r.creator || null, early: !!r.early,
                   flags: r.flags.sort((a, b) => order[a.level] - order[b.level]), checkedAt: Date.now() };
     riskCache.set(key, out);
     if (riskCache.size > 3000) riskCache.delete(riskCache.keys().next().value);
@@ -2382,6 +2456,242 @@ app.get("/api/risk/:chain/:address", async (req, res) => {
     log("error", `risk ${chain} ${raw.slice(0, 8)}: ${err.message}`);
     res.status(502).json({ error: "Couldn't finish the scan. Try again." });
   }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// ⑮ MASTERPEACE — private launch sniper, PAPER MODE (no real money moves)
+// ═══════════════════════════════════════════════════════════════════════
+/**
+ * Watches every new pump.fun launch live, waits a short moment so the launch can show
+ * its hand, runs SLAPBOT-style filters, and paper-buys only the ones that pass. Then it
+ * manages each paper position with take-profit, stop-loss and a time limit, priced
+ * straight from the bonding curve, with real-world costs (pump.fun fee, priority fee,
+ * Jito tip, slippage) taken off so the results are honest.
+ *
+ * Nothing here holds a key or sends a transaction. Owner-only.
+ */
+const MP = {
+  on: !/^(0|off|false)$/i.test(String(process.env.MP_ON || "1")),
+  settings: {
+    sizeSol: 0.05,        // paper size per snipe
+    waitSec: 90,          // let the launch play out this long before judging it
+    minProgress: 5,       // curve must be at least this % filled by then (real demand)
+    maxDevPct: 8,         // creator may hold at most this % of supply
+    maxTop10Pct: 35,      // top 10 real wallets (curve excluded) may hold at most this %
+    maxTop1Pct: 12,       // biggest single real wallet
+    tpPct: 100,           // take profit at +100%
+    slPct: 30,            // stop loss at −30%
+    maxHoldMin: 30,       // sell after 30 minutes no matter what
+    maxOpen: 8,           // never more than this many paper positions
+    maxEvalPerMin: 10,    // keep the server and data budget healthy
+    feePct: 1,            // pump.fun trading fee each way
+    priorityFeeSol: 0.0001, jitoTipSol: 0.0001, slippagePct: 3,
+  },
+  seen: 0, queue: [], evaluated: [], positions: [], closed: [], creators: new Map(),
+  skips: {}, startedAt: Date.now(), feed: { connected: false, lastEventAt: null, subId: null, decodeFails: 0 },
+};
+const CREATE_EVENT_ID = crypto.createHash("sha256").update("event:CreateEvent").digest().subarray(0, 8);
+const FAMOUS_TICKERS = new Set(["SOL", "USDC", "USDT", "BONK", "WIF", "JUP", "TRUMP", "POPCAT", "PEPE", "DOGE", "SHIB", "BTC", "ETH", "PNUT", "MOODENG", "FARTCOIN", "PENGU"]);
+
+/** Pure: decode pump.fun's CreateEvent from a "Program data:" log line. Returns null if it isn't one. */
+function decodeCreateEvent(b64) {
+  try {
+    const buf = Buffer.from(b64, "base64");
+    if (buf.length < 8 + 12 + 96 || !buf.subarray(0, 8).equals(CREATE_EVENT_ID)) return null;
+    let o = 8;
+    const str = (max) => { const n = buf.readUInt32LE(o); o += 4; if (n > max || o + n > buf.length) throw 0; const v = buf.subarray(o, o + n).toString("utf8"); o += n; return v; };
+    const key = () => { if (o + 32 > buf.length) throw 0; const k = new PublicKey(buf.subarray(o, o + 32)).toBase58(); o += 32; return k; };
+    const name = str(200), symbol = str(50), uri = str(400);
+    const mint = key(), curve = key(), creator = key();
+    return { name: name.replace(/[<>\u0000]/g, "").slice(0, 60), symbol: symbol.replace(/[<>\u0000]/g, "").slice(0, 20), uri, mint, curve, creator };
+  } catch { return null; }
+}
+
+function mpSkip(reason, ev) {
+  MP.skips[reason] = (MP.skips[reason] || 0) + 1;
+  if (ev) { MP.evaluated.unshift({ ...ev, verdict: "skip", reason, at: Date.now() }); MP.evaluated = MP.evaluated.slice(0, 120); }
+}
+
+/** A new launch arrives: note the creator, queue it to be judged after the wait. */
+function mpOnLaunch(ev) {
+  MP.seen++; MP.feed.lastEventAt = Date.now();
+  const c = MP.creators.get(ev.creator) || [];
+  c.push(Date.now()); MP.creators.set(ev.creator, c.filter((t) => Date.now() - t < 24 * 3600e3));
+  if (MP.creators.size > 50000) MP.creators.delete(MP.creators.keys().next().value);
+  // instant rejects that need no chain reads
+  if (!/pump$/.test(ev.mint)) return mpSkip("not a pump.fun mint");
+  if (!ev.uri) return mpSkip("no metadata");
+  if (FAMOUS_TICKERS.has(ev.symbol.toUpperCase().replace(/^\$/, ""))) return mpSkip("copycat ticker", ev);
+  if (MP.creators.get(ev.creator).length >= 3) return mpSkip("creator spamming launches", ev);
+  if (rugReg.has(ev.creator)) return mpSkip("creator is a known rugger", ev);
+  MP.queue.push({ ...ev, launchedAt: Date.now() });
+  if (MP.queue.length > 400) MP.queue.splice(0, MP.queue.length - 400);
+}
+
+/** Judge one launch after the wait: real demand, no big dev/whale bags, clean contract. */
+async function mpEvaluate(ev) {
+  const S = MP.settings;
+  let c;
+  try { c = await readBondingCurve(ev.mint); } catch { return mpSkip("couldn't read curve", ev); }
+  if (!c) return mpSkip("couldn't read curve", ev);
+  if (c.complete) return mpSkip("already graduated", ev);
+  const sol = await getSolUsd().catch(() => null);
+  if (!sol) return mpSkip("no SOL price", ev);
+  const m = curveMarket(c, sol, 6);
+  // every launch with real money in it gets watched for a creator dump, pass or skip
+  let devAt = null; try { devAt = ((await balanceOf(ev.creator, ev.mint)) / 1e9) * 100; } catch {}
+  if (m.progress >= 3) { rugWatch.push({ mint: ev.mint, sym: ev.symbol, creator: ev.creator, peakSol: Number(c.rSol) / 1e9, devAt, due: Date.now() + 30 * 60e3, round: 0 }); if (rugWatch.length > 2000) rugWatch.shift(); }
+  if (m.progress < S.minProgress) return mpSkip(`weak demand (<${S.minProgress}% bonded)`, { ...ev, progress: m.progress });
+  // creator's bag and holder concentration, curve excluded
+  const chk = await getMintCheck(ev.mint).catch(() => null);
+  if (!chk || !chk.found) return mpSkip("couldn't check holders", ev);
+  if (!chk.mintAuthorityRenounced || !chk.freezeAuthorityRenounced) return mpSkip("can print or freeze", ev);
+  const top10 = chk.top10WalletPct, top1 = chk.top1WalletPct;
+  if (top1 != null && top1 > S.maxTop1Pct) return mpSkip(`one wallet holds ${Math.round(top1)}%`, ev);
+  if (top10 != null && top10 > S.maxTop10Pct) return mpSkip(`top 10 hold ${Math.round(top10)}%`, ev);
+  const devPct = devAt;
+  if (devPct != null && devPct > S.maxDevPct) return mpSkip(`creator holds ${devPct.toFixed(1)}%`, ev);
+  // passes: paper buy
+  if (MP.positions.length >= S.maxOpen) return mpSkip("max open positions", ev);
+  const entry = m.price * (1 + S.slippagePct / 100);                        // you pay a little above the quote
+  const costSol = S.sizeSol * (1 + S.feePct / 100) + S.priorityFeeSol + S.jitoTipSol;
+  const tokens = (S.sizeSol * sol) / entry;
+  const pos = { mint: ev.mint, symbol: ev.symbol, name: ev.name, creator: ev.creator, entry, entrySol: sol, tokens, costSol,
+                openedAt: Date.now(), progressAtBuy: m.progress, high: entry, last: entry, devPct, top10, top1 };
+  MP.positions.push(pos);
+  MP.evaluated.unshift({ ...ev, verdict: "paper buy", reason: `${m.progress.toFixed(1)}% bonded · top10 ${top10 != null ? Math.round(top10) + "%" : "?"} · dev ${devPct != null ? devPct.toFixed(1) + "%" : "?"}`, at: Date.now() });
+  MP.evaluated = MP.evaluated.slice(0, 120);
+  log("masterpeace", `PAPER BUY ${ev.symbol} at ${m.progress.toFixed(1)}% bonded`);
+}
+
+/** Check open paper positions against take-profit, stop-loss, time limit and graduation. */
+async function mpManage() {
+  const S = MP.settings, sol = await getSolUsd().catch(() => null);
+  if (!sol) return;
+  for (const p of MP.positions.slice()) {
+    let price = null, why = null;
+    try {
+      const c = await readBondingCurve(p.mint);
+      if (c && !c.complete) price = curveMarket(c, sol, 6).price;
+      else if (c && c.complete) { price = p.last; why = "graduated (sold at last curve price)"; }
+    } catch {}
+    if (price == null) continue;
+    p.last = price; p.high = Math.max(p.high, price);
+    const ch = (price / p.entry - 1) * 100;
+    if (!why && ch >= S.tpPct) why = `take profit +${S.tpPct}%`;
+    if (!why && ch <= -S.slPct) why = `stop loss −${S.slPct}%`;
+    if (!why && Date.now() - p.openedAt > S.maxHoldMin * 60e3) why = `time limit ${S.maxHoldMin}m`;
+    if (why) {
+      const exit = price * (1 - S.slippagePct / 100);                     // you get a little under the quote
+      const backSol = ((p.tokens * exit) / sol) * (1 - S.feePct / 100) - S.priorityFeeSol - S.jitoTipSol;
+      const pnlSol = backSol - p.costSol;
+      MP.closed.unshift({ ...p, exit, closedAt: Date.now(), why, pnlSol: +pnlSol.toFixed(5), pnlPct: +((pnlSol / p.costSol) * 100).toFixed(1) });
+      MP.closed = MP.closed.slice(0, 300);
+      MP.positions = MP.positions.filter((x) => x !== p);
+      log("masterpeace", `PAPER SELL ${p.symbol} ${why} ${pnlSol >= 0 ? "+" : ""}${pnlSol.toFixed(4)} SOL`);
+    }
+  }
+}
+
+/** Live feed of pump.fun launches, straight from the chain. */
+function mpConnect() {
+  if (!MP.on || MP.feed.subId != null) return;
+  try {
+    MP.feed.subId = connection.onLogs(PUMP_PROGRAM, (l) => {
+      MP.feed.connected = true;
+      if (l.err || !Array.isArray(l.logs) || !l.logs.some((x) => x.includes("Instruction: Create"))) return;
+      for (const line of l.logs) {
+        if (!line.startsWith("Program data: ")) continue;
+        const ev = decodeCreateEvent(line.slice(14));
+        if (ev) { mpOnLaunch(ev); return; }
+      }
+      MP.feed.decodeFails++;
+    }, "confirmed");
+    MP.feed.connected = true;
+    log("masterpeace", "watching pump.fun launches (paper mode)");
+  } catch (e) { MP.feed.subId = null; log("error", `masterpeace feed: ${e.message}`); }
+}
+setTimeout(mpConnect, 8000);
+// reconnect if launches stop arriving for 3 minutes (pump.fun is never that quiet)
+setInterval(async () => {
+  if (!MP.on) return;
+  if (MP.feed.lastEventAt && Date.now() - MP.feed.lastEventAt > 180000 && MP.feed.subId != null) {
+    try { await connection.removeOnLogsListener(MP.feed.subId); } catch {}
+    MP.feed.subId = null; MP.feed.connected = false; mpConnect();
+  }
+}, 60000);
+// judge launches whose wait is over, a few at a time
+let mpEvalWindow = [];
+setInterval(async () => {
+  if (!MP.on) return;
+  const now = Date.now(), S = MP.settings;
+  mpEvalWindow = mpEvalWindow.filter((t) => now - t < 60000);
+  while (MP.queue.length && now - MP.queue[0].launchedAt >= S.waitSec * 1000) {
+    const ev = MP.queue.shift();
+    if (now - ev.launchedAt > (S.waitSec + 120) * 1000) { mpSkip("too old by the time it was judged"); continue; }
+    if (mpEvalWindow.length >= S.maxEvalPerMin) { mpSkip("busy (sampled out)"); continue; }
+    mpEvalWindow.push(now);
+    mpEvaluate(ev).catch(() => mpSkip("check failed", ev));
+  }
+}, 2000);
+setInterval(() => { if (MP.on && MP.positions.length) mpManage().catch(() => {}); }, 10000);
+
+/** Rug watcher: re-check launches at 30 minutes and 3 hours. Creator sold out + curve collapsed = rug. */
+const rugWatch = [];
+setInterval(async () => {
+  const now = Date.now(); let checks = 0;
+  for (let i = 0; i < rugWatch.length && checks < 4; i++) {
+    const w = rugWatch[i]; if (w.due > now) continue;
+    checks++;
+    try {
+      const c = await readBondingCurve(w.mint);
+      if (!c || c.complete) { rugWatch.splice(i--, 1); continue; }            // graduated or gone: not a curve dump
+      const solNow = Number(c.rSol) / 1e9; w.peakSol = Math.max(w.peakSol, solNow);
+      let devNow = null; try { devNow = ((await balanceOf(w.creator, w.mint)) / 1e9) * 100; } catch {}
+      const collapsed = w.peakSol >= 2 && solNow < w.peakSol * 0.35;
+      const devDumped = w.devAt != null && w.devAt >= 1 && devNow != null && devNow < 0.1;
+      if (collapsed && devDumped) {
+        markRug(w.creator, { role: "creator", mint: w.mint, sym: w.sym, how: `sold out while the curve fell from ${w.peakSol.toFixed(1)} to ${solNow.toFixed(1)} SOL` });
+        log("rugwatch", `${w.sym} creator ${w.creator.slice(0, 4)}… marked as rugger`);
+        rugWatch.splice(i--, 1); continue;
+      }
+      if (++w.round >= 2) rugWatch.splice(i--, 1); else w.due = now + 150 * 60e3;   // second look at ~3 hours
+    } catch { w.due = now + 10 * 60e3; }
+  }
+}, 30000);
+
+function requireOwner(req, res) {
+  const p = readPass(String(req.headers.authorization || "").replace(/^Bearer\s+/i, ""));
+  if (!p || !MY_WALLET || p.w !== MY_WALLET) { res.status(403).json({ error: "Owner only." }); return false; }
+  return true;
+}
+app.use("/api/mp", rateLimit({ windowMs: 60 * 1000, max: 60, standardHeaders: true, legacyHeaders: false, message: { error: "Too many requests." } }));
+
+/** Owner-only dashboard data */
+app.get("/api/mp/state", (req, res) => {
+  if (!requireOwner(req, res)) return;
+  const sol = solUsd.v || null;
+  const done = MP.closed, wins = done.filter((x) => x.pnlSol > 0).length;
+  const pnl = done.reduce((a, x) => a + x.pnlSol, 0);
+  const open = MP.positions.map((p) => ({ ...p, chPct: +(((p.last / p.entry) - 1) * 100).toFixed(1), ageMin: +((Date.now() - p.openedAt) / 60000).toFixed(1) }));
+  res.json({ mode: "paper", on: MP.on, startedAt: MP.startedAt, solUsd: sol, settings: MP.settings,
+    feed: { ...MP.feed, subId: undefined }, seen: MP.seen, queued: MP.queue.length,
+    stats: { trades: done.length, wins, winRate: done.length ? Math.round((wins / done.length) * 100) : null, pnlSol: +pnl.toFixed(4), pnlUsd: sol ? +(pnl * sol).toFixed(2) : null,
+             best: done.length ? Math.max(...done.map((x) => x.pnlPct)) : null, worst: done.length ? Math.min(...done.map((x) => x.pnlPct)) : null },
+    skips: MP.skips, open, closed: done.slice(0, 60), evaluated: MP.evaluated.slice(0, 60) });
+});
+
+/** Owner-only: change the rules (numbers are clamped to sane ranges) */
+app.post("/api/mp/settings", (req, res) => {
+  if (!requireOwner(req, res)) return;
+  const b = req.body || {}, S = MP.settings;
+  const clamp = (k, lo, hi) => { if (b[k] == null) return; const v = Number(b[k]); if (Number.isFinite(v)) S[k] = Math.min(hi, Math.max(lo, v)); };
+  clamp("sizeSol", 0.001, 5); clamp("waitSec", 10, 900); clamp("minProgress", 0, 90); clamp("maxDevPct", 0, 100);
+  clamp("maxTop10Pct", 5, 100); clamp("maxTop1Pct", 1, 100); clamp("tpPct", 5, 2000); clamp("slPct", 5, 95);
+  clamp("maxHoldMin", 1, 1440); clamp("maxOpen", 1, 30); clamp("maxEvalPerMin", 1, 30);
+  if (typeof b.on === "boolean") { MP.on = b.on; if (MP.on) mpConnect(); }
+  if (b.reset === true) { MP.closed = []; MP.positions = []; MP.evaluated = []; MP.skips = {}; MP.seen = 0; MP.startedAt = Date.now(); }
+  res.json({ ok: true, settings: S, on: MP.on });
 });
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -2510,6 +2820,8 @@ app.get("/api/health", (req, res) => {
                   callsLastMinute: gtTimes.filter((t) => Date.now() - t < 60000).length, budgetPerMinute: GT_PER_MIN, ...gtStats,
                   coolingDown: Date.now() < gtBackoffUntil, newPoolsAgeSec: poolCache.new.ts ? Math.round((Date.now() - poolCache.new.ts) / 1000) : null },
     lowSupply: { found: lowSupply.size, maxSupply: LOW_SUPPLY_MAX },
+    masterpeace: { on: MP.on, mode: "paper", feedConnected: MP.feed.connected, launchesSeen: MP.seen, openPaper: MP.positions.length },
+    rugRegistry: { wallets: rugReg.size, watching: rugWatch.length, savedPermanently: !!RUG_FILE },
     smartWallets: { tracked: ledger.size, watching: watchList.length, liveWallets: liveSubs.size, alerts24h: alerts.length, learningSince: new Date(smartSince).toISOString(), savedPermanently: smartPersistent, priceUsd: SMART_PRICE_USD },
     time: new Date().toISOString(),
   });
