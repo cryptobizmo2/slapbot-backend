@@ -203,7 +203,18 @@ function withTimeout(promise, ms, label) {
 const CG_API_KEY = String(process.env.CG_API_KEY || "").trim();
 const CG_PRO = /^pro$/i.test(String(process.env.CG_PLAN || ""));
 const CG_BASE = CG_PRO ? "https://pro-api.coingecko.com/api/v3/onchain" : "https://api.coingecko.com/api/v3/onchain";
-const GT_PER_MIN = Math.max(5, parseInt(process.env.GT_PER_MIN || (CG_API_KEY ? (CG_PRO ? "450" : "28") : "9"), 10));
+// On a server with its own address (AWS) the free doorway gives ~30 calls a minute that are ours alone.
+// The free CoinGecko Demo key also caps at about 10,000 calls a MONTH, which a busy bot burns in hours,
+// so the key is now the backup: used only when the free doorway says "slow down", and capped per day.
+const OWN_IP = !process.env.RAILWAY_ENVIRONMENT && !process.env.RAILWAY_PROJECT_ID;
+const GT_PER_MIN = Math.max(5, parseInt(process.env.GT_PER_MIN || (CG_PRO ? "450" : OWN_IP ? "26" : CG_API_KEY ? "28" : "9"), 10));
+const KEY_PER_DAY = Math.max(0, parseInt(process.env.CG_KEY_PER_DAY || (CG_PRO ? "100000" : "300"), 10));
+let keyDay = { day: "", n: 0 };
+function keyAllowed() {
+  const d = new Date().toISOString().slice(0, 10);
+  if (keyDay.day !== d) keyDay = { day: d, n: 0 };
+  return CG_API_KEY && keyDay.n < KEY_PER_DAY;
+}
 let gtTimes = [], gtBackoffUntil = 0;
 const gtStats = { ok: 0, limited: 0, failed: 0, skipped: 0, last429: null };
 async function gtFetch(url, prio = "user") {
@@ -219,14 +230,15 @@ async function gtFetch(url, prio = "user") {
   }
   gtTimes.push(Date.now());
   let r;
-  if (CG_API_KEY) {
-    const keyed = url.replace("https://api.geckoterminal.com/api/v2", CG_BASE);
-    r = await fetch(keyed, { headers: { accept: "application/json", [CG_PRO ? "x-cg-pro-api-key" : "x-cg-demo-api-key"]: CG_API_KEY } });
-    if (r.status === 401 || r.status === 403 || r.status === 404) {   // not in this plan: use the free doorway for this one
-      gtStats.keyFallback = (gtStats.keyFallback || 0) + 1;
-      r = await fetch(url, { headers: { accept: "application/json" } });
-    }
-  } else r = await fetch(url, { headers: { accept: "application/json" } });
+  const keyed = () => { keyDay.n++; gtStats.keyCalls = (gtStats.keyCalls || 0) + 1;
+    return fetch(url.replace("https://api.geckoterminal.com/api/v2", CG_BASE), { headers: { accept: "application/json", [CG_PRO ? "x-cg-pro-api-key" : "x-cg-demo-api-key"]: CG_API_KEY } }); };
+  if (CG_PRO || (!OWN_IP && keyAllowed())) {
+    r = await keyed();                                              // paid plan, or no address of our own: key first
+    if ([401, 403, 404, 429].includes(r.status)) r = await fetch(url, { headers: { accept: "application/json" } });
+  } else {
+    r = await fetch(url, { headers: { accept: "application/json" } });   // our own address: free doorway first
+    if (r.status === 429 && keyAllowed()) { const k = await keyed(); if (k.ok) r = k; }   // key only as backup
+  }
   if (r.status === 429) { gtStats.limited++; gtStats.last429 = Date.now(); gtBackoffUntil = Date.now() + 60000; throw new Error("GeckoTerminal 429"); }
   if (!r.ok) { gtStats.failed++; throw new Error("GeckoTerminal " + r.status); }
   gtStats.ok++;
@@ -2880,7 +2892,8 @@ app.get("/api/health", (req, res) => {
     // What actually opens the Exclusive page:
     exclusiveGate: { goldKey: { token: GOLD_MINT, hold: GOLD_MIN_HOLD }, holderKey: { token: GATE_MINT, holdUsd: GATE_MIN_USD } },
     allocationList: { listed: claims.size, savedPermanently: claimsPersistent },
-    marketData: { keyed: !!CG_API_KEY, plan: CG_API_KEY ? (CG_PRO ? "pro" : "demo") : "keyless (shared, ~10/min)",
+    marketData: { keyed: !!CG_API_KEY, plan: CG_PRO ? "pro" : OWN_IP ? "own address, key as backup" : CG_API_KEY ? "demo key" : "keyless (shared)",
+                  keyCallsToday: keyDay.n, keyDailyCap: KEY_PER_DAY,
                   callsLastMinute: gtTimes.filter((t) => Date.now() - t < 60000).length, budgetPerMinute: GT_PER_MIN, ...gtStats,
                   coolingDown: Date.now() < gtBackoffUntil, newPoolsAgeSec: poolCache.new.ts ? Math.round((Date.now() - poolCache.new.ts) / 1000) : null },
     lowSupply: { found: lowSupply.size, maxSupply: LOW_SUPPLY_MAX },
