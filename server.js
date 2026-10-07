@@ -400,8 +400,9 @@ const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toSt
 if (!process.env.SESSION_SECRET) log("warn", "SESSION_SECRET not set — holder sessions reset on each restart");
 const SESSION_MS = 12 * 60 * 60 * 1000;
 
-function issuePass(wallet) {
-  const body = Buffer.from(JSON.stringify({ w: wallet, exp: Date.now() + SESSION_MS })).toString("base64url");
+const REMEMBER_MS = 30 * 24 * 3600e3;          // "remember this device" for the owner: 30 days
+function issuePass(wallet, ms = SESSION_MS) {
+  const body = Buffer.from(JSON.stringify({ w: wallet, exp: Date.now() + ms })).toString("base64url");
   const mac = crypto.createHmac("sha256", SESSION_SECRET).update(body).digest("base64url");
   return body + "." + mac;
 }
@@ -535,7 +536,7 @@ app.get("/api/auth/challenge", (req, res) => {
 
 /** Step 2 — prove ownership, check balance, receive a pass */
 app.post("/api/auth/verify", async (req, res) => {
-  const { wallet, signature } = req.body || {};
+  const { wallet, signature } = req.body || {};   // optional: remember (owner only)
   // Types and sizes first — never let an object, array or huge string reach the crypto
   if (typeof wallet !== "string" || typeof signature !== "string" || wallet.length > 64 || signature.length > 200)
     return res.status(400).json({ error: "Malformed sign-in request." });
@@ -557,7 +558,8 @@ app.post("/api/auth/verify", async (req, res) => {
   // basicPass: proves the wallet, opens nothing on its own. Smart Wallets uses it to let
   // non-holders pay; every Exclusive route still re-checks the balance on each visit.
   if (!status.authorized) return res.status(403).json({ error: "Not enough tokens", ...status, basicPass: issuePass(wallet) });
-  res.json({ pass: issuePass(wallet), ...status });
+  const remember = (req.body || {}).remember === true && status.isOwner;    // only the owner gets a 30-day pass
+  res.json({ pass: issuePass(wallet, remember ? REMEMBER_MS : SESSION_MS), remembered: remember, ...status });
 });
 
 /**
@@ -585,7 +587,8 @@ app.post("/api/auth/owner", rateLimit({ windowMs: 15 * 60 * 1000, max: 5, standa
     return res.status(401).json({ error: "Wrong code." });
   }
   log("access", "owner signed in with code");
-  res.json({ pass: issuePass(MY_WALLET), wallet: MY_WALLET, owner: true });
+  const remember = (req.body || {}).remember === true;
+  res.json({ pass: issuePass(MY_WALLET, remember ? REMEMBER_MS : SESSION_MS), wallet: MY_WALLET, owner: true, remembered: remember });
 });
 
 /** Guard for every exclusive endpoint — re-checks the balance on each visit */
@@ -2132,7 +2135,7 @@ function marketFlags(m, flags) {
  * server has a disk), and it grows from three places:
  *   1. its own scans: a token whose liquidity was pulled marks its creator; bundle wallets
  *      on a token that's being dumped get marked too
- *   2. MasterPeace's launch watcher: a creator whose token got dumped while they sold out
+ *   2. THE CANNON's launch watcher: a creator whose token got dumped while they sold out
  *   3. the second opinion: when it calls a token a rug, the creator is noted
  */
 const RUG_FILE = VOLUME_DIR ? nodePath.join(VOLUME_DIR, "rug-registry.json") : "";
@@ -2534,7 +2537,40 @@ app.get("/api/risk/:chain/:address", async (req, res) => {
 const MP = {
   on: !/^(0|off|false)$/i.test(String(process.env.MP_ON || "1")),
   settings: {
-    sizeSol: 0.05,        // paper size per snipe
+    startUsd: 50,         // starting paper bankroll
+    slots: 10,            // split the money into this many snipes at once ($5 → ten $0.50 snipes). 0 = use riskPct instead
+    riskPct: 10,          // (when slots is 0) each snipe uses this % of the trading balance
+    minTradeUsd: 0.25,    // never trade smaller than this
+    maxLossPct: 0,        // safety cap: one snipe can never put more than this % of ALL your money at risk (0 = off, 1 = 1%)
+    vaultAtX: 3,          // when the trading balance reaches 3× the start...
+    keepX: 1,             // ...lock everything above 1× start in the vault (never traded again)
+    dailyStopPct: 30,     // down 30% on the day: stop trading until tomorrow
+    maxLossStreak: 5,     // 5 losses in a row: pause
+    pauseMin: 120,        // ...for 2 hours
+    learn: 1,             // 1 = learn from its own results and skip setups that keep losing
+    learnMin: 12,         // a setup needs at least this many trades before it's judged
+    // offense
+    tp1SellPct: 50,       // at the take-profit, sell this % (gets your money back) and let the rest ride
+    trailPct: 25,         // after +100%, the riding part sells if it falls this % from its high
+    trailAt5x: 15,        // tighter once it's up 5×
+    trailAt10x: 10,       // tighter still once it's up 10× (protect the big wins)
+    moonHoldMin: 180,     // the riding part sells after this long no matter what
+    smartBoost: 1.5,      // bet bigger when a top smart wallet bought the same launch
+    favorBoost: 1.5,      // bet bigger on setups that have been winning
+    maxBetPct: 20,        // but never more than this % of the trading balance on one launch
+    // Launch Shot: buy in the first seconds of a launch (around $5K market cap)
+    fastLane: 1,          // 1 = on
+    fastMaxMcap: 8000,    // only if it's still under this market cap when we see it
+    fastBetPct: 5,        // smaller bets: the earliest entries are the riskiest
+    fastMaxPerMin: 3,     // at most this many fast buys a minute
+    fastMaxOpen: 4,       // and at most this many fast positions at once
+    fastMaxDevPct: 15,    // skip if the creator bought more than this % at launch
+    fastTimeoutSec: 180,  // if it hasn't lifted off by then...
+    fastMinGainPct: 30,   // ...(up at least this %), get out
+    // defense
+    devExit: 1,           // 1 = sell everything the moment the creator dumps their bag
+    // savings
+    autoSend: 1,          // 1 = every time profit gets locked, send it to your savings wallet
     waitSec: 90,          // let the launch play out this long before judging it
     minProgress: 5,       // curve must be at least this % filled by then (real demand)
     maxDevPct: 8,         // creator may hold at most this % of supply
@@ -2550,7 +2586,137 @@ const MP = {
   },
   seen: 0, queue: [], evaluated: [], positions: [], closed: [], creators: new Map(),
   skips: {}, startedAt: Date.now(), feed: { connected: false, lastEventAt: null, subId: null, decodeFails: 0 },
+  bank: null, outcomes: [], report: {}, events: [],
 };
+function mpNewBank(start) {
+  const d = new Date().toISOString().slice(0, 10);
+  return { start, cash: start, vault: 0, sent: 0, sends: [], day: d, dayStart: start, streak: 0, pausedUntil: 0, pauseWhy: null, peak: start };
+}
+/** Move the vault to your savings wallet. Paper mode records it; live mode will make the real transfer. */
+function mpSendVault(why) {
+  const B = MP.bank, amt = +(B.vault || 0).toFixed(2);
+  if (!(amt > 0)) return 0;
+  const to = MP.settings.savingsWallet || MY_WALLET || "";
+  B.vault = 0; B.sent = +((B.sent || 0) + amt).toFixed(2);
+  B.sends = [{ at: Date.now(), usd: amt, to, why, paper: true }, ...(B.sends || [])].slice(0, 50);
+  mpEvent(`Sent $${amt.toFixed(2)} of profit to your savings wallet ${to ? to.slice(0, 4) + "…" + to.slice(-4) : ""} (paper: in live mode this is a real transfer)`);
+  return amt;
+}
+MP.bank = mpNewBank(MP.settings.startUsd);
+function mpEvent(text) { MP.events.unshift({ at: Date.now(), text }); MP.events = MP.events.slice(0, 50); log("cannon", text); }
+
+// ── saved to the server's disk, so paper results survive restarts and updates ──
+const MP_FILE = VOLUME_DIR ? nodePath.join(VOLUME_DIR, "masterpeace.json") : "";
+try {
+  if (MP_FILE && nodeFs.existsSync(MP_FILE)) {
+    const d = JSON.parse(nodeFs.readFileSync(MP_FILE, "utf8"));
+    if (d.settings) Object.assign(MP.settings, d.settings);
+    for (const k of ["bank", "closed", "report", "skips", "events", "startedAt", "seen", "outcomes"]) if (d[k] != null) MP[k] = d[k];
+    if (!MP.bank || !Number.isFinite(MP.bank.cash)) MP.bank = mpNewBank(MP.settings.startUsd);
+  }
+} catch (e) { log("error", `loading THE CANNON: ${e.message}`); }
+setInterval(() => {
+  if (!MP_FILE) return;
+  try { const tmp = MP_FILE + ".tmp";
+    nodeFs.writeFileSync(tmp, JSON.stringify({ settings: MP.settings, bank: MP.bank, closed: MP.closed, report: MP.report, skips: MP.skips,
+      events: MP.events, startedAt: MP.startedAt, seen: MP.seen, outcomes: MP.outcomes.slice(-600) }));
+    nodeFs.renameSync(tmp, MP_FILE); } catch (e) { log("error", `saving THE CANNON: ${e.message}`); }
+}, 2 * 60e3);
+
+/** Pure: which "setup" a trade belongs to, so it can learn what works. */
+function mpBuckets(x) {
+  const b = [];
+  if (x.fast) { b.push("Launch Shot entries"); return b; }
+  const pr = x.progressAtBuy;
+  if (pr != null) b.push(pr < 10 ? "bought at 5–10% bonded" : pr < 20 ? "bought at 10–20% bonded" : pr < 40 ? "bought at 20–40% bonded" : "bought at 40%+ bonded");
+  if (x.top10 != null) b.push(x.top10 < 15 ? "top 10 hold under 15%" : x.top10 < 25 ? "top 10 hold 15–25%" : "top 10 hold 25%+");
+  if (x.devPct != null) b.push(x.devPct < 0.5 ? "creator sold or holds nothing" : x.devPct < 3 ? "creator holds under 3%" : "creator holds 3%+");
+  return b;
+}
+/** Pure: average result per setup from closed trades. Setups that keep losing get skipped. */
+function mpLearned(closed, minN) {
+  const by = {};
+  for (const t of closed) for (const k of mpBuckets(t)) { const s = by[k] || (by[k] = { n: 0, sum: 0, wins: 0 }); s.n++; s.sum += t.pnlPct; if (t.pnlPct > 0) s.wins++; }
+  return Object.entries(by).map(([k, s]) => ({ setup: k, trades: s.n, avgPct: +(s.sum / s.n).toFixed(1), winRate: Math.round((s.wins / s.n) * 100),
+    verdict: s.n < minN ? "learning" : s.sum / s.n < -10 ? "skip" : s.sum / s.n > 10 ? "favor" : "neutral" })).sort((a, b) => b.trades - a.trades);
+}
+/** Pure: how big the next snipe is. With slots, all the money (cash + what's in trades) is split evenly. */
+function mpBetSize(bank, S, openPositions, mult = 1, pctOverride = null, sol = 150) {
+  let size;
+  if (S.slots > 0 && pctOverride == null) {
+    // each slot gets an equal share of ALL the money, and the bet is sized so fees + tips fit inside that share
+    const inTrades = openPositions.reduce((a, p) => a + (p.costUsd || 0), 0);
+    const share = (bank.cash + inTrades) / S.slots, fixed = (S.priorityFeeSol + S.jitoTipSol) * sol;
+    size = ((share - fixed) / (1 + S.feePct / 100)) * mult;
+  } else size = (bank.cash * (pctOverride ?? S.riskPct) * mult) / 100;
+  const cap = (bank.cash * S.maxBetPct) / 100;
+  if (S.slots <= 0 && cap > S.minTradeUsd) size = Math.min(size, cap);
+  size = Math.min(bank.cash, Math.max(S.minTradeUsd, size));
+  if (S.maxLossPct > 0) {                       // worst case (a rug takes the whole bet) stays within maxLossPct of everything
+    const all = bank.cash + bank.vault + openPositions.reduce((a, p) => a + (p.costUsd || 0), 0);
+    const limit = (all * S.maxLossPct) / 100;
+    if (limit < S.minTradeUsd) return 0;          // too small to trade safely: don't trade
+    size = Math.min(size, limit);
+  }
+  return size;
+}
+const mpMaxOpen = (S) => (S.slots > 0 ? S.slots : S.maxOpen);
+/** Pure: what one snipe costs, round trip, as a % of the bet (fees, tips, slippage). */
+function mpCostPct(S, bet, sol) {
+  if (!(bet > 0)) return null;
+  const fixed = 2 * (S.priorityFeeSol + S.jitoTipSol) * sol;
+  return +(((fixed + bet * (2 * S.feePct + 2 * S.slippagePct) / 100) / bet) * 100).toFixed(1);
+}
+
+/**
+ * Pure: the scorecard that decides when real money is allowed.
+ * A strategy has to PROVE an edge over many trades before it scales: positive average result after
+ * all costs, winners outweighing losers, and no deep drawdowns. Until then it stays on paper.
+ */
+function mpScorecard(closed, start) {
+  const t = closed.slice().reverse();                       // oldest first
+  const n = t.length, wins = t.filter((x) => x.pnlUsd > 0);
+  const grossWin = wins.reduce((a, x) => a + x.pnlUsd, 0), grossLoss = -t.filter((x) => x.pnlUsd <= 0).reduce((a, x) => a + x.pnlUsd, 0);
+  const avgPct = n ? t.reduce((a, x) => a + (x.pnlPct || 0), 0) / n : 0;
+  let eq = start, peak = start, maxDD = 0;
+  for (const x of t) { eq += x.pnlUsd || 0; peak = Math.max(peak, eq); maxDD = Math.max(maxDD, peak > 0 ? (peak - eq) / peak : 0); }
+  const pf = grossLoss > 0 ? grossWin / grossLoss : (grossWin > 0 ? 99 : 0);
+  const gates = [
+    { test: "200+ paper trades", ok: n >= 200, now: `${n}` },
+    { test: "average trade positive after all fees", ok: n > 0 && avgPct > 0, now: `${avgPct >= 0 ? "+" : ""}${avgPct.toFixed(1)}%` },
+    { test: "winners outweigh losers 1.3× or more", ok: pf >= 1.3, now: `${pf.toFixed(2)}×` },
+    { test: "worst drop under 30%", ok: n > 0 && maxDD < 0.3, now: `${(maxDD * 100).toFixed(0)}%` },
+  ];
+  return { trades: n, winRate: n ? Math.round((wins.length / n) * 100) : null, avgPct: +avgPct.toFixed(1), profitFactor: +pf.toFixed(2),
+           maxDrawdownPct: +(maxDD * 100).toFixed(1), gates, readyForLive: gates.every((g) => g.ok) };
+}
+
+/** Pure: daily reset, then is trading allowed right now? */
+function mpBankGate(bank, S, now = Date.now()) {
+  const d = new Date(now).toISOString().slice(0, 10);
+  if (bank.day !== d) { bank.day = d; bank.dayStart = bank.cash; if (bank.pauseWhy === "daily stop") { bank.pausedUntil = 0; bank.pauseWhy = null; } }
+  if (bank.pausedUntil > now) return `paused: ${bank.pauseWhy}`;
+  if (bank.cash < S.minTradeUsd) return "trading balance too low (the vault is safe)";
+  return null;
+}
+/** Pure: after a trade closes — streaks, daily stop, and locking profits in the vault. Returns messages. */
+function mpAfterClose(bank, S, pnlUsd, now = Date.now()) {
+  const msgs = [];
+  bank.streak = pnlUsd > 0 ? 0 : bank.streak + 1;
+  if (bank.streak >= S.maxLossStreak) { bank.pausedUntil = now + S.pauseMin * 60e3; bank.pauseWhy = `${bank.streak} losses in a row`; bank.streak = 0;
+    msgs.push(`Paused ${S.pauseMin} minutes after ${S.maxLossStreak} losses in a row`); }
+  if (bank.cash < bank.dayStart * (1 - S.dailyStopPct / 100)) {
+    const t = new Date(now); t.setUTCHours(24, 0, 0, 0);
+    bank.pausedUntil = t.getTime(); bank.pauseWhy = "daily stop";
+    msgs.push(`Down ${S.dailyStopPct}% today: stopped until tomorrow`);
+  }
+  if (bank.cash >= bank.start * S.vaultAtX) {
+    const keep = bank.start * S.keepX, moved = bank.cash - keep;
+    if (moved > 0) { bank.vault += moved; bank.cash = keep; msgs.push(`Locked $${moved.toFixed(2)} of profit in the vault, kept $${keep.toFixed(2)} trading`); }
+  }
+  bank.peak = Math.max(bank.peak || 0, bank.cash + bank.vault);
+  return msgs;
+}
 const CREATE_EVENT_ID = crypto.createHash("sha256").update("event:CreateEvent").digest().subarray(0, 8);
 const FAMOUS_TICKERS = new Set(["SOL", "USDC", "USDT", "BONK", "WIF", "JUP", "TRUMP", "POPCAT", "PEPE", "DOGE", "SHIB", "BTC", "ETH", "PNUT", "MOODENG", "FARTCOIN", "PENGU"]);
 
@@ -2585,8 +2751,40 @@ function mpOnLaunch(ev) {
   if (FAMOUS_TICKERS.has(ev.symbol.toUpperCase().replace(/^\$/, ""))) return mpSkip("copycat ticker", ev);
   if (MP.creators.get(ev.creator).length >= 3) return mpSkip("creator spamming launches", ev);
   if (rugReg.has(ev.creator)) return mpSkip("creator is a known rugger", ev);
+  if (MP.settings.fastLane) mpFast(ev).catch(() => {});
   MP.queue.push({ ...ev, launchedAt: Date.now() });
   if (MP.queue.length > 400) MP.queue.splice(0, MP.queue.length - 400);
+}
+
+/** Fast lane: buy within seconds of the launch, while it's still around $5K. Only instant checks are possible this early. */
+let mpFastTimes = [], mpFastTries = [];
+async function mpFast(ev) {
+  const S = MP.settings, t0 = Date.now();
+  mpFastTimes = mpFastTimes.filter((t) => t0 - t < 60000);          // buys this minute
+  mpFastTries = mpFastTries.filter((t) => t0 - t < 60000);          // looks this minute (keeps chain reads sane)
+  if (mpFastTimes.length >= S.fastMaxPerMin || mpFastTries.length >= 20) return;
+  if ((S.slots <= 0 && MP.positions.filter((p) => p.fast).length >= S.fastMaxOpen) || MP.positions.length >= mpMaxOpen(S)) return;
+  if (mpBankGate(MP.bank, S)) return;
+  mpFastTries.push(t0);
+  const [cR, dR, sR] = await Promise.allSettled([readBondingCurve(ev.mint), balanceOf(ev.creator, ev.mint), getSolUsd()]);
+  const c = cR.status === "fulfilled" ? cR.value : null, sol = sR.status === "fulfilled" ? sR.value : null;
+  if (!c || c.complete || !sol) return;
+  const m = curveMarket(c, sol, 6), devPct = dR.status === "fulfilled" ? (dR.value / 1e9) * 100 : null;
+  if (m.mcap > S.fastMaxMcap) return mpSkip(`Launch Shot: already past $${Math.round(S.fastMaxMcap / 1000)}K`, ev);
+  if (devPct != null && devPct > S.fastMaxDevPct) return mpSkip(`Launch Shot: creator bought ${devPct.toFixed(1)}% at launch`, ev);
+  if (MP.positions.some((p) => p.mint === ev.mint)) return;
+  const sizeUsd = S.slots > 0 ? mpBetSize(MP.bank, S, MP.positions, 1, null, sol) : mpBetSize(MP.bank, S, MP.positions, 1, S.fastBetPct, sol);
+  if (!(sizeUsd > 0)) return mpSkip(`max loss ${S.maxLossPct}%: balance too small for a safe bet`, ev);
+  const extraUsd = (S.priorityFeeSol + S.jitoTipSol) * sol, costUsd = sizeUsd * (1 + S.feePct / 100) + extraUsd;
+  if (costUsd > MP.bank.cash) return;
+  MP.bank.cash -= costUsd; mpFastTimes.push(t0);
+  const entry = m.price * (1 + S.slippagePct / 100), tokens = sizeUsd / entry, ms = Date.now() - t0;
+  MP.positions.push({ mint: ev.mint, symbol: ev.symbol, name: ev.name, creator: ev.creator, entry, entrySol: sol, tokens, sizeUsd, costUsd,
+    costSol: costUsd / sol, openedAt: Date.now(), progressAtBuy: m.progress, mcapAtBuy: Math.round(m.mcap), high: entry, last: entry,
+    devPct, top10: null, top1: null, tokensLeft: tokens, realizedUsd: 0, phase: "full", boosts: [`Launch Shot: in at $${(m.mcap / 1000).toFixed(1)}K, ${ms} ms after seeing it`], fast: true, devCheckedAt: 0 });
+  MP.evaluated.unshift({ ...ev, verdict: "paper buy", reason: `Launch Shot · $${(m.mcap / 1000).toFixed(1)}K market cap · ${m.progress.toFixed(1)}% bonded · creator ${devPct != null ? devPct.toFixed(1) + "%" : "?"} · ${ms} ms`, at: Date.now() });
+  MP.evaluated = MP.evaluated.slice(0, 120);
+  log("cannon", `LAUNCH SHOT BUY ${ev.symbol} $${sizeUsd.toFixed(2)} at $${Math.round(m.mcap)} mcap in ${ms} ms`);
 }
 
 /** Judge one launch after the wait: real demand, no big dev/whale bags, clean contract. */
@@ -2599,57 +2797,129 @@ async function mpEvaluate(ev) {
   const sol = await getSolUsd().catch(() => null);
   if (!sol) return mpSkip("no SOL price", ev);
   const m = curveMarket(c, sol, 6);
+  const skipT = (reason, extra) => {          // skip, and remember the price so we can see later if the skip was right
+    mpSkip(reason, { ...ev, ...(extra || {}) });
+    MP.outcomes.push({ mint: ev.mint, sym: ev.symbol, reason: reason.replace(/[\d.]+%/g, "N%").replace(/\d+ /g, "N "), p0: m.price, due: Date.now() + 30 * 60e3 });
+    if (MP.outcomes.length > 800) MP.outcomes.splice(0, MP.outcomes.length - 800);
+  };
   // every launch with real money in it gets watched for a creator dump, pass or skip
   let devAt = null; try { devAt = ((await balanceOf(ev.creator, ev.mint)) / 1e9) * 100; } catch {}
   if (m.progress >= 3) { rugWatch.push({ mint: ev.mint, sym: ev.symbol, creator: ev.creator, peakSol: Number(c.rSol) / 1e9, devAt, due: Date.now() + 30 * 60e3, round: 0 }); if (rugWatch.length > 2000) rugWatch.shift(); }
-  if (m.progress < S.minProgress) return mpSkip(`weak demand (<${S.minProgress}% bonded)`, { ...ev, progress: m.progress });
+  if (m.progress < S.minProgress) return skipT(`weak demand (<${S.minProgress}% bonded)`, { progress: m.progress });
   // creator's bag and holder concentration, curve excluded
   const chk = await getMintCheck(ev.mint).catch(() => null);
   if (!chk || !chk.found) return mpSkip("couldn't check holders", ev);
-  if (!chk.mintAuthorityRenounced || !chk.freezeAuthorityRenounced) return mpSkip("can print or freeze", ev);
+  if (!chk.mintAuthorityRenounced || !chk.freezeAuthorityRenounced) return skipT("can print or freeze");
   const top10 = chk.top10WalletPct, top1 = chk.top1WalletPct;
-  if (top1 != null && top1 > S.maxTop1Pct) return mpSkip(`one wallet holds ${Math.round(top1)}%`, ev);
-  if (top10 != null && top10 > S.maxTop10Pct) return mpSkip(`top 10 hold ${Math.round(top10)}%`, ev);
+  if (top1 != null && top1 > S.maxTop1Pct) return skipT(`one wallet holds ${Math.round(top1)}%`);
+  if (top10 != null && top10 > S.maxTop10Pct) return skipT(`top 10 hold ${Math.round(top10)}%`);
   const devPct = devAt;
-  if (devPct != null && devPct > S.maxDevPct) return mpSkip(`creator holds ${devPct.toFixed(1)}%`, ev);
-  // passes: paper buy
-  if (MP.positions.length >= S.maxOpen) return mpSkip("max open positions", ev);
+  if (devPct != null && devPct > S.maxDevPct) return skipT(`creator holds ${devPct.toFixed(1)}%`);
+  // learned: setups that have kept losing money get skipped
+  if (S.learn) {
+    const bad = mpLearned(MP.closed, S.learnMin).filter((x) => x.verdict === "skip");
+    const mine = mpBuckets({ progressAtBuy: m.progress, top10, devPct });
+    const hit = bad.find((x) => mine.includes(x.setup));
+    if (hit) return skipT(`learned: "${hit.setup}" averaged ${hit.avgPct}% over ${hit.trades} trades`);
+  }
+  // bankroll: protection first, then size from the balance
+  if (MP.positions.some((p) => p.mint === ev.mint)) return mpSkip("already holding (Launch Shot)", ev);
+  const gate = mpBankGate(MP.bank, S);
+  if (gate) return mpSkip(gate, ev);
+  if (MP.positions.length >= mpMaxOpen(S)) return mpSkip("all snipe slots are full", ev);
+  // offense: bet bigger with evidence, never past the cap
+  const boosts = [];
+  let mult = 1;
+  if (S.learn) {
+    const good = mpLearned(MP.closed, S.learnMin).filter((x) => x.verdict === "favor");
+    const mine = mpBuckets({ progressAtBuy: m.progress, top10, devPct });
+    const fav = good.find((x) => mine.includes(x.setup));
+    if (fav) { mult *= S.favorBoost; boosts.push(`winning setup: ${fav.setup}`); }
+  }
+  try {
+    const ranked = new Set(leaderboard().slice(0, 60).map((r) => r.wallet));
+    const smartIn = recentBuys.filter((b) => b.t === ev.mint && ranked.has(b.w) && Date.now() - b.at < 15 * 60e3).length;
+    if (smartIn) { mult *= S.smartBoost; boosts.push(`${smartIn} smart wallet${smartIn > 1 ? "s" : ""} bought it`); }
+  } catch {}
+  const sizeUsd = mpBetSize(MP.bank, S, MP.positions, mult, null, sol);
+  if (!(sizeUsd > 0)) return mpSkip(`max loss ${S.maxLossPct}%: balance too small for a safe bet`, ev);
+  const extraUsd = (S.priorityFeeSol + S.jitoTipSol) * sol, costUsd = sizeUsd * (1 + S.feePct / 100) + extraUsd;
+  if (costUsd > MP.bank.cash) return mpSkip("trading balance too low (the vault is safe)", ev);
+  MP.bank.cash -= costUsd;
   const entry = m.price * (1 + S.slippagePct / 100);                        // you pay a little above the quote
-  const costSol = S.sizeSol * (1 + S.feePct / 100) + S.priorityFeeSol + S.jitoTipSol;
-  const tokens = (S.sizeSol * sol) / entry;
-  const pos = { mint: ev.mint, symbol: ev.symbol, name: ev.name, creator: ev.creator, entry, entrySol: sol, tokens, costSol,
-                openedAt: Date.now(), progressAtBuy: m.progress, high: entry, last: entry, devPct, top10, top1 };
+  const tokens = sizeUsd / entry;
+  const pos = { mint: ev.mint, symbol: ev.symbol, name: ev.name, creator: ev.creator, entry, entrySol: sol, tokens, sizeUsd, costUsd,
+                costSol: costUsd / sol, openedAt: Date.now(), progressAtBuy: m.progress, high: entry, last: entry, devPct, top10, top1,
+                tokensLeft: tokens, realizedUsd: 0, phase: "full", boosts, devCheckedAt: 0 };
   MP.positions.push(pos);
   MP.evaluated.unshift({ ...ev, verdict: "paper buy", reason: `${m.progress.toFixed(1)}% bonded · top10 ${top10 != null ? Math.round(top10) + "%" : "?"} · dev ${devPct != null ? devPct.toFixed(1) + "%" : "?"}`, at: Date.now() });
   MP.evaluated = MP.evaluated.slice(0, 120);
-  log("masterpeace", `PAPER BUY ${ev.symbol} at ${m.progress.toFixed(1)}% bonded`);
+  log("cannon", `PAPER BUY ${ev.symbol} $${sizeUsd.toFixed(2)} at ${m.progress.toFixed(1)}% bonded${boosts.length ? " (" + boosts.join(", ") + ")" : ""}`);
 }
 
-/** Check open paper positions against take-profit, stop-loss, time limit and graduation. */
+/**
+ * Manage open paper positions.
+ *   defense: stop-loss, time limit, and an instant exit if the creator dumps their bag
+ *   offense: at the take-profit, sell part (your money back) and let the rest ride with a
+ *            trailing stop, so one big runner can pay for many small losses
+ */
 async function mpManage() {
   const S = MP.settings, sol = await getSolUsd().catch(() => null);
   if (!sol) return;
+  const sell = (p, frac, price) => {                   // sell a fraction of what's left, at a realistic price
+    const tok = p.tokensLeft * frac, exit = price * (1 - S.slippagePct / 100);
+    const back = Math.max(0, tok * exit * (1 - S.feePct / 100) - (S.priorityFeeSol + S.jitoTipSol) * sol);
+    p.tokensLeft -= tok; p.realizedUsd += back; MP.bank.cash += back;
+    return back;
+  };
+  const close = (p, why) => {
+    const cost = p.costUsd != null ? p.costUsd : p.costSol * sol;
+    const pnlUsd = p.realizedUsd - cost;
+    MP.closed.unshift({ ...p, exit: p.last, closedAt: Date.now(), why, pnlUsd: +pnlUsd.toFixed(2), pnlSol: +(pnlUsd / sol).toFixed(5), pnlPct: +((pnlUsd / cost) * 100).toFixed(1) });
+    MP.closed = MP.closed.slice(0, 500);
+    MP.positions = MP.positions.filter((x) => x !== p);
+    log("cannon", `PAPER CLOSED ${p.symbol} ${why} ${pnlUsd >= 0 ? "+" : ""}$${pnlUsd.toFixed(2)}`);
+    for (const msg of mpAfterClose(MP.bank, S, pnlUsd)) mpEvent(msg);
+    if (S.autoSend && MP.bank.vault > 0) mpSendVault("auto: profit locked");
+  };
   for (const p of MP.positions.slice()) {
-    let price = null, why = null;
+    if (p.tokensLeft == null) { p.tokensLeft = p.tokens; p.realizedUsd = 0; p.phase = "full"; }
+    let price = null, graduated = false;
     try {
       const c = await readBondingCurve(p.mint);
       if (c && !c.complete) price = curveMarket(c, sol, 6).price;
-      else if (c && c.complete) { price = p.last; why = "graduated (sold at last curve price)"; }
+      else if (c && c.complete) { price = p.last; graduated = true; }
     } catch {}
     if (price == null) continue;
     p.last = price; p.high = Math.max(p.high, price);
-    const ch = (price / p.entry - 1) * 100;
-    if (!why && ch >= S.tpPct) why = `take profit +${S.tpPct}%`;
-    if (!why && ch <= -S.slPct) why = `stop loss −${S.slPct}%`;
-    if (!why && Date.now() - p.openedAt > S.maxHoldMin * 60e3) why = `time limit ${S.maxHoldMin}m`;
-    if (why) {
-      const exit = price * (1 - S.slippagePct / 100);                     // you get a little under the quote
-      const backSol = ((p.tokens * exit) / sol) * (1 - S.feePct / 100) - S.priorityFeeSol - S.jitoTipSol;
-      const pnlSol = backSol - p.costSol;
-      MP.closed.unshift({ ...p, exit, closedAt: Date.now(), why, pnlSol: +pnlSol.toFixed(5), pnlPct: +((pnlSol / p.costSol) * 100).toFixed(1) });
-      MP.closed = MP.closed.slice(0, 300);
-      MP.positions = MP.positions.filter((x) => x !== p);
-      log("masterpeace", `PAPER SELL ${p.symbol} ${why} ${pnlSol >= 0 ? "+" : ""}${pnlSol.toFixed(4)} SOL`);
+    const ch = (price / p.entry - 1) * 100, age = Date.now() - p.openedAt;
+
+    // defense: creator dumped → out now (checked every 30 s per position)
+    if (S.devExit && p.devPct != null && p.devPct >= 0.5 && Date.now() - (p.devCheckedAt || 0) > 30000) {
+      p.devCheckedAt = Date.now();
+      try { const now = ((await balanceOf(p.creator, p.mint)) / 1e9) * 100;
+        if (now < 0.1) { sell(p, 1, price); close(p, "creator dumped: got out"); continue; } } catch {}
+    }
+    if (graduated) { sell(p, 1, price); close(p, p.phase === "moon" ? "moon bag: graduated, cashed out" : "graduated, cashed out"); continue; }
+
+    if (p.phase === "full") {
+      if (ch >= S.tpPct) {                           // offense: lock the win, keep a free ride
+        if (S.tp1SellPct >= 100) { sell(p, 1, price); close(p, `take profit +${S.tpPct}%`); continue; }
+        sell(p, S.tp1SellPct / 100, price);
+        p.phase = "moon"; p.moonHigh = price;
+        mpEvent(`${p.symbol} hit +${Math.round(ch)}%: sold ${S.tp1SellPct}%, letting the rest ride`);
+        continue;
+      }
+      if (ch <= -S.slPct) { sell(p, 1, price); close(p, `stop loss −${S.slPct}%`); continue; }
+      if (p.fast && age > S.fastTimeoutSec * 1000 && ch < S.fastMinGainPct) { sell(p, 1, price); close(p, `Launch Shot: no lift-off in ${Math.round(S.fastTimeoutSec / 60)}m`); continue; }
+      if (age > S.maxHoldMin * 60e3) { sell(p, 1, price); close(p, `time limit ${S.maxHoldMin}m`); continue; }
+    } else {                                         // moon bag: ride it, trail the high
+      p.moonHigh = Math.max(p.moonHigh || price, price);
+      const run = p.moonHigh / p.entry;
+      const trail = run >= 10 ? Math.min(S.trailPct, S.trailAt10x) : run >= 5 ? Math.min(S.trailPct, S.trailAt5x) : S.trailPct;
+      p.trailNow = trail;
+      if (price <= p.moonHigh * (1 - trail / 100)) { sell(p, 1, price); close(p, `moon bag: trailing stop (peaked +${Math.round((p.moonHigh / p.entry - 1) * 100)}%)`); continue; }
+      if (age > S.moonHoldMin * 60e3) { sell(p, 1, price); close(p, `moon bag: time limit ${S.moonHoldMin}m`); continue; }
     }
   }
 }
@@ -2669,8 +2939,8 @@ function mpConnect() {
       MP.feed.decodeFails++;
     }, "confirmed");
     MP.feed.connected = true;
-    log("masterpeace", "watching pump.fun launches (paper mode)");
-  } catch (e) { MP.feed.subId = null; log("error", `masterpeace feed: ${e.message}`); }
+    log("cannon", "watching pump.fun launches (paper mode)");
+  } catch (e) { MP.feed.subId = null; log("error", `cannon feed: ${e.message}`); }
 }
 setTimeout(mpConnect, 8000);
 // reconnect if launches stop arriving for 3 minutes (pump.fun is never that quiet)
@@ -2696,6 +2966,22 @@ setInterval(async () => {
   }
 }, 2000);
 setInterval(() => { if (MP.on && MP.positions.length) mpManage().catch(() => {}); }, 10000);
+setInterval(async () => {
+  const now = Date.now(); let n = 0;
+  for (let i = 0; i < MP.outcomes.length && n < 3; i++) {
+    const o = MP.outcomes[i]; if (o.due > now) continue; n++;
+    let verdict = null;
+    try {
+      const c = await readBondingCurve(o.mint);
+      if (c && c.complete) verdict = "win";                                  // graduated: it ran
+      else if (c) { const p = curveMarket(c, await getSolUsd(), 6).price, r = p / o.p0; verdict = r >= 2 ? "win" : r <= 0.5 ? "loss" : "flat"; }
+    } catch {}
+    MP.outcomes.splice(i--, 1);
+    if (!verdict) continue;
+    const r = MP.report[o.reason] || (MP.report[o.reason] = { checked: 0, wouldWin: 0, wouldLose: 0 });
+    r.checked++; if (verdict === "win") r.wouldWin++; if (verdict === "loss") r.wouldLose++;
+  }
+}, 30000);
 
 /** Rug watcher: re-check launches at 30 minutes and 3 hours. Creator sold out + curve collapsed = rug. */
 const rugWatch = [];
@@ -2732,14 +3018,32 @@ app.use("/api/mp", rateLimit({ windowMs: 60 * 1000, max: 60, standardHeaders: tr
 app.get("/api/mp/state", (req, res) => {
   if (!requireOwner(req, res)) return;
   const sol = solUsd.v || null;
-  const done = MP.closed, wins = done.filter((x) => x.pnlSol > 0).length;
-  const pnl = done.reduce((a, x) => a + x.pnlSol, 0);
+  const done = MP.closed, wins = done.filter((x) => (x.pnlUsd ?? x.pnlSol) > 0).length;
+  const pnl = done.reduce((a, x) => a + (x.pnlSol || 0), 0);
+  mpBankGate(MP.bank, MP.settings);
+  const openValue = MP.positions.reduce((a, p) => a + (p.tokensLeft ?? p.tokens) * p.last * (1 - MP.settings.feePct / 100), 0);
+  const B = MP.bank, total = B.cash + B.vault + (B.sent || 0) + openValue;
+  const bank = { start: B.start, trading: +B.cash.toFixed(2), vault: +B.vault.toFixed(2), inTrades: +openValue.toFixed(2), total: +total.toFixed(2),
+    growthPct: +(((total / B.start) - 1) * 100).toFixed(1), today: +(B.cash + openValue - B.dayStart).toFixed(2), peak: +(B.peak || 0).toFixed(2),
+    paused: B.pausedUntil > Date.now() ? { why: B.pauseWhy, until: B.pausedUntil } : null, nextBetUsd: +mpBetSize(B, MP.settings, MP.positions, 1, null, sol || 150).toFixed(2),
+    slots: mpMaxOpen(MP.settings), slotsUsed: MP.positions.length,
+    sent: +(B.sent || 0).toFixed(2), sends: (B.sends || []).slice(0, 10), savingsWallet: MP.settings.savingsWallet || MY_WALLET || null };
+  bank.costPct = mpCostPct(MP.settings, bank.nextBetUsd, sol || 150);
+  if (MP.settings.maxLossPct > 0) bank.minSafeBalance = +((MP.settings.minTradeUsd * 100) / MP.settings.maxLossPct).toFixed(2);
+  const filterReport = Object.entries(MP.report).map(([reason, r]) => ({ reason, ...r,
+    verdict: r.checked < 10 ? "still checking" : r.wouldLose >= r.wouldWin ? "saving you money" : "may be costing you winners" })).sort((a, b) => b.checked - a.checked);
   const open = MP.positions.map((p) => ({ ...p, chPct: +(((p.last / p.entry) - 1) * 100).toFixed(1), ageMin: +((Date.now() - p.openedAt) / 60000).toFixed(1) }));
-  res.json({ mode: "paper", on: MP.on, startedAt: MP.startedAt, solUsd: sol, settings: MP.settings,
+  const fastClosed = done.filter((x) => x.fast);
+  const fast = { on: !!MP.settings.fastLane, trades: fastClosed.length, wins: fastClosed.filter((x) => x.pnlUsd > 0).length,
+    pnlUsd: +fastClosed.reduce((a, x) => a + (x.pnlUsd || 0), 0).toFixed(2), open: MP.positions.filter((p) => p.fast).length,
+    avgEntryMcap: fastClosed.length ? Math.round(fastClosed.reduce((a, x) => a + (x.mcapAtBuy || 0), 0) / fastClosed.length) : null };
+  res.json({ mode: "paper", on: MP.on, fast, startedAt: MP.startedAt, solUsd: sol, settings: MP.settings,
     feed: { ...MP.feed, subId: undefined }, seen: MP.seen, queued: MP.queue.length,
     stats: { trades: done.length, wins, winRate: done.length ? Math.round((wins / done.length) * 100) : null, pnlSol: +pnl.toFixed(4), pnlUsd: sol ? +(pnl * sol).toFixed(2) : null,
              best: done.length ? Math.max(...done.map((x) => x.pnlPct)) : null, worst: done.length ? Math.min(...done.map((x) => x.pnlPct)) : null },
-    skips: MP.skips, open, closed: done.slice(0, 60), evaluated: MP.evaluated.slice(0, 60) });
+    skips: MP.skips, open, closed: done.slice(0, 60), evaluated: MP.evaluated.slice(0, 60),
+    bank, events: MP.events.slice(0, 20), learned: mpLearned(done, MP.settings.learnMin), filterReport,
+    scorecard: mpScorecard(done.filter((x) => x.pnlUsd != null), MP.bank.start) });
 });
 
 /** Owner-only: change the rules (numbers are clamped to sane ranges) */
@@ -2747,11 +3051,26 @@ app.post("/api/mp/settings", (req, res) => {
   if (!requireOwner(req, res)) return;
   const b = req.body || {}, S = MP.settings;
   const clamp = (k, lo, hi) => { if (b[k] == null) return; const v = Number(b[k]); if (Number.isFinite(v)) S[k] = Math.min(hi, Math.max(lo, v)); };
-  clamp("sizeSol", 0.001, 5); clamp("waitSec", 10, 900); clamp("minProgress", 0, 90); clamp("maxDevPct", 0, 100);
+  clamp("startUsd", 1, 100000); clamp("slots", 0, 30); clamp("maxLossPct", 0, 100); clamp("riskPct", 1, 50); clamp("minTradeUsd", 0.1, 1000); clamp("vaultAtX", 1.2, 100); clamp("keepX", 0.2, 50);
+  clamp("tp1SellPct", 10, 100); clamp("trailPct", 5, 90); clamp("moonHoldMin", 5, 2880); clamp("smartBoost", 1, 3); clamp("favorBoost", 1, 3);
+  clamp("maxBetPct", 2, 50); clamp("devExit", 0, 1); clamp("autoSend", 0, 1); clamp("trailAt5x", 3, 90); clamp("trailAt10x", 2, 90);
+  if (typeof b.savingsWallet === "string") {
+    const w = b.savingsWallet.trim();
+    if (w === "") S.savingsWallet = "";
+    else if (SOL_ADDR.test(w)) S.savingsWallet = w;
+    else return res.status(400).json({ error: "That isn't a valid Solana wallet address." });
+  }
+  if (b.sendVault === true) mpSendVault("you tapped Send");
+  clamp("fastLane", 0, 1); clamp("fastMaxMcap", 3000, 100000); clamp("fastBetPct", 1, 25); clamp("fastMaxPerMin", 1, 20); clamp("fastMaxOpen", 1, 20);
+  clamp("fastMaxDevPct", 0, 100); clamp("fastTimeoutSec", 30, 3600); clamp("fastMinGainPct", 0, 500);
+  clamp("dailyStopPct", 5, 100); clamp("maxLossStreak", 2, 50); clamp("pauseMin", 5, 1440); clamp("learn", 0, 1); clamp("learnMin", 5, 200);
+  if (S.keepX >= S.vaultAtX) S.keepX = Math.max(0.2, S.vaultAtX - 0.2);
+  clamp("waitSec", 10, 900); clamp("minProgress", 0, 90); clamp("maxDevPct", 0, 100);
   clamp("maxTop10Pct", 5, 100); clamp("maxTop1Pct", 1, 100); clamp("tpPct", 5, 2000); clamp("slPct", 5, 95);
   clamp("maxHoldMin", 1, 1440); clamp("maxOpen", 1, 30); clamp("maxEvalPerMin", 1, 30);
   if (typeof b.on === "boolean") { MP.on = b.on; if (MP.on) mpConnect(); }
-  if (b.reset === true) { MP.closed = []; MP.positions = []; MP.evaluated = []; MP.skips = {}; MP.seen = 0; MP.startedAt = Date.now(); }
+  if (b.reset === true) { MP.closed = []; MP.positions = []; MP.evaluated = []; MP.skips = {}; MP.seen = 0; MP.startedAt = Date.now();
+    MP.bank = mpNewBank(S.startUsd); MP.report = {}; MP.outcomes = []; MP.events = []; mpEvent(`Started fresh with $${S.startUsd}`); }
   res.json({ ok: true, settings: S, on: MP.on });
 });
 
@@ -2897,7 +3216,7 @@ app.get("/api/health", (req, res) => {
                   callsLastMinute: gtTimes.filter((t) => Date.now() - t < 60000).length, budgetPerMinute: GT_PER_MIN, ...gtStats,
                   coolingDown: Date.now() < gtBackoffUntil, newPoolsAgeSec: poolCache.new.ts ? Math.round((Date.now() - poolCache.new.ts) / 1000) : null },
     lowSupply: { found: lowSupply.size, maxSupply: LOW_SUPPLY_MAX },
-    masterpeace: { running: MP.on && MP.feed.connected },   // details are owner-only (/api/mp/state)
+    cannon: { running: MP.on && MP.feed.connected },   // details are owner-only (/api/mp/state)
     rugRegistry: { wallets: rugReg.size, watching: rugWatch.length, savedPermanently: !!RUG_FILE },
     smartWallets: { tracked: ledger.size, watching: watchList.length, liveWallets: liveSubs.size, alerts24h: alerts.length, learningSince: new Date(smartSince).toISOString(), savedPermanently: smartPersistent, priceUsd: SMART_PRICE_USD },
     time: new Date().toISOString(),
