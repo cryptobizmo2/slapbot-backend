@@ -15,6 +15,44 @@
  * Deploy: Railway, Render, or any Node host. See DEPLOY.md.
  */
 
+/**
+ * PROXY MODE (Railway only). When the variable PROXY_TO is set, this whole file turns into a tiny
+ * forwarder: every request is passed straight to the real server (AWS) and the answer comes back
+ * unchanged. Old links and the scanner keep working on the Railway address, and Railway stops
+ * doing any background work of its own. AWS never sets PROXY_TO, so it runs the full bot below.
+ * The forwarder proves itself to AWS with a key derived from CG_API_KEY (both servers have it),
+ * so AWS can rate-limit each real visitor separately instead of lumping everyone together.
+ */
+if (process.env.PROXY_TO) {
+  const http = require("http"), cryptoP = require("crypto");
+  const target = String(process.env.PROXY_TO).replace(/\/+$/, "");
+  const proof = cryptoP.createHash("sha256").update("slapbot-proxy:" + String(process.env.CG_API_KEY || "")).digest("hex");
+  const DROP = new Set(["host", "connection", "content-length", "transfer-encoding", "keep-alive", "upgrade", "proxy-connection", "te", "trailer"]);
+  http.createServer((req, res) => {
+    const chunks = []; let size = 0;
+    req.on("data", (c) => { size += c.length; if (size > 64 * 1024) { res.writeHead(413).end(); req.destroy(); } else chunks.push(c); });
+    req.on("end", async () => {
+      try {
+        const headers = {};
+        for (const [k, v] of Object.entries(req.headers)) if (!DROP.has(k.toLowerCase()) && !k.toLowerCase().startsWith("x-slapbot")) headers[k] = v;
+        const xff = String(req.headers["x-forwarded-for"] || "").split(",").map((x) => x.trim()).filter(Boolean);
+        headers["x-slapbot-proxy"] = proof;
+        headers["x-slapbot-client"] = xff[xff.length - 1] || req.socket.remoteAddress || "";
+        const r = await fetch(target + req.url, { method: req.method, headers, redirect: "manual",
+          body: ["GET", "HEAD"].includes(req.method) ? undefined : Buffer.concat(chunks), signal: AbortSignal.timeout(30000) });
+        const out = {};
+        r.headers.forEach((v, k) => { if (!["content-encoding", "content-length", "transfer-encoding", "connection"].includes(k)) out[k] = v; });
+        const body = Buffer.from(await r.arrayBuffer());
+        res.writeHead(r.status, out); res.end(body);
+      } catch (e) {
+        res.writeHead(502, { "content-type": "application/json", "access-control-allow-origin": "*" });
+        res.end(JSON.stringify({ error: "The main server didn't answer. Try again in a moment." }));
+      }
+    });
+  }).listen(process.env.PORT || 3000, () => console.log(`[proxy] forwarding everything to ${target}`));
+  return;   // stop here: nothing below runs in proxy mode
+}
+
 const express = require("express");
 const cors = require("cors");
 const rateLimit = require("express-rate-limit");
@@ -30,6 +68,17 @@ const PORT = process.env.PORT || 3000;
 // global and blocks everyone once it fills. Trust exactly ONE hop (not
 // 'true'), so a client can't forge its own IP to dodge the limit.
 app.set("trust proxy", 1);
+// Requests forwarded by our own Railway proxy carry a proof key: use the real visitor's address for them.
+const PROXY_PROOF = process.env.CG_API_KEY ? crypto.createHash("sha256").update("slapbot-proxy:" + process.env.CG_API_KEY).digest("hex") : null;
+app.use((req, res, next) => {
+  const p = req.headers["x-slapbot-proxy"];
+  if (PROXY_PROOF && typeof p === "string" && p.length === PROXY_PROOF.length &&
+      crypto.timingSafeEqual(Buffer.from(p), Buffer.from(PROXY_PROOF))) {
+    const c = String(req.headers["x-slapbot-client"] || "").slice(0, 64);
+    if (c) Object.defineProperty(req, "ip", { value: c, configurable: true });
+  }
+  next();
+});
 
 // ── config from environment (set these in Railway/Render dashboard) ───────
 const SOLANA_RPC_URL = process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
