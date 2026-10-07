@@ -2884,7 +2884,7 @@ app.get("/api/health", (req, res) => {
                   callsLastMinute: gtTimes.filter((t) => Date.now() - t < 60000).length, budgetPerMinute: GT_PER_MIN, ...gtStats,
                   coolingDown: Date.now() < gtBackoffUntil, newPoolsAgeSec: poolCache.new.ts ? Math.round((Date.now() - poolCache.new.ts) / 1000) : null },
     lowSupply: { found: lowSupply.size, maxSupply: LOW_SUPPLY_MAX },
-    masterpeace: { on: MP.on, mode: "paper", feedConnected: MP.feed.connected, launchesSeen: MP.seen, openPaper: MP.positions.length },
+    masterpeace: { running: MP.on && MP.feed.connected },   // details are owner-only (/api/mp/state)
     rugRegistry: { wallets: rugReg.size, watching: rugWatch.length, savedPermanently: !!RUG_FILE },
     smartWallets: { tracked: ledger.size, watching: watchList.length, liveWallets: liveSubs.size, alerts24h: alerts.length, learningSince: new Date(smartSince).toISOString(), savedPermanently: smartPersistent, priceUsd: SMART_PRICE_USD },
     time: new Date().toISOString(),
