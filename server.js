@@ -83,7 +83,10 @@ app.use((req, res, next) => {
 // ── config from environment (set these in Railway/Render dashboard) ───────
 const SOLANA_RPC_URL = process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
 const SLAPGOLD_MINT = process.env.SLAPGOLD_MINT; // e.g. 4R7Hbdhh3YeVqZaESRA3qPJ8Z3xh3Qedsw88RDjxL1Q9
-const MY_WALLET = process.env.MY_WALLET;         // YOUR wallet address — the only one allowed in
+// The owner wallet. Set here (it's a public address, not a secret) so it can be changed with a normal upload,
+// without touching the server's settings file. It wins over the MY_WALLET setting.
+const OWNER_WALLET = "4t3F4TvCsRCohYJ3EZ4B2ahaN2nN5kBE3A8WUVy2K1CF";
+const MY_WALLET = OWNER_WALLET || process.env.MY_WALLET;   // YOUR wallet address — the only one allowed in
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*"; // lock to your GitHub Pages URL once live
 const MIN_HOLD_AMOUNT = parseFloat(process.env.MIN_HOLD_AMOUNT || "1"); // min SLAP GOLD to unlock
 
@@ -607,7 +610,7 @@ app.post("/api/auth/owner", rateLimit({ windowMs: 15 * 60 * 1000, max: 5, standa
 async function requireHolder(req, res, next) {
   const h = req.headers.authorization || "";
   const data = readPass(h.startsWith("Bearer ") ? h.slice(7) : "");
-  if (!data) return res.status(401).json({ error: "Please sign in." });
+  if (!data || !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(String(data.w))) return res.status(401).json({ error: "Please sign in." });
   try {
     const status = await getHolderStatus(data.w);
     if (!status.authorized) return res.status(403).json({ error: "You no longer hold enough to access Exclusive.", ...status });
@@ -2577,6 +2580,7 @@ const MP = {
     fastMaxPerMin: 3,     // at most this many fast buys a minute
     fastMaxOpen: 4,       // and at most this many fast positions at once
     fastMaxDevPct: 15,    // skip if the creator bought more than this % at launch
+    cashOutMcap: 100000,  // RUG ZONE: a fast mover that reaches this market cap gets sold completely (0 = off)
     fastTimeoutSec: 180,  // if it hasn't lifted off by then...
     fastMinGainPct: 30,   // ...(up at least this %), get out
     // defense
@@ -2869,6 +2873,22 @@ async function mpEvaluate(ev) {
   log("cannon", `PAPER BUY ${ev.symbol} $${sizeUsd.toFixed(2)} at ${m.progress.toFixed(1)}% bonded${boosts.length ? " (" + boosts.join(", ") + ")" : ""}`);
 }
 
+/** Price + market cap from the live trading pool (used once a token graduates off the pump.fun curve). Cached 8 s. */
+const mpDexCache = new Map();
+async function mpDexPrice(mint) {
+  const h = mpDexCache.get(mint);
+  if (h && Date.now() - h.ts < 8000) return h.v;
+  let v = null;
+  try {
+    const d = await (await withTimeout(fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`), 6000, "dex price")).json();
+    const p = trustedDexPair(d.pairs, mint);
+    if (p && +p.priceUsd > 0) v = { price: +p.priceUsd, mcap: +p.marketCap || +p.fdv || 0 };
+  } catch {}
+  mpDexCache.set(mint, { v, ts: Date.now() });
+  if (mpDexCache.size > 500) mpDexCache.delete(mpDexCache.keys().next().value);
+  return v;
+}
+
 /**
  * Manage open paper positions.
  *   defense: stop-loss, time limit, and an instant exit if the creator dumps their bag
@@ -2899,8 +2919,12 @@ async function mpManage() {
     let price = null, graduated = false;
     try {
       const c = await readBondingCurve(p.mint);
-      if (c && !c.complete) price = curveMarket(c, sol, 6).price;
-      else if (c && c.complete) { price = p.last; graduated = true; }
+      if (c && !c.complete) { const m = curveMarket(c, sol, 6); price = m.price; p.mcapNow = m.mcap; }
+      else if (c && c.complete) {
+        const dx = await mpDexPrice(p.mint);                              // graduated: keep following it on the trading pool
+        if (dx) { price = dx.price; p.mcapNow = dx.mcap; p.postGrad = true; }
+        else { price = p.last; graduated = true; }                         // no pool price yet: cash out at the last curve price
+      }
     } catch {}
     if (price == null) continue;
     p.last = price; p.high = Math.max(p.high, price);
@@ -2911,6 +2935,14 @@ async function mpManage() {
       p.devCheckedAt = Date.now();
       try { const now = ((await balanceOf(p.creator, p.mint)) / 1e9) * 100;
         if (now < 0.1) { sell(p, 1, price); close(p, "creator dumped: got out"); continue; } } catch {}
+    }
+    // RUG ZONE: fast movers that reach this market cap are usually being pumped to dump on late buyers. Take everything and go.
+    if (S.cashOutMcap > 0 && p.mcapNow >= S.cashOutMcap) {
+      const k = Math.round(p.mcapNow / 1000);
+      sell(p, 1, price);
+      MP.outcomes.push({ mint: p.mint, sym: p.symbol, reason: "cashed out in the rug zone", p0: price, due: Date.now() + 30 * 60e3, dex: true });
+      mpEvent(`${p.symbol} reached $${k}K market cap: sold everything (rug zone)`);
+      close(p, `rug zone: cashed out at $${k}K market cap (+${Math.round(ch)}%)`); continue;
     }
     if (graduated) { sell(p, 1, price); close(p, p.phase === "moon" ? "moon bag: graduated, cashed out" : "graduated, cashed out"); continue; }
 
@@ -2984,9 +3016,12 @@ setInterval(async () => {
     const o = MP.outcomes[i]; if (o.due > now) continue; n++;
     let verdict = null;
     try {
+      if (o.dex) { const d = await mpDexPrice(o.mint); if (d) { const r = d.price / o.p0; verdict = r >= 1.6 ? "win" : r <= 0.5 ? "loss" : "flat"; } }
+      else {
       const c = await readBondingCurve(o.mint);
       if (c && c.complete) verdict = "win";                                  // graduated: it ran
       else if (c) { const p = curveMarket(c, await getSolUsd(), 6).price, r = p / o.p0; verdict = r >= 2 ? "win" : r <= 0.5 ? "loss" : "flat"; }
+      }
     } catch {}
     MP.outcomes.splice(i--, 1);
     if (!verdict) continue;
@@ -3026,6 +3061,51 @@ function requireOwner(req, res) {
 }
 app.use("/api/mp", rateLimit({ windowMs: 60 * 1000, max: 60, standardHeaders: true, legacyHeaders: false, message: { error: "Too many requests." } }));
 
+/**
+ * VIEW-ONLY SHARING. The owner creates a secret link; whoever opens it can WATCH the dashboard
+ * (trades, balance, decisions, rules) but every change stays owner-only. Turning the link off,
+ * or making a new one, instantly locks out the old link and every pass it handed out.
+ * Only the link's fingerprint is stored, on the server's disk.
+ */
+const SHARE_FILE = VOLUME_DIR ? nodePath.join(VOLUME_DIR, "cannon-share.json") : "";
+let shareInfo = null;                       // { id, hash, at }
+try { if (SHARE_FILE && nodeFs.existsSync(SHARE_FILE)) shareInfo = JSON.parse(nodeFs.readFileSync(SHARE_FILE, "utf8")); } catch {}
+function saveShare() {
+  if (!SHARE_FILE) return;
+  try { if (shareInfo) { const t = SHARE_FILE + ".tmp"; nodeFs.writeFileSync(t, JSON.stringify(shareInfo), { mode: 0o600 }); nodeFs.renameSync(t, SHARE_FILE); }
+        else if (nodeFs.existsSync(SHARE_FILE)) nodeFs.unlinkSync(SHARE_FILE); } catch (e) { log("error", `saving share link: ${e.message}`); }
+}
+/** Pure-ish: who is this pass? "owner", "viewer", or null. */
+function cannonRole(p) {
+  if (!p) return null;
+  if (MY_WALLET && p.w === MY_WALLET) return "owner";
+  if (shareInfo && p.w === "viewer:" + shareInfo.id) return "viewer";
+  return null;
+}
+function requireReader(req, res) {
+  const role = cannonRole(readPass(String(req.headers.authorization || "").replace(/^Bearer\s+/i, "")));
+  if (!role) { res.status(403).json({ error: "This link was turned off or has expired. Ask the owner for a new one." }); return null; }
+  return role;
+}
+/** Owner: turn the share link on (a fresh one each time) or off, or see whether it's on. */
+app.get("/api/mp/share", (req, res) => { if (!requireOwner(req, res)) return; res.json({ on: !!shareInfo, since: shareInfo ? shareInfo.at : null }); });
+app.post("/api/mp/share", (req, res) => {
+  if (!requireOwner(req, res)) return;
+  if ((req.body || {}).action === "off") { shareInfo = null; saveShare(); log("access", "share link turned off"); return res.json({ on: false }); }
+  const token = crypto.randomBytes(24).toString("base64url");
+  shareInfo = { id: crypto.randomBytes(6).toString("hex"), hash: crypto.createHash("sha256").update(token).digest("hex"), at: Date.now() };
+  saveShare(); log("access", "new view-only share link created");
+  res.json({ on: true, token, since: shareInfo.at });
+});
+/** Anyone with the link: trade it for a 7-day view-only pass. */
+app.post("/api/mp/view", rateLimit({ windowMs: 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false, message: { error: "Too many tries. Wait a minute." } }), (req, res) => {
+  const t = (req.body || {}).token;
+  if (!shareInfo || typeof t !== "string" || t.length > 100) return res.status(403).json({ error: "This link was turned off. Ask the owner for a new one." });
+  const a = Buffer.from(crypto.createHash("sha256").update(t).digest("hex")), b = Buffer.from(shareInfo.hash);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(403).json({ error: "This link isn't valid anymore. Ask the owner for a new one." });
+  res.json({ pass: issuePass("viewer:" + shareInfo.id, 7 * 24 * 3600e3), role: "viewer" });
+});
+
 /** Owner-only: pick a new owner code (you must already be signed in as the owner, e.g. with your wallet). */
 app.post("/api/mp/owner-code", (req, res) => {
   if (!requireOwner(req, res)) return;
@@ -3046,7 +3126,7 @@ app.post("/api/mp/owner-code", (req, res) => {
 
 /** Owner-only dashboard data */
 app.get("/api/mp/state", (req, res) => {
-  if (!requireOwner(req, res)) return;
+  const role = requireReader(req, res); if (!role) return;
   const sol = solUsd.v || null;
   const done = MP.closed, wins = done.filter((x) => (x.pnlUsd ?? x.pnlSol) > 0).length;
   const pnl = done.reduce((a, x) => a + (x.pnlSol || 0), 0);
@@ -3067,7 +3147,7 @@ app.get("/api/mp/state", (req, res) => {
   const fast = { on: !!MP.settings.fastLane, trades: fastClosed.length, wins: fastClosed.filter((x) => x.pnlUsd > 0).length,
     pnlUsd: +fastClosed.reduce((a, x) => a + (x.pnlUsd || 0), 0).toFixed(2), open: MP.positions.filter((p) => p.fast).length,
     avgEntryMcap: fastClosed.length ? Math.round(fastClosed.reduce((a, x) => a + (x.mcapAtBuy || 0), 0) / fastClosed.length) : null };
-  res.json({ mode: "paper", on: MP.on, fast, startedAt: MP.startedAt, solUsd: sol, settings: MP.settings,
+  res.json({ role, mode: "paper", on: MP.on, fast, startedAt: MP.startedAt, solUsd: sol, settings: MP.settings,
     feed: { ...MP.feed, subId: undefined }, seen: MP.seen, queued: MP.queue.length,
     stats: { trades: done.length, wins, winRate: done.length ? Math.round((wins / done.length) * 100) : null, pnlSol: +pnl.toFixed(4), pnlUsd: sol ? +(pnl * sol).toFixed(2) : null,
              best: done.length ? Math.max(...done.map((x) => x.pnlPct)) : null, worst: done.length ? Math.min(...done.map((x) => x.pnlPct)) : null },
@@ -3083,7 +3163,7 @@ app.post("/api/mp/settings", (req, res) => {
   const clamp = (k, lo, hi) => { if (b[k] == null) return; const v = Number(b[k]); if (Number.isFinite(v)) S[k] = Math.min(hi, Math.max(lo, v)); };
   clamp("startUsd", 1, 100000); clamp("slots", 0, 30); clamp("maxLossPct", 0, 100); clamp("riskPct", 1, 50); clamp("minTradeUsd", 0.1, 1000); clamp("vaultAtX", 1.2, 100); clamp("keepX", 0.2, 50);
   clamp("tp1SellPct", 10, 100); clamp("trailPct", 5, 90); clamp("moonHoldMin", 5, 2880); clamp("smartBoost", 1, 3); clamp("favorBoost", 1, 3);
-  clamp("maxBetPct", 2, 50); clamp("devExit", 0, 1); clamp("autoSend", 0, 1); clamp("trailAt5x", 3, 90); clamp("trailAt10x", 2, 90);
+  clamp("maxBetPct", 2, 50); clamp("devExit", 0, 1); clamp("cashOutMcap", 0, 100000000); if (S.cashOutMcap > 0 && S.cashOutMcap < 10000) S.cashOutMcap = 10000; clamp("autoSend", 0, 1); clamp("trailAt5x", 3, 90); clamp("trailAt10x", 2, 90);
   if (typeof b.savingsWallet === "string") {
     const w = b.savingsWallet.trim();
     if (w === "") S.savingsWallet = "";
