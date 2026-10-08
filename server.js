@@ -572,14 +572,26 @@ app.post("/api/auth/verify", async (req, res) => {
 const OWNER_CODE = String(process.env.OWNER_CODE || "");
 const OWNER_CODE_HASH = OWNER_CODE.length >= 12 ? crypto.createHash("sha256").update(OWNER_CODE).digest() : null;
 let ownerFails = [], ownerLockedUntil = 0;
+// The owner can pick a new code from the dashboard (after signing in with the wallet). Only its fingerprint is saved, on the server's disk.
+let ownerStored = null, ownerStoredLoaded = false;
+function ownerHashNow() {
+  if (!ownerStoredLoaded) {
+    ownerStoredLoaded = true;
+    try {
+      const f = VOLUME_DIR ? nodePath.join(VOLUME_DIR, "owner-code.json") : "";
+      if (f && nodeFs.existsSync(f)) { const h = Buffer.from(String(JSON.parse(nodeFs.readFileSync(f, "utf8")).hash || ""), "hex"); if (h.length === 32) ownerStored = h; }
+    } catch {}
+  }
+  return ownerStored || OWNER_CODE_HASH;
+}
 app.post("/api/auth/owner", rateLimit({ windowMs: 15 * 60 * 1000, max: 5, standardHeaders: true, legacyHeaders: false,
   message: { error: "Too many tries. Wait 15 minutes." } }), (req, res) => {
-  if (!OWNER_CODE_HASH || !MY_WALLET) return res.status(404).json({ error: "Owner sign-in isn't set up." });
+  if (!ownerHashNow() || !MY_WALLET) return res.status(404).json({ error: "Owner sign-in isn't set up." });
   const now = Date.now();
   if (now < ownerLockedUntil) return res.status(429).json({ error: "Owner sign-in is locked for a while. Try later." });
   const code = (req.body || {}).code;
   if (typeof code !== "string" || code.length > 200) return res.status(400).json({ error: "Wrong code." });
-  const ok = crypto.timingSafeEqual(crypto.createHash("sha256").update(code).digest(), OWNER_CODE_HASH);
+  const ok = crypto.timingSafeEqual(crypto.createHash("sha256").update(code).digest(), ownerHashNow());
   if (!ok) {
     ownerFails = ownerFails.filter((t) => now - t < 3600e3); ownerFails.push(now);
     if (ownerFails.length >= 25) { ownerLockedUntil = now + 3600e3; ownerFails = []; log("warn", "owner sign-in locked for 1 hour after repeated wrong codes"); }
@@ -3013,6 +3025,24 @@ function requireOwner(req, res) {
   return true;
 }
 app.use("/api/mp", rateLimit({ windowMs: 60 * 1000, max: 60, standardHeaders: true, legacyHeaders: false, message: { error: "Too many requests." } }));
+
+/** Owner-only: pick a new owner code (you must already be signed in as the owner, e.g. with your wallet). */
+app.post("/api/mp/owner-code", (req, res) => {
+  if (!requireOwner(req, res)) return;
+  const code = (req.body || {}).code;
+  if (typeof code !== "string" || code.length < 12 || code.length > 200) return res.status(400).json({ error: "Use at least 12 characters." });
+  if (/^\s|\s$/.test(code)) return res.status(400).json({ error: "No spaces at the start or end." });
+  const hash = crypto.createHash("sha256").update(code).digest();
+  if (VOLUME_DIR) {
+    try {
+      const f = nodePath.join(VOLUME_DIR, "owner-code.json"), tmp = f + ".tmp";
+      nodeFs.writeFileSync(tmp, JSON.stringify({ hash: hash.toString("hex"), at: Date.now() }), { mode: 0o600 }); nodeFs.renameSync(tmp, f);
+    } catch (e) { log("error", `saving owner code: ${e.message}`); return res.status(500).json({ error: "Couldn't save it. Try again." }); }
+  }
+  ownerStored = hash; ownerStoredLoaded = true; ownerFails = []; ownerLockedUntil = 0;
+  log("access", "owner code changed from the dashboard");
+  res.json({ ok: true, saved: !!VOLUME_DIR });
+});
 
 /** Owner-only dashboard data */
 app.get("/api/mp/state", (req, res) => {
