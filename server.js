@@ -3075,10 +3075,16 @@ function saveShare() {
   try { if (shareInfo) { const t = SHARE_FILE + ".tmp"; nodeFs.writeFileSync(t, JSON.stringify(shareInfo), { mode: 0o600 }); nodeFs.renameSync(t, SHARE_FILE); }
         else if (nodeFs.existsSync(SHARE_FILE)) nodeFs.unlinkSync(SHARE_FILE); } catch (e) { log("error", `saving share link: ${e.message}`); }
 }
+/**
+ * Wallets that may WATCH THE CANNON by signing in with their own wallet (no tokens needed).
+ * View-only: every change stays owner-only. Add a public wallet address, upload, done.
+ */
+const VIEWER_WALLETS = [];
 /** Pure-ish: who is this pass? "owner", "viewer", or null. */
 function cannonRole(p) {
   if (!p) return null;
   if (MY_WALLET && p.w === MY_WALLET) return "owner";
+  if (VIEWER_WALLETS.includes(p.w)) return "viewer";
   if (shareInfo && p.w === "viewer:" + shareInfo.id) return "viewer";
   return null;
 }
@@ -3147,7 +3153,11 @@ app.get("/api/mp/state", (req, res) => {
   const fast = { on: !!MP.settings.fastLane, trades: fastClosed.length, wins: fastClosed.filter((x) => x.pnlUsd > 0).length,
     pnlUsd: +fastClosed.reduce((a, x) => a + (x.pnlUsd || 0), 0).toFixed(2), open: MP.positions.filter((p) => p.fast).length,
     avgEntryMcap: fastClosed.length ? Math.round(fastClosed.reduce((a, x) => a + (x.mcapAtBuy || 0), 0) / fastClosed.length) : null };
-  res.json({ role, mode: "paper", on: MP.on, fast, startedAt: MP.startedAt, solUsd: sol, settings: MP.settings,
+  if (role === "viewer") {                     // watchers never get the owner's wallet addresses
+    bank.savingsWallet = null; bank.sends = (bank.sends || []).map((x) => ({ at: x.at, usd: x.usd, why: x.why, paper: x.paper }));
+  }
+  const settingsOut = role === "viewer" ? { ...MP.settings, savingsWallet: undefined } : MP.settings;
+  res.json({ role, mode: "paper", on: MP.on, fast, startedAt: MP.startedAt, solUsd: sol, settings: settingsOut,
     feed: { ...MP.feed, subId: undefined }, seen: MP.seen, queued: MP.queue.length,
     stats: { trades: done.length, wins, winRate: done.length ? Math.round((wins / done.length) * 100) : null, pnlSol: +pnl.toFixed(4), pnlUsd: sol ? +(pnl * sol).toFixed(2) : null,
              best: done.length ? Math.max(...done.map((x) => x.pnlPct)) : null, worst: done.length ? Math.min(...done.map((x) => x.pnlPct)) : null },
