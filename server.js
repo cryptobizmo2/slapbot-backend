@@ -2602,7 +2602,7 @@ const MP = {
   },
   seen: 0, queue: [], evaluated: [], positions: [], closed: [], creators: new Map(),
   skips: {}, startedAt: Date.now(), feed: { connected: false, lastEventAt: null, subId: null, decodeFails: 0 },
-  bank: null, outcomes: [], report: {}, events: [],
+  bank: null, outcomes: [], report: {}, events: [], tape: [], launchTimes: [],
 };
 function mpNewBank(start) {
   const d = new Date().toISOString().slice(0, 10);
@@ -2750,20 +2750,26 @@ function decodeCreateEvent(b64) {
   } catch { return null; }
 }
 
+/** The live tape: every launch the bot sees, newest first, with what it decided. */
+function mpTape(mint, status) { const t = MP.tape.find((x) => x.mint === mint); if (t) { t.status = status; t.doneAt = Date.now(); } }
 function mpSkip(reason, ev) {
   MP.skips[reason] = (MP.skips[reason] || 0) + 1;
+  if (ev && ev.mint) mpTape(ev.mint, "skipped: " + reason);
   if (ev) { MP.evaluated.unshift({ ...ev, verdict: "skip", reason, at: Date.now() }); MP.evaluated = MP.evaluated.slice(0, 120); }
 }
 
 /** A new launch arrives: note the creator, queue it to be judged after the wait. */
 function mpOnLaunch(ev) {
   MP.seen++; MP.feed.lastEventAt = Date.now();
+  MP.launchTimes.push(Date.now()); if (MP.launchTimes.length > 600) MP.launchTimes.splice(0, MP.launchTimes.length - 600);
+  MP.tape.unshift({ mint: ev.mint, symbol: ev.symbol, name: ev.name, creator: ev.creator, at: Date.now(), status: "watching" });
+  if (MP.tape.length > 60) MP.tape.length = 60;
   const c = MP.creators.get(ev.creator) || [];
   c.push(Date.now()); MP.creators.set(ev.creator, c.filter((t) => Date.now() - t < 24 * 3600e3));
   if (MP.creators.size > 50000) MP.creators.delete(MP.creators.keys().next().value);
   // instant rejects that need no chain reads
-  if (!/pump$/.test(ev.mint)) return mpSkip("not a pump.fun mint");
-  if (!ev.uri) return mpSkip("no metadata");
+  if (!/pump$/.test(ev.mint)) { mpTape(ev.mint, "skipped: not a pump.fun mint"); return mpSkip("not a pump.fun mint"); }
+  if (!ev.uri) { mpTape(ev.mint, "skipped: no metadata"); return mpSkip("no metadata"); }
   if (FAMOUS_TICKERS.has(ev.symbol.toUpperCase().replace(/^\$/, ""))) return mpSkip("copycat ticker", ev);
   if (MP.creators.get(ev.creator).length >= 3) return mpSkip("creator spamming launches", ev);
   if (rugReg.has(ev.creator)) return mpSkip("creator is a known rugger", ev);
@@ -2798,6 +2804,7 @@ async function mpFast(ev) {
   MP.positions.push({ mint: ev.mint, symbol: ev.symbol, name: ev.name, creator: ev.creator, entry, entrySol: sol, tokens, sizeUsd, costUsd,
     costSol: costUsd / sol, openedAt: Date.now(), progressAtBuy: m.progress, mcapAtBuy: Math.round(m.mcap), high: entry, last: entry,
     devPct, top10: null, top1: null, tokensLeft: tokens, realizedUsd: 0, phase: "full", boosts: [`Launch Shot: in at $${(m.mcap / 1000).toFixed(1)}K, ${ms} ms after seeing it`], fast: true, devCheckedAt: 0 });
+  mpTape(ev.mint, "BOUGHT (Launch Shot)");
   MP.evaluated.unshift({ ...ev, verdict: "paper buy", reason: `Launch Shot · $${(m.mcap / 1000).toFixed(1)}K market cap · ${m.progress.toFixed(1)}% bonded · creator ${devPct != null ? devPct.toFixed(1) + "%" : "?"} · ${ms} ms`, at: Date.now() });
   MP.evaluated = MP.evaluated.slice(0, 120);
   log("cannon", `LAUNCH SHOT BUY ${ev.symbol} $${sizeUsd.toFixed(2)} at $${Math.round(m.mcap)} mcap in ${ms} ms`);
@@ -2868,6 +2875,7 @@ async function mpEvaluate(ev) {
                 costSol: costUsd / sol, openedAt: Date.now(), progressAtBuy: m.progress, high: entry, last: entry, devPct, top10, top1,
                 tokensLeft: tokens, realizedUsd: 0, phase: "full", boosts, devCheckedAt: 0 };
   MP.positions.push(pos);
+  mpTape(ev.mint, "BOUGHT");
   MP.evaluated.unshift({ ...ev, verdict: "paper buy", reason: `${m.progress.toFixed(1)}% bonded · top10 ${top10 != null ? Math.round(top10) + "%" : "?"} · dev ${devPct != null ? devPct.toFixed(1) + "%" : "?"}`, at: Date.now() });
   MP.evaluated = MP.evaluated.slice(0, 120);
   log("cannon", `PAPER BUY ${ev.symbol} $${sizeUsd.toFixed(2)} at ${m.progress.toFixed(1)}% bonded${boosts.length ? " (" + boosts.join(", ") + ")" : ""}`);
@@ -3158,7 +3166,7 @@ app.get("/api/mp/state", (req, res) => {
   }
   const settingsOut = role === "viewer" ? { ...MP.settings, savingsWallet: undefined } : MP.settings;
   res.json({ role, mode: "paper", on: MP.on, fast, startedAt: MP.startedAt, solUsd: sol, settings: settingsOut,
-    feed: { ...MP.feed, subId: undefined }, seen: MP.seen, queued: MP.queue.length,
+    feed: { ...MP.feed, subId: undefined, perMin: MP.launchTimes.filter((t) => Date.now() - t < 60000).length }, tape: MP.tape.slice(0, 30), seen: MP.seen, queued: MP.queue.length,
     stats: { trades: done.length, wins, winRate: done.length ? Math.round((wins / done.length) * 100) : null, pnlSol: +pnl.toFixed(4), pnlUsd: sol ? +(pnl * sol).toFixed(2) : null,
              best: done.length ? Math.max(...done.map((x) => x.pnlPct)) : null, worst: done.length ? Math.min(...done.map((x) => x.pnlPct)) : null },
     skips: MP.skips, open, closed: done.slice(0, 60), evaluated: MP.evaluated.slice(0, 60),
