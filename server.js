@@ -1398,6 +1398,7 @@ async function refreshWatchList() {
     geckoFeed("trending_pools", "bg").catch(() => []), page("/trending_pools?include=base_token&page=2"),
     geckoFeed("new_pools", "bg").catch(() => []), page("/new_pools?include=base_token&page=2"),
     page("/dexes/pump-fun/pools?include=base_token&page=1"), page("/dexes/pumpswap/pools?include=base_token&page=1")]);
+  for (const p of [...sets[0], ...sets[1]]) LAB.trended.set(p.addr, Date.now());     // trending lists, pages 1–2: the Winner Lab's "made the list" signal
   // interleave the sources so no single list crowds out the rest
   const merged = [];
   for (let i = 0; i < 20; i++) for (const s of sets) if (s[i]) merged.push(s[i]);
@@ -2580,6 +2581,9 @@ const MP = {
     fastMaxPerMin: 3,     // at most this many fast buys a minute
     fastMaxOpen: 4,       // and at most this many fast positions at once
     fastMaxDevPct: 15,    // skip if the creator bought more than this % at launch
+    labFilter: 0,         // 1 = skip launches the Winner Lab scores below labMinLift (only once the lab has 300 finished launches)
+    labMinLift: 1.0,      // 1.0 = "no better than a random launch"
+    labBoost: 1.5,        // bet bigger when the lab scores a launch 2.5× or better
     cashOutMcap: 100000,  // RUG ZONE: a fast mover that reaches this market cap gets sold completely (0 = off)
     fastTimeoutSec: 180,  // if it hasn't lifted off by then...
     fastMinGainPct: 30,   // ...(up at least this %), get out
@@ -2750,6 +2754,130 @@ function decodeCreateEvent(b64) {
   } catch { return null; }
 }
 
+
+// ═══════════════════════════════════════════════════════════════════════
+// 🧪 WINNER LAB — study every launch, find what the winners had in common, score new ones early
+// ═══════════════════════════════════════════════════════════════════════
+/**
+ * For every launch THE CANNON judges (winners AND losers), the lab writes down what the launch looked like
+ * at ~90 seconds: how far along the curve, who holds it, what the creator did before, whether it has a
+ * website / X / Telegram, when it launched, what it's called. Later it checks what happened:
+ *   WIN  = graduated, OR showed up on the trending list, OR reached a $100K market cap
+ * Then it counts, feature by feature, how much more (or less) often winners had each trait: the "lift".
+ * New launches get a score from those lifts, at 90 seconds, long before they trend.
+ * Until it has 300 finished launches it only shows its starting guesses (from published research) and
+ * does not influence trading.
+ */
+const LAB_FILE = VOLUME_DIR ? nodePath.join(VOLUME_DIR, "cannon-lab.json") : "";
+const LAB = { snaps: [], devs: new Map(), trended: new Map(), cache: null, cacheAt: 0 };
+const LAB_CP = [20 * 60e3, 2 * 3600e3, 12 * 3600e3];          // outcome checkpoints after launch
+const LAB_READY_AT = 300;                                     // finished launches needed before the lab may steer trading
+try { if (LAB_FILE && nodeFs.existsSync(LAB_FILE)) { const d = JSON.parse(nodeFs.readFileSync(LAB_FILE, "utf8")); LAB.snaps = d.snaps || []; for (const [k, v] of d.devs || []) LAB.devs.set(k, v); } } catch {}
+setInterval(() => { if (!LAB_FILE) return; try { const t = LAB_FILE + ".tmp";
+  nodeFs.writeFileSync(t, JSON.stringify({ snaps: LAB.snaps.slice(-4000), devs: [...LAB.devs].slice(-20000) })); nodeFs.renameSync(t, LAB_FILE); } catch {} }, 2 * 60e3);
+
+async function labSocial(uri) {                                // website / X / Telegram, read from the token's own metadata file
+  if (!/^https:\/\//.test(uri || "")) return null;
+  try {
+    const j = await (await withTimeout(fetch(uri), 3500, "token meta")).json();
+    const has = (x) => typeof x === "string" && x.trim().length > 3;
+    return [has(j.twitter), has(j.telegram), has(j.website)].filter(Boolean).length;
+  } catch { return null; }
+}
+/** Write down what this launch looked like. Safe to call more than once. */
+function labSnap(ev, m, devPct) {
+  const old = LAB.snaps.find((x) => x.mint === ev.mint); if (old) return old;
+  const d = LAB.devs.get(ev.creator) || { l: 0, g: 0 }, nm = String(ev.name || ""), at = ev.launchedAt || Date.now();
+  const s = { mint: ev.mint, sym: ev.symbol, name: ev.name, creator: ev.creator, at, hour: new Date(at).getUTCHours(),
+    progress: +(+m.progress).toFixed(2), mcap: Math.round(m.mcap), top10: null, top1: null, devPct: devPct == null ? null : +devPct.toFixed(2),
+    dev24: (MP.creators.get(ev.creator) || []).length, devL: d.l, devG: d.g, social: null, nameLen: nm.length,
+    emoji: /[^\x00-\x7F]/.test(nm + (ev.symbol || "")) ? 1 : 0, cp: 0, peak: Math.round(m.mcap), grad: false, trended: false, win: false, done: false };
+  d.l++; LAB.devs.set(ev.creator, d); if (LAB.devs.size > 30000) LAB.devs.delete(LAB.devs.keys().next().value);
+  LAB.snaps.push(s); if (LAB.snaps.length > 5000) LAB.snaps.splice(0, LAB.snaps.length - 5000);
+  labSocial(ev.uri).then((v) => { s.social = v; }).catch(() => {});
+  return s;
+}
+function labFeat(mint, obj) { const s = LAB.snaps.find((x) => x.mint === mint); if (s) Object.assign(s, obj); }
+
+/** What happened to each one? Checked at 20 min, 2 h and 12 h. */
+setInterval(async () => {
+  const now = Date.now(); let n = 0;
+  for (const [k, t] of LAB.trended) if (now - t > 36 * 3600e3) LAB.trended.delete(k);
+  for (const s of LAB.snaps) {
+    if (n >= 6) break;
+    if (s.done || s.at + LAB_CP[s.cp] > now) continue;
+    n++;
+    try {
+      const c = await readBondingCurve(s.mint);
+      let mc = null;
+      if (c && c.complete) { s.grad = true; const dx = await mpDexPrice(s.mint); mc = dx ? dx.mcap : null; }
+      else if (c) mc = curveMarket(c, await getSolUsd(), 6).mcap;
+      if (mc) s.peak = Math.max(s.peak || 0, Math.round(mc));
+    } catch { continue; }
+    if (LAB.trended.has(s.mint)) s.trended = true;
+    if (s.grad || s.trended || s.peak >= 100000) s.win = true;
+    if (s.grad && !s.gradCounted) { s.gradCounted = true; const d = LAB.devs.get(s.creator); if (d) d.g++; }
+    s.cp++;
+    if (s.win || s.cp >= LAB_CP.length) s.done = true;        // a win is final; a loss is final only after the 12 h look
+  }
+}, 15000);
+
+const LAB_FEATURES = [
+  ["How far along the curve at 90s", (s) => s.progress, [[0, 3, "under 3% bonded"], [3, 6, "3–6% bonded"], [6, 12, "6–12% bonded"], [12, 25, "12–25% bonded"], [25, 101, "25%+ bonded"]]],
+  ["Market cap at 90s", (s) => s.mcap, [[0, 6000, "market cap under $6K"], [6000, 9000, "market cap $6–9K"], [9000, 15000, "market cap $9–15K"], [15000, 1e12, "market cap over $15K"]]],
+  ["Top 10 holders", (s) => s.top10, [[0, 15, "top 10 hold under 15%"], [15, 25, "top 10 hold 15–25%"], [25, 40, "top 10 hold 25–40%"], [40, 101, "top 10 hold 40%+"]]],
+  ["Biggest single wallet", (s) => s.top1, [[0, 5, "biggest wallet under 5%"], [5, 10, "biggest wallet 5–10%"], [10, 20, "biggest wallet 10–20%"], [20, 101, "biggest wallet 20%+"]]],
+  ["Creator's bag", (s) => s.devPct, [[0, 0.5, "creator holds almost nothing"], [0.5, 2, "creator holds 0.5–2%"], [2, 5, "creator holds 2–5%"], [5, 10, "creator holds 5–10%"], [10, 101, "creator holds 10%+"]]],
+  ["Creator's launches today", (s) => s.dev24, [[0, 2, "creator's first launch today"], [2, 3, "creator's second launch today"], [3, 999, "creator launched 3+ today"]]],
+  ["Creator's track record", (s) => s.devG, [[0, 1, "creator has no past graduates"], [1, 999, "creator already graduated a token"]]],
+  ["Website / X / Telegram", (s) => s.social, [[0, 1, "no website, X or Telegram"], [1, 2, "1 social link"], [2, 3, "2 social links"], [3, 4, "website + X + Telegram"]]],
+  ["Hour launched (UTC)", (s) => s.hour, [[0, 6, "launched 00–06 UTC"], [6, 12, "launched 06–12 UTC"], [12, 18, "launched 12–18 UTC"], [18, 24, "launched 18–24 UTC"]]],
+  ["Name length", (s) => s.nameLen, [[0, 5, "very short name (≤4)"], [5, 9, "short name (5–8)"], [9, 15, "medium name (9–14)"], [15, 999, "long name (15+)"]]],
+  ["Emoji in the name", (s) => s.emoji, [[0, 1, "no emoji in the name"], [1, 2, "emoji in the name"]]],
+];
+// starting guesses from published pump.fun research, used only until the lab has enough of its own data
+const LAB_PRIOR = { "no website, X or Telegram": 0.5, "1 social link": 1.6, "2 social links": 4, "website + X + Telegram": 9, "creator already graduated a token": 5 };
+const labBucket = (bins, v) => { if (v == null || Number.isNaN(v)) return null; for (const [lo, hi, label] of bins) if (v >= lo && v < hi) return label; return null; };
+
+/** Count, feature by feature, how much more (or less) often winners had each trait. Cached 20 s. */
+function labAnalyze() {
+  const now = Date.now(); if (LAB.cache && now - LAB.cacheAt < 20000) return LAB.cache;
+  const L = LAB.snaps.filter((s) => s.win || s.done), W = L.filter((s) => s.win).length, base = L.length ? W / L.length : 0, K = 20;
+  const rows = [], table = new Map();
+  for (const [feat, get, bins] of LAB_FEATURES) for (const [lo, hi, label] of bins) {
+    const inB = L.filter((s) => { const v = get(s); return v != null && v >= lo && v < hi; });
+    if (inB.length < 5) continue;
+    const w = inB.filter((s) => s.win).length, rate = (w + base * K) / (inB.length + K), lift = base > 0 ? rate / base : 1;
+    rows.push({ feat, label, n: inB.length, wins: w, ratePct: +(rate * 100).toFixed(2), lift: +lift.toFixed(2) }); table.set(label, lift);
+  }
+  const ready = L.length >= LAB_READY_AT && W >= 8;
+  LAB.cache = { L: L.length, W, base, ready, rows, table }; LAB.cacheAt = now; return LAB.cache;
+}
+/** The launch's lift: how many times better than a random launch, from the lifts of each trait it has. */
+function labLift(s, A = labAnalyze()) {
+  if (!s) return 1;
+  if (typeof rugReg !== "undefined" && rugReg.has(s.creator)) return 0.05;       // a known rugger's launch is never a "winner"
+  let sum = 0;
+  for (const [feat, get, bins] of LAB_FEATURES) {
+    const label = labBucket(bins, get(s)); if (!label) continue;
+    let l = A.ready ? A.table.get(label) : LAB_PRIOR[label];
+    if (l == null) continue;
+    sum += Math.log(Math.min(4, Math.max(0.25, l)));
+  }
+  return Math.exp(0.6 * sum);                                                    // dampened: traits overlap, so don't count them in full
+}
+function labPublic() {
+  const A = labAnalyze(), now = Date.now();
+  const win = A.rows.filter((r) => r.n >= 20 && r.lift >= 1.4).sort((a, b) => b.lift - a.lift).slice(0, 8);
+  const avoid = A.rows.filter((r) => r.n >= 20 && r.lift <= 0.6).sort((a, b) => a.lift - b.lift).slice(0, 6);
+  const hot = LAB.snaps.filter((s) => !s.done && now - s.at < 30 * 60e3).map((s) => ({ s, lift: labLift(s, A) }))
+    .sort((a, b) => b.lift - a.lift).slice(0, 8).map(({ s, lift }) => ({ mint: s.mint, symbol: s.sym, name: s.name, progress: s.progress, mcap: s.mcap, social: s.social, at: s.at,
+      lift: +lift.toFixed(2), oddsPct: +Math.min(95, A.base * lift * 100).toFixed(1) }));
+  const graduated = LAB.snaps.filter((s) => s.grad).length, trended = LAB.snaps.filter((s) => s.trended).length;
+  return { collected: LAB.snaps.length, finished: A.L, wins: A.W, graduated, trended, baselinePct: +(A.base * 100).toFixed(2), ready: A.ready, readyAt: LAB_READY_AT,
+    winners: win, avoid, hot, starter: !A.ready };
+}
+
 /** The live tape: every launch the bot sees, newest first, with what it decided. */
 function mpTape(mint, status) { const t = MP.tape.find((x) => x.mint === mint); if (t) { t.status = status; t.doneAt = Date.now(); } }
 function mpSkip(reason, ev) {
@@ -2827,6 +2955,7 @@ async function mpEvaluate(ev) {
   };
   // every launch with real money in it gets watched for a creator dump, pass or skip
   let devAt = null; try { devAt = ((await balanceOf(ev.creator, ev.mint)) / 1e9) * 100; } catch {}
+  labSnap(ev, m, devAt);                                        // the Winner Lab writes down what this launch looked like
   if (m.progress >= 3) { rugWatch.push({ mint: ev.mint, sym: ev.symbol, creator: ev.creator, peakSol: Number(c.rSol) / 1e9, devAt, due: Date.now() + 30 * 60e3, round: 0 }); if (rugWatch.length > 2000) rugWatch.shift(); }
   if (m.progress < S.minProgress) return skipT(`weak demand (<${S.minProgress}% bonded)`, { progress: m.progress });
   // creator's bag and holder concentration, curve excluded
@@ -2834,6 +2963,7 @@ async function mpEvaluate(ev) {
   if (!chk || !chk.found) return mpSkip("couldn't check holders", ev);
   if (!chk.mintAuthorityRenounced || !chk.freezeAuthorityRenounced) return skipT("can print or freeze");
   const top10 = chk.top10WalletPct, top1 = chk.top1WalletPct;
+  labFeat(ev.mint, { top10: top10 == null ? null : +top10.toFixed(1), top1: top1 == null ? null : +top1.toFixed(1) });
   if (top1 != null && top1 > S.maxTop1Pct) return skipT(`one wallet holds ${Math.round(top1)}%`);
   if (top10 != null && top10 > S.maxTop10Pct) return skipT(`top 10 hold ${Math.round(top10)}%`);
   const devPct = devAt;
@@ -2845,6 +2975,9 @@ async function mpEvaluate(ev) {
     const hit = bad.find((x) => mine.includes(x.setup));
     if (hit) return skipT(`learned: "${hit.setup}" averaged ${hit.avgPct}% over ${hit.trades} trades`);
   }
+  // Winner Lab: only steers trading once it has enough finished launches of its own
+  const labA = labAnalyze(), labS = LAB.snaps.find((x) => x.mint === ev.mint), labL = labS ? labLift(labS, labA) : 1;
+  if (S.labFilter && labA.ready && labL < S.labMinLift) return skipT(`Winner Lab: ${labL.toFixed(1)}× the usual odds, below your ${S.labMinLift}× line`);
   // bankroll: protection first, then size from the balance
   if (MP.positions.some((p) => p.mint === ev.mint)) return mpSkip("already holding (Launch Shot)", ev);
   const gate = mpBankGate(MP.bank, S);
@@ -2853,6 +2986,7 @@ async function mpEvaluate(ev) {
   // offense: bet bigger with evidence, never past the cap
   const boosts = [];
   let mult = 1;
+  if (labA.ready && labL >= 2.5 && S.labBoost > 1) { mult *= S.labBoost; boosts.push(`Winner Lab: ${labL.toFixed(1)}× the usual odds`); }
   if (S.learn) {
     const good = mpLearned(MP.closed, S.learnMin).filter((x) => x.verdict === "favor");
     const mine = mpBuckets({ progressAtBuy: m.progress, top10, devPct });
@@ -3171,7 +3305,7 @@ app.get("/api/mp/state", (req, res) => {
              best: done.length ? Math.max(...done.map((x) => x.pnlPct)) : null, worst: done.length ? Math.min(...done.map((x) => x.pnlPct)) : null },
     skips: MP.skips, open, closed: done.slice(0, 60), evaluated: MP.evaluated.slice(0, 60),
     bank, events: MP.events.slice(0, 20), learned: mpLearned(done, MP.settings.learnMin), filterReport,
-    scorecard: mpScorecard(done.filter((x) => x.pnlUsd != null), MP.bank.start) });
+    scorecard: mpScorecard(done.filter((x) => x.pnlUsd != null), MP.bank.start), lab: labPublic() });
 });
 
 /** Owner-only: change the rules (numbers are clamped to sane ranges) */
@@ -3181,7 +3315,7 @@ app.post("/api/mp/settings", (req, res) => {
   const clamp = (k, lo, hi) => { if (b[k] == null) return; const v = Number(b[k]); if (Number.isFinite(v)) S[k] = Math.min(hi, Math.max(lo, v)); };
   clamp("startUsd", 1, 100000); clamp("slots", 0, 30); clamp("maxLossPct", 0, 100); clamp("riskPct", 1, 50); clamp("minTradeUsd", 0.1, 1000); clamp("vaultAtX", 1.2, 100); clamp("keepX", 0.2, 50);
   clamp("tp1SellPct", 10, 100); clamp("trailPct", 5, 90); clamp("moonHoldMin", 5, 2880); clamp("smartBoost", 1, 3); clamp("favorBoost", 1, 3);
-  clamp("maxBetPct", 2, 50); clamp("devExit", 0, 1); clamp("cashOutMcap", 0, 100000000); if (S.cashOutMcap > 0 && S.cashOutMcap < 10000) S.cashOutMcap = 10000; clamp("autoSend", 0, 1); clamp("trailAt5x", 3, 90); clamp("trailAt10x", 2, 90);
+  clamp("maxBetPct", 2, 50); clamp("devExit", 0, 1); clamp("labFilter", 0, 1); clamp("labMinLift", 0.3, 5); clamp("labBoost", 1, 3); clamp("cashOutMcap", 0, 100000000); if (S.cashOutMcap > 0 && S.cashOutMcap < 10000) S.cashOutMcap = 10000; clamp("autoSend", 0, 1); clamp("trailAt5x", 3, 90); clamp("trailAt10x", 2, 90);
   if (typeof b.savingsWallet === "string") {
     const w = b.savingsWallet.trim();
     if (w === "") S.savingsWallet = "";
@@ -3256,6 +3390,7 @@ async function refreshPools(type) {
       pools = freshTrending(mapPoolRows(raw));
     }
     poolCache[type] = { data: { source: "geckoterminal", type, count: pools.length, pools }, ts: Date.now() };
+    if (type === "trending") for (const p of pools) LAB.trended.set(p.addr, Date.now());
     return poolCache[type].data;
   })().finally(() => { poolBusy[type] = null; });
   return poolBusy[type];
