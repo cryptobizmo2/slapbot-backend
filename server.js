@@ -4100,14 +4100,14 @@ const MP_PRESETS = {
   balanced: { slots: 10, tpPct: 100, tp1SellPct: 50, slPct: 30, trailPct: 25, trailAt5x: 15, trailAt10x: 10, dailyStopPct: 30, maxLossStreak: 5, pauseMin: 120, cashOutMcap: 100000, minProgress: 5, maxTop10Pct: 35, maxTop1Pct: 12, maxDevPct: 8, fastLane: 0, maxHoldMin: 30, learn: 1, labFilter: 0, labMinLift: 1, labBoost: 1.5, momentum: 1, momBuyers60: 8, momBuyShare: 60, momNetSol: 2, momRise2m: 15, momMaxMcap: 40000, gradOn: 1, gradSl: 15, gradMaxOpen: 3, copyOn: 0 },
   offense: { slots: 6, tpPct: 150, tp1SellPct: 40, slPct: 35, trailPct: 30, trailAt5x: 18, trailAt10x: 12, dailyStopPct: 40, maxLossStreak: 7, pauseMin: 60, cashOutMcap: 100000, minProgress: 4, maxTop10Pct: 40, maxTop1Pct: 15, maxDevPct: 10, fastLane: 1, maxHoldMin: 45, learn: 1, labFilter: 0, labMinLift: 1, labBoost: 2, momentum: 1, momBuyers60: 6, momBuyShare: 55, momNetSol: 1.5, momRise2m: 10, momMaxMcap: 60000, gradOn: 1, gradSl: 18, gradMaxOpen: 4, copyOn: 1 },
 };
-const TG = { on: false, running: false, gen: 0, err: null, me: null, offset: 0, pair: null, sent: [], hello: new Map(), chats: new Set((CONN.tgChats || []).map(String)), alerts: CONN.tgAlerts !== false };
+const TG = { on: false, running: false, gen: 0, err: null, abort: null, conflictGraceMs: 60000, me: null, offset: 0, pair: null, sent: [], hello: new Map(), chats: new Set((CONN.tgChats || []).map(String)), alerts: CONN.tgAlerts !== false };
 const tgEsc = (x) => String(x == null ? "" : x).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
 const tgMoney = (n) => (n < 0 ? "−$" : "$") + Math.abs(+n || 0).toFixed(2);
 const tgK = (n) => (n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "K" : String(Math.round(n || 0)));
 const tgAgo = (t) => { const s = Math.max(0, Math.round((Date.now() - t) / 1000)); return s < 60 ? s + "s" : s < 3600 ? Math.round(s / 60) + "m" : Math.round(s / 3600) + "h"; };
-async function tgApi(method, body) {
+async function tgApi(method, body, signal) {
   if (!CONN.tgToken) throw new Error("no token");
-  const r = await withTimeout(fetch(`https://api.telegram.org/bot${CONN.tgToken}/${method}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body || {}) }), method === "getUpdates" ? 40000 : 12000, "telegram " + method);
+  const r = await withTimeout(fetch(`https://api.telegram.org/bot${CONN.tgToken}/${method}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body || {}), ...(signal ? { signal } : {}) }), method === "getUpdates" ? 40000 : 12000, "telegram " + method);
   const j = await r.json().catch(() => ({}));
   if (!j.ok) throw new Error(j.description || "telegram " + r.status);
   return j.result;
@@ -4243,20 +4243,55 @@ async function tgHandle(u) {
   if (addr) { await tgApi("sendChatAction", { chat_id: chat, action: "typing" }).catch(() => {}); const r = await tgLookup(addr); return tgSend(chat, r.text, r.kb); }
   return tgSend(chat, "Pick something, or paste a Solana token address to scan it:", TG_MENU);
 }
+/** Stop listening: retire the current listener and cancel the request it's waiting on, so Telegram never sees two at once. */
+function tgStop() {
+  TG.gen++;
+  if (TG.abort) { try { TG.abort.abort(); } catch {} TG.abort = null; }
+  TG.running = false; TG.on = false;
+}
+/**
+ * Connect: check the token with Telegram (getMe), then start listening in the background.
+ * Resolves as soon as Telegram has answered, so the dashboard gets its reply right away.
+ */
 async function tgLoop() {
-  if (!CONN.tgToken) return;
-  const gen = ++TG.gen;                                                   // starting a new loop (say, after a new token) retires any older one
-  TG.running = true; TG.err = null;
-  try { TG.me = await tgApi("getMe"); await tgApi("deleteWebhook", { drop_pending_updates: false }).catch(() => {}); }
-  catch (e) { TG.err = tgFail(e); log("error", `telegram: ${TG.err}`); if (gen === TG.gen) { TG.running = false; TG.on = false; } return; }
+  tgStop();                                                               // never two listeners
+  if (!CONN.tgToken) return false;
+  const gen = TG.gen; TG.running = true; TG.err = null;
+  try {
+    const me = await tgApi("getMe"); if (gen !== TG.gen) return false;
+    TG.me = me; await tgApi("deleteWebhook", { drop_pending_updates: false }).catch(() => {});
+  } catch (e) {
+    if (gen === TG.gen) { TG.err = tgFail(e); TG.running = false; TG.on = false; log("error", `telegram: ${TG.err}`); }
+    return false;
+  }
+  if (gen !== TG.gen) return false;
   TG.on = true; TG.err = null; log("alkaid", `Telegram bot @${TG.me.username} is on`);
+  tgListen(gen).catch(() => {});                                          // runs in the background
+  return true;
+}
+async function tgListen(gen) {
+  let conflictSince = 0;
   while (gen === TG.gen && CONN.tgToken) {
+    const ac = typeof AbortController === "function" ? new AbortController() : null; TG.abort = ac;
     try {
-      const ups = await tgApi("getUpdates", { offset: TG.offset, timeout: 25, allowed_updates: ["message", "callback_query"] });
+      const ups = await tgApi("getUpdates", { offset: TG.offset, timeout: 25, allowed_updates: ["message", "callback_query"] }, ac ? ac.signal : undefined);
       if (gen !== TG.gen) break;
-      TG.err = null;
+      TG.err = null; conflictSince = 0;
       for (const u of ups) { TG.offset = u.update_id + 1; await tgHandle(u).catch((e) => log("error", `telegram handler: ${e.message}`)); }
-    } catch (e) { TG.err = tgFail(e); if (/rejected the token/.test(TG.err)) { TG.on = false; } await new Promise((r) => setTimeout(r, 5000)); }
+    } catch (e) {
+      if (gen !== TG.gen) break;                                          // this listener was retired on purpose: stop quietly
+      const why = tgFail(e);
+      if (/Something else is using/.test(why)) {
+        // usually just the previous listener's request winding down: only report it if it keeps happening
+        if (!conflictSince) conflictSince = Date.now();
+        if (Date.now() - conflictSince >= TG.conflictGraceMs) TG.err = why;
+        await new Promise((r) => setTimeout(r, 2000));
+      } else {
+        TG.err = why;
+        if (/rejected the token/.test(why)) { TG.on = false; break; }
+        await new Promise((r) => setTimeout(r, 5000));
+      }
+    }
   }
   if (gen === TG.gen) { TG.running = false; TG.on = false; }
 }
@@ -4301,7 +4336,7 @@ app.post("/api/mp/connections", async (req, res) => {
     if (!m) return res.status(400).json({ error: "I couldn't find a bot token in what you pasted. In BotFather, copy the message that has your token (it contains something like 123456789:ABC…) and paste it here." });
     const v = m[0];
     CONN.tgToken = v; TG.me = null; TG.err = null; TG.offset = 0;
-    saveConn(); await tgLoop().catch(() => {});                           // returns once the bot has answered "getMe" (or failed), so the reply below already knows
+    saveConn(); await tgLoop().catch(() => {});                           // returns as soon as Telegram has answered, so the reply below already knows
   }
   if (b.tgTest === true) {
     if (!TG.chats.size) return res.status(400).json({ error: "No phone is paired yet. Tap Make a pairing code first." });
@@ -4310,7 +4345,7 @@ app.post("/api/mp/connections", async (req, res) => {
   }
   if (b.tgNewCode === true) { if (!CONN.tgToken) return res.status(400).json({ error: "Add your Telegram bot token first." }); TG.pair = { code: crypto.randomBytes(5).toString("hex").toUpperCase(), exp: Date.now() + 15 * 60e3 }; }
   if (b.tgUnpair === true) { TG.chats.clear(); CONN.tgChats = []; }
-  if (b.tgRemove === true) { delete CONN.tgToken; TG.gen++; TG.running = false; TG.on = false; TG.err = null; TG.me = null; TG.chats.clear(); CONN.tgChats = []; }
+  if (b.tgRemove === true) { delete CONN.tgToken; tgStop(); TG.err = null; TG.me = null; TG.chats.clear(); CONN.tgChats = []; }
   if (!saveConn()) return res.status(500).json({ error: "Couldn't save. Try again." });
   mpEvent("Connections updated" + (restart ? ": restarting to use the new chain connection" : ""));
   res.json({ ok: true, restart, ...connPublic() });
