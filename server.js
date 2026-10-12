@@ -4226,7 +4226,7 @@ async function tgHandle(u) {
     const code = (text.split(/\s+/)[1] || "").toUpperCase();
     if (allowed) return tgSend(chat, "👋 Welcome back. Pick something:", TG_MENU);
     if (TG.pair && Date.now() < TG.pair.exp && code && tgSafeEq(code, TG.pair.code)) {
-      TG.chats.add(chat); CONN.tgChats = [...TG.chats]; saveConn(); TG.pair = null; mpEvent("Telegram paired with your phone");
+      TG.chats.add(chat); CONN.tgChats = [...TG.chats]; saveConn(); TG.pair = null; mpEvent("Telegram paired with your phone"); tgCommandsFor(chat);
       return tgSend(chat, "✅ <b>You're connected to ALKAID.</b>\nAlerts are on: every buy, sell, pause, and vault lock. Paste any Solana token address to scan it.", TG_MENU);
     }
   }
@@ -4242,6 +4242,27 @@ async function tgHandle(u) {
   const addr = SOL_ADDR.test(text) ? text : (cmd === "/lookup" || cmd === "/scan") && SOL_ADDR.test(arg) ? arg : null;
   if (addr) { await tgApi("sendChatAction", { chat_id: chat, action: "typing" }).catch(() => {}); const r = await tgLookup(addr); return tgSend(chat, r.text, r.kb); }
   return tgSend(chat, "Pick something, or paste a Solana token address to scan it:", TG_MENU);
+}
+/** The bot's name card and command menu, set automatically. Commands are shown only to paired phones; strangers see none. */
+const TG_DESC = "ALKAID · private trading assistant.\n\nLive alerts, open positions, strategy reports and token safety scans for its owner.\n\nThis bot is private: it only answers phones paired from the owner's dashboard.";
+const TG_SHORT = "ALKAID · private trading alerts and token safety scans.";
+const TG_COMMANDS = [
+  { command: "status", description: "Balance, today, open trades" }, { command: "positions", description: "Open trades with live profit or loss" },
+  { command: "hot", description: "Hottest launches right now" }, { command: "graduates", description: "Recent graduations" },
+  { command: "why", description: "Why it's winning or losing" }, { command: "strategy", description: "What the bot is doing" },
+  { command: "top", description: "Top 100 trending" }, { command: "sweet", description: "Best-performing rules" },
+  { command: "vault", description: "Vault and savings" }, { command: "pause", description: "Stop new trades" },
+  { command: "resume", description: "Start trading again" }, { command: "defense", description: "Safer settings" },
+  { command: "balanced", description: "Default settings" }, { command: "offense", description: "Bolder settings" },
+  { command: "alerts", description: "Turn alerts on or off" }, { command: "scan", description: "Scan a token: /scan then the address" },
+  { command: "menu", description: "Show the buttons" },
+];
+const tgCommandsFor = (chat) => tgApi("setMyCommands", { commands: TG_COMMANDS, scope: { type: "chat", chat_id: Number(chat) } }).catch(() => {});
+async function tgProfile() {
+  await tgApi("setMyDescription", { description: TG_DESC }).catch(() => {});
+  await tgApi("setMyShortDescription", { short_description: TG_SHORT }).catch(() => {});
+  await tgApi("deleteMyCommands", {}).catch(() => {});                   // the public sees no command list
+  for (const c of TG.chats) await tgCommandsFor(c);                       // paired phones get the full menu
 }
 /** Stop listening: retire the current listener and cancel the request it's waiting on, so Telegram never sees two at once. */
 function tgStop() {
@@ -4266,6 +4287,7 @@ async function tgLoop() {
   }
   if (gen !== TG.gen) return false;
   TG.on = true; TG.err = null; log("alkaid", `Telegram bot @${TG.me.username} is on`);
+  tgProfile().catch(() => {});                                            // description + command menu, every time it connects
   tgListen(gen).catch(() => {});                                          // runs in the background
   return true;
 }
