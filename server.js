@@ -2170,7 +2170,7 @@ function marketFlags(m, flags) {
  * server has a disk), and it grows from three places:
  *   1. its own scans: a token whose liquidity was pulled marks its creator; bundle wallets
  *      on a token that's being dumped get marked too
- *   2. THE CANNON's launch watcher: a creator whose token got dumped while they sold out
+ *   2. ALKAID's launch watcher: a creator whose token got dumped while they sold out
  *   3. the second opinion: when it calls a token a rug, the creator is noted
  */
 const RUG_FILE = VOLUME_DIR ? nodePath.join(VOLUME_DIR, "rug-registry.json") : "";
@@ -2665,7 +2665,7 @@ function mpSendVault(why) {
   return amt;
 }
 MP.bank = mpNewBank(MP.settings.startUsd);
-function mpEvent(text) { MP.events.unshift({ at: Date.now(), text }); MP.events = MP.events.slice(0, 50); log("cannon", text); if (typeof tgEvent === "function") tgEvent(text); }
+function mpEvent(text) { MP.events.unshift({ at: Date.now(), text }); MP.events = MP.events.slice(0, 50); log("alkaid", text); if (typeof tgEvent === "function") tgEvent(text); }
 
 // ── saved to the server's disk, so paper results survive restarts and updates ──
 const MP_FILE = VOLUME_DIR ? nodePath.join(VOLUME_DIR, "masterpeace.json") : "";
@@ -2677,13 +2677,13 @@ try {
     if (!MP.bank || !Number.isFinite(MP.bank.cash)) MP.bank = mpNewBank(MP.settings.startUsd);
     if (MP.bank.pauseWhy === "daily stop") { MP.bank.pausedUntil = 0; MP.bank.pauseWhy = null; MP.bank.dayPnl = 0; }   // the old daily stop misfired
   }
-} catch (e) { log("error", `loading THE CANNON: ${e.message}`); }
+} catch (e) { log("error", `loading ALKAID: ${e.message}`); }
 setInterval(() => {
   if (!MP_FILE) return;
   try { const tmp = MP_FILE + ".tmp";
     nodeFs.writeFileSync(tmp, JSON.stringify({ settings: MP.settings, bank: MP.bank, closed: MP.closed, report: MP.report, skips: MP.skips,
       events: MP.events, startedAt: MP.startedAt, seen: MP.seen, outcomes: MP.outcomes.slice(-600) }));
-    nodeFs.renameSync(tmp, MP_FILE); } catch (e) { log("error", `saving THE CANNON: ${e.message}`); }
+    nodeFs.renameSync(tmp, MP_FILE); } catch (e) { log("error", `saving ALKAID: ${e.message}`); }
 }, 2 * 60e3);
 
 /** Pure: which "setup" a trade belongs to, so it can learn what works. */
@@ -2877,7 +2877,7 @@ function decodeCreateEvent(b64) {
 // 🧪 WINNER LAB — study every launch, find what the winners had in common, score new ones early
 // ═══════════════════════════════════════════════════════════════════════
 /**
- * For every launch THE CANNON judges (winners AND losers), the lab writes down what the launch looked like
+ * For every launch ALKAID judges (winners AND losers), the lab writes down what the launch looked like
  * at ~90 seconds: how far along the curve, who holds it, what the creator did before, whether it has a
  * website / X / Telegram, when it launched, what it's called. Later it checks what happened:
  *   WIN  = graduated, OR showed up on the trending list, OR reached a $100K market cap
@@ -3450,7 +3450,7 @@ function flowStats(f, now = Date.now()) {
 
 /**
  * ALL LAUNCHES + ALL GRADUATIONS, kept for 48 hours: how many launch, how many graduate, how long it takes,
- * what time of day, and whether THE CANNON had seen (and scored) each graduate early.
+ * what time of day, and whether ALKAID had seen (and scored) each graduate early.
  */
 const GR = { launches: [], grads: [], seen: new Map() };
 function mpOnComplete(ev) {
@@ -3545,7 +3545,7 @@ async function mpFast(ev) {
   mpTape(ev.mint, "BOUGHT (Launch Shot)");
   MP.evaluated.unshift({ ...ev, verdict: "paper buy", reason: `Launch Shot · $${(m.mcap / 1000).toFixed(1)}K market cap · ${m.progress.toFixed(1)}% bonded · creator ${devPct != null ? devPct.toFixed(1) + "%" : "?"} · ${ms} ms`, at: Date.now() });
   MP.evaluated = MP.evaluated.slice(0, 120);
-  log("cannon", `LAUNCH SHOT BUY ${ev.symbol} $${sizeUsd.toFixed(2)} at $${Math.round(m.mcap)} mcap in ${ms} ms`);
+  log("alkaid", `LAUNCH SHOT BUY ${ev.symbol} $${sizeUsd.toFixed(2)} at $${Math.round(m.mcap)} mcap in ${ms} ms`);
 }
 
 /** Judge one launch after the wait: real demand, no big dev/whale bags, clean contract. */
@@ -3639,7 +3639,7 @@ function mpOpen(ev, m, info) {
   mpTape(ev.mint, info.momentum ? "BOUGHT on momentum" : "BOUGHT");
   MP.evaluated.unshift({ ...ev, verdict: "paper buy", reason: info.why, at: Date.now() });
   MP.evaluated = MP.evaluated.slice(0, 120);
-  log("cannon", `PAPER BUY ${ev.symbol} $${sizeUsd.toFixed(2)} at ${m.progress.toFixed(1)}% bonded${boosts.length ? " (" + boosts.join(", ") + ")" : ""}`);
+  log("alkaid", `PAPER BUY ${ev.symbol} $${sizeUsd.toFixed(2)} at ${m.progress.toFixed(1)}% bonded${boosts.length ? " (" + boosts.join(", ") + ")" : ""}`);
 }
 
 /** Pure: is this the moment? Real buyers piling in, buys beating sells, SOL flowing in, price rising, not too late. */
@@ -3750,7 +3750,7 @@ async function mpManage() {
     MP.closed.unshift({ ...p, exit: p.last, closedAt: Date.now(), why, pnlUsd: +pnlUsd.toFixed(2), pnlSol: +(pnlUsd / sol).toFixed(5), pnlPct: +((pnlUsd / cost) * 100).toFixed(1) });
     MP.closed = MP.closed.slice(0, 500);
     MP.positions = MP.positions.filter((x) => x !== p);
-    log("cannon", `PAPER CLOSED ${p.symbol} ${why} ${pnlUsd >= 0 ? "+" : ""}$${pnlUsd.toFixed(2)}`);
+    log("alkaid", `PAPER CLOSED ${p.symbol} ${why} ${pnlUsd >= 0 ? "+" : ""}$${pnlUsd.toFixed(2)}`);
     if (typeof tgTradeClosed === "function") tgTradeClosed(p, why, pnlUsd);
     for (const msg of mpAfterClose(MP.bank, S, pnlUsd)) mpEvent(msg);
     if (S.autoSend && MP.bank.vault > 0) mpSendVault("auto: profit locked");
@@ -3829,7 +3829,7 @@ function mpConnect() {
       }
     }, "confirmed");
     MP.feed.connected = true;
-    log("cannon", "watching pump.fun launches (paper mode)");
+    log("alkaid", "watching pump.fun launches (paper mode)");
   } catch (e) { MP.feed.subId = null; log("error", `cannon feed: ${e.message}`); }
 }
 setTimeout(mpConnect, 8000);
@@ -3922,7 +3922,7 @@ function saveShare() {
         else if (nodeFs.existsSync(SHARE_FILE)) nodeFs.unlinkSync(SHARE_FILE); } catch (e) { log("error", `saving share link: ${e.message}`); }
 }
 /**
- * Wallets that may WATCH THE CANNON by signing in with their own wallet (no tokens needed).
+ * Wallets that may WATCH ALKAID by signing in with their own wallet (no tokens needed).
  * View-only: every change stays owner-only. Add a public wallet address, upload, done.
  */
 const VIEWER_WALLETS = [];
@@ -4137,7 +4137,7 @@ function tgBank() {
 }
 function tgStatus() {
   const S = MP.settings, { B, total } = tgBank(), paused = B.pausedUntil > Date.now() ? B.pauseWhy : null, perMin = MP.launchTimes.filter((t) => Date.now() - t < 60000).length;
-  return `📊 <b>THE CANNON</b> · paper money\nTotal <b>${tgMoney(total)}</b> (started ${tgMoney(B.start)}, ${total >= B.start ? "+" : ""}${(((total / B.start) - 1) * 100).toFixed(1)}%)\n` +
+  return `📊 <b>ALKAID</b> · paper money\nTotal <b>${tgMoney(total)}</b> (started ${tgMoney(B.start)}, ${total >= B.start ? "+" : ""}${(((total / B.start) - 1) * 100).toFixed(1)}%)\n` +
     `Trading cash ${tgMoney(B.cash)} · Vault ${tgMoney(B.vault)} · Sent to savings ${tgMoney(B.sent || 0)}\nToday <b>${tgMoney(B.dayPnl || 0)}</b>\n` +
     `Open trades ${MP.positions.length}/${S.slots > 0 ? S.slots : S.maxOpen} · watching ${MP.watch.size} launches for momentum\n` +
     `Last launch ${MP.feed.lastEventAt ? tgAgo(MP.feed.lastEventAt) + " ago" : "—"} · ${perMin} a minute\n` +
@@ -4212,7 +4212,7 @@ async function tgHandle(u) {
     if (allowed) return tgSend(chat, "👋 Welcome back. Pick something:", TG_MENU);
     if (TG.pair && Date.now() < TG.pair.exp && code && tgSafeEq(code, TG.pair.code)) {
       TG.chats.add(chat); CONN.tgChats = [...TG.chats]; saveConn(); TG.pair = null; mpEvent("Telegram paired with your phone");
-      return tgSend(chat, "✅ <b>You're connected to THE CANNON.</b>\nAlerts are on: every buy, sell, pause, and vault lock. Paste any Solana token address to scan it.", TG_MENU);
+      return tgSend(chat, "✅ <b>You're connected to ALKAID.</b>\nAlerts are on: every buy, sell, pause, and vault lock. Paste any Solana token address to scan it.", TG_MENU);
     }
   }
   if (!allowed) {                                                         // strangers get one polite line, at most every 10 minutes, and nothing else
@@ -4233,7 +4233,7 @@ async function tgLoop() {
   TG.running = true;
   try { TG.me = await tgApi("getMe"); await tgApi("deleteWebhook", { drop_pending_updates: false }).catch(() => {}); }
   catch (e) { log("error", `telegram: ${e.message}`); TG.running = false; TG.on = false; return; }
-  TG.on = true; log("cannon", `Telegram bot @${TG.me.username} is on`);
+  TG.on = true; log("alkaid", `Telegram bot @${TG.me.username} is on`);
   while (TG.running && CONN.tgToken) {
     try {
       const ups = await tgApi("getUpdates", { offset: TG.offset, timeout: 25, allowed_updates: ["message", "callback_query"] });
@@ -4290,6 +4290,26 @@ app.post("/api/mp/connections", async (req, res) => {
   if (restart) setTimeout(() => process.exit(0), 1500);                    // the service manager brings it straight back up
 });
 /*CONN_END*/
+
+
+/*PAGE_BEGIN*/
+/**
+ * The dashboard page itself is served from this server (https://your-api-address/alkaid), so one upload to this
+ * repo updates the bot AND its screen together, and nothing about it sits on a separate public website.
+ * The page holds no secrets: every number on it comes from a signed-in request. It is also hidden from search engines.
+ */
+function alkaidPage(req, res) {
+  let html;
+  try { html = nodeFs.readFileSync(process.env.ALKAID_HTML || nodePath.join(__dirname, "alkaid.html"), "utf8"); }
+  catch { return res.status(404).json({ error: "The dashboard file isn't on this server yet. Upload alkaid.html next to server.js." }); }
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("X-Robots-Tag", "noindex, nofollow");
+  res.setHeader("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'");
+  res.send(html);
+}
+app.get(["/alkaid", "/alkaid.html"], alkaidPage);
+/*PAGE_END*/
 
 // ═══════════════════════════════════════════════════════════════════════
 // health check
@@ -4434,7 +4454,7 @@ app.get("/api/health", (req, res) => {
                   callsLastMinute: gtTimes.filter((t) => Date.now() - t < 60000).length, budgetPerMinute: GT_PER_MIN, ...gtStats,
                   coolingDown: Date.now() < gtBackoffUntil, newPoolsAgeSec: poolCache.new.ts ? Math.round((Date.now() - poolCache.new.ts) / 1000) : null },
     lowSupply: { found: lowSupply.size, maxSupply: LOW_SUPPLY_MAX },
-    cannon: { running: MP.on && MP.feed.connected, tradesRead: MP.feed.trades || 0, graduationsSeen: MP.feed.grads || 0, telegram: TG.on },   // details are owner-only (/api/mp/state)
+    engine: { running: MP.on && MP.feed.connected, tradesRead: MP.feed.trades || 0, graduationsSeen: MP.feed.grads || 0, telegram: TG.on },   // details are owner-only (/api/mp/state)
     rugRegistry: { wallets: rugReg.size, watching: rugWatch.length, savedPermanently: !!RUG_FILE },
     smartWallets: { tracked: ledger.size, watching: watchList.length, liveWallets: liveSubs.size, alerts24h: alerts.length, learningSince: new Date(smartSince).toISOString(), savedPermanently: smartPersistent, priceUsd: SMART_PRICE_USD },
     time: new Date().toISOString(),
