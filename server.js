@@ -2633,6 +2633,7 @@ try {
     if (d.settings) Object.assign(MP.settings, d.settings);
     for (const k of ["bank", "closed", "report", "skips", "events", "startedAt", "seen", "outcomes"]) if (d[k] != null) MP[k] = d[k];
     if (!MP.bank || !Number.isFinite(MP.bank.cash)) MP.bank = mpNewBank(MP.settings.startUsd);
+    if (MP.bank.pauseWhy === "daily stop") { MP.bank.pausedUntil = 0; MP.bank.pauseWhy = null; MP.bank.dayPnl = 0; }   // the old daily stop misfired
   }
 } catch (e) { log("error", `loading THE CANNON: ${e.message}`); }
 setInterval(() => {
@@ -2712,9 +2713,13 @@ function mpScorecard(closed, start) {
 }
 
 /** Pure: daily reset, then is trading allowed right now? */
-function mpBankGate(bank, S, now = Date.now()) {
+function mpBankGate(bank, S, now = Date.now(), open = (typeof MP !== "undefined" ? MP.positions : [])) {
   const d = new Date(now).toISOString().slice(0, 10);
-  if (bank.day !== d) { bank.day = d; bank.dayStart = bank.cash; if (bank.pauseWhy === "daily stop") { bank.pausedUntil = 0; bank.pauseWhy = null; } }
+  if (bank.day !== d) {
+    // the day starts from ALL the trading money: cash on hand + what's sitting in open trades
+    bank.day = d; bank.dayStart = bank.cash + (open || []).reduce((a, p) => a + (p.costUsd || 0), 0); bank.dayPnl = 0;
+    if (bank.pauseWhy === "daily stop") { bank.pausedUntil = 0; bank.pauseWhy = null; }
+  }
   if (bank.pausedUntil > now) return `paused: ${bank.pauseWhy}`;
   if (bank.cash < S.minTradeUsd) return "trading balance too low (the vault is safe)";
   return null;
@@ -2725,7 +2730,9 @@ function mpAfterClose(bank, S, pnlUsd, now = Date.now()) {
   bank.streak = pnlUsd > 0 ? 0 : bank.streak + 1;
   if (bank.streak >= S.maxLossStreak) { bank.pausedUntil = now + S.pauseMin * 60e3; bank.pauseWhy = `${bank.streak} losses in a row`; bank.streak = 0;
     msgs.push(`Paused ${S.pauseMin} minutes after ${S.maxLossStreak} losses in a row`); }
-  if (bank.cash < bank.dayStart * (1 - S.dailyStopPct / 100)) {
+  // daily stop counts real results only: money parked in open trades is not a loss
+  bank.dayPnl = (bank.dayPnl || 0) + pnlUsd;
+  if (bank.dayStart > 0 && bank.dayPnl <= -bank.dayStart * (S.dailyStopPct / 100)) {
     const t = new Date(now); t.setUTCHours(24, 0, 0, 0);
     bank.pausedUntil = t.getTime(); bank.pauseWhy = "daily stop";
     msgs.push(`Down ${S.dailyStopPct}% today: stopped until tomorrow`);
@@ -3282,7 +3289,7 @@ app.get("/api/mp/state", (req, res) => {
   const openValue = MP.positions.reduce((a, p) => a + (p.tokensLeft ?? p.tokens) * p.last * (1 - MP.settings.feePct / 100), 0);
   const B = MP.bank, total = B.cash + B.vault + (B.sent || 0) + openValue;
   const bank = { start: B.start, trading: +B.cash.toFixed(2), vault: +B.vault.toFixed(2), inTrades: +openValue.toFixed(2), total: +total.toFixed(2),
-    growthPct: +(((total / B.start) - 1) * 100).toFixed(1), today: +(B.cash + openValue - B.dayStart).toFixed(2), peak: +(B.peak || 0).toFixed(2),
+    growthPct: +(((total / B.start) - 1) * 100).toFixed(1), today: +(B.dayPnl || 0).toFixed(2), peak: +(B.peak || 0).toFixed(2),
     paused: B.pausedUntil > Date.now() ? { why: B.pauseWhy, until: B.pausedUntil } : null, nextBetUsd: +mpBetSize(B, MP.settings, MP.positions, 1, null, sol || 150).toFixed(2),
     slots: mpMaxOpen(MP.settings), slotsUsed: MP.positions.length,
     sent: +(B.sent || 0).toFixed(2), sends: (B.sends || []).slice(0, 10), savingsWallet: MP.settings.savingsWallet || MY_WALLET || null };
@@ -3323,6 +3330,7 @@ app.post("/api/mp/settings", (req, res) => {
     else return res.status(400).json({ error: "That isn't a valid Solana wallet address." });
   }
   if (b.sendVault === true) mpSendVault("you tapped Send");
+  if (b.resume === true) { MP.bank.pausedUntil = 0; MP.bank.pauseWhy = null; MP.bank.streak = 0; mpEvent("You resumed trading"); }
   clamp("fastLane", 0, 1); clamp("fastMaxMcap", 3000, 100000); clamp("fastBetPct", 1, 25); clamp("fastMaxPerMin", 1, 20); clamp("fastMaxOpen", 1, 20);
   clamp("fastMaxDevPct", 0, 100); clamp("fastTimeoutSec", 30, 3600); clamp("fastMinGainPct", 0, 500);
   clamp("dailyStopPct", 5, 100); clamp("maxLossStreak", 2, 50); clamp("pauseMin", 5, 1440); clamp("learn", 0, 1); clamp("learnMin", 5, 200);
