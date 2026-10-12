@@ -4296,8 +4296,10 @@ app.post("/api/mp/connections", async (req, res) => {
   }
   if (b.rpcDailyCap != null) { const n = Number(b.rpcDailyCap); if (Number.isFinite(n) && n >= 0 && n <= 1e8) CONN.rpcDailyCap = Math.round(n); }
   if (typeof b.tgToken === "string" && b.tgToken.trim()) {
-    const v = b.tgToken.trim();
-    if (!/^\d{5,12}:[A-Za-z0-9_-]{30,60}$/.test(v)) return res.status(400).json({ error: "That doesn't look like a Telegram bot token (it looks like 123456789:ABC…)." });
+    // accept the whole BotFather message, or just the token: pick the token out of whatever was pasted
+    const m = b.tgToken.match(/\d{5,12}:[A-Za-z0-9_-]{30,60}/);
+    if (!m) return res.status(400).json({ error: "I couldn't find a bot token in what you pasted. In BotFather, copy the message that has your token (it contains something like 123456789:ABC…) and paste it here." });
+    const v = m[0];
     CONN.tgToken = v; TG.me = null; TG.err = null; TG.offset = 0;
     saveConn(); await tgLoop().catch(() => {});                           // returns once the bot has answered "getMe" (or failed), so the reply below already knows
   }
