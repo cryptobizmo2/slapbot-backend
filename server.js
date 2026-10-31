@@ -92,7 +92,7 @@ const SOLANA_RPC_URL = CONN.rpcUrl || process.env.SOLANA_RPC_URL || "https://api
 const SLAPGOLD_MINT = process.env.SLAPGOLD_MINT; // e.g. 4R7Hbdhh3YeVqZaESRA3qPJ8Z3xh3Qedsw88RDjxL1Q9
 // The owner wallet. Set here (it's a public address, not a secret) so it can be changed with a normal upload,
 // without touching the server's settings file. It wins over the MY_WALLET setting.
-const BUILD_ID = "2026-10-30 · owner-only · V1.1 · ledger · playbook · graduate index · price floor";            // shown on the dashboard and the health page: it tells you which version is running
+const BUILD_ID = "2026-10-31 · owner-only · V1.1 · price floor · stop survives restarts · data export";            // shown on the dashboard and the health page: it tells you which version is running
 const OWNER_WALLET = "4t3F4TvCsRCohYJ3EZ4B2ahaN2nN5kBE3A8WUVy2K1CF";
 const MY_WALLET = OWNER_WALLET || process.env.MY_WALLET;   // YOUR wallet address — the only one allowed in
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*"; // lock to your GitHub Pages URL once live
@@ -2745,7 +2745,10 @@ try {
     if (Array.isArray(d.positions)) MP.positions = d.positions.filter((p) => p && typeof p.mint === "string" && p.entry > 0 && p.tokens > 0 && p.costUsd > 0);
     for (const k of ["bank", "closed", "report", "skips", "events", "startedAt", "seen", "outcomes", "auto", "runs"]) if (d[k] != null) MP[k] = d[k];
     if (!MP.bank || !Number.isFinite(MP.bank.cash)) MP.bank = mpNewBank(MP.settings.startUsd);
-    if (MP.bank.pauseWhy === "daily stop") { MP.bank.pausedUntil = 0; MP.bank.pauseWhy = null; MP.bank.dayPnl = 0; }   // the old daily stop misfired
+    // a daily stop that is still running STAYS running: a restart (an upload, a crash) must never switch off a risk control.
+    // Only an expired one, or an impossible one (more than 26 hours away), is cleared.
+    { const tUntil = MP.bank.pausedUntil, nowT = Date.now();
+      if (MP.bank.pauseWhy === "daily stop" && (!(tUntil > nowT) || tUntil - nowT > 26 * 3600e3)) { MP.bank.pausedUntil = 0; MP.bank.pauseWhy = null; MP.bank.dayPnl = 0; } }
   }
 } catch (e) { log("error", `loading ALKAID: ${e.message}`); }
 function mpSaveNow() {
@@ -4141,6 +4144,7 @@ const PB_SEEDS = [
   ["lesson:no-edge-yet", "No edge has shown up yet", "Across 180+ paper trades in the runs so far (110, 55 and 17 in the three reported, plus a smaller one), no way of entering has had a positive average after costs. Nothing is proven, and real money stays locked until the Strategy Court says otherwise."],
   ["lesson:restarts", "Open trades used to vanish on a restart", "Before this fix, an upload restarted the server and any open trade disappeared with its money. Open trades are now saved and restored, and everything is flushed to disk on shutdown."],
   ["lesson:impossible-prices", "A loss bigger than a thin token can physically produce", "Oct 30: a \"−15% stop\" booked a 62% loss on a token at a $6.5K market cap. Such a token can fall at most about 35% (its curve has a floor), so the price used was wrong, and it also triggered the 3% daily stop. Fixed: a token bought on its curve now records its own floor and ignores any reading below it, and a failed chain read no longer switches the bot to a different, slower price source."],
+  ["lesson:restart-wiped-stop", "A restart used to cancel the daily stop", "Oct 30: the daily stop (3%) was active until 7 PM, but an upload restarted the server at about 6:50 PM and a leftover startup rule wiped the stop, so the bot bought 2 minutes later. Fixed: a daily stop that is still running now survives restarts. Only an expired one is cleared."],
   ["lesson:one-bad-print", "One bad price can cost a whole trade", "A graduate was booked at −99% on a −12% stop (bad data or a real crash). A one-step drop of 35% or more is now re-checked 1.5 seconds later before the bot acts."],
 ];
 function pbSeed() { for (const [id, title, text] of PB_SEEDS) if (!pbFind(id)) { const it = { id, kind: "lesson", status: "learned", title, text, at: Date.now(), log: [] }; PB.items.push(it); } }
@@ -4322,6 +4326,47 @@ function tgPlan() {
     `\n\n<b>${p.verdict ? "Verdict " + p.verdict : "Next"}:</b> ${p.next.replace(/[<>&]/g, "")}\n\nRules:\n` + p.rules.map((r) => "• " + r.replace(/[<>&]/g, "")).join("\n");
 }
 /*PLAN_END*/
+
+
+/*EXPORT_BEGIN*/
+// ═══════════════════════════════════════════════════════════════════════
+// 📤 EXPORT — the raw data as spreadsheets, so patterns can be searched on the full record, not on a summary
+// ═══════════════════════════════════════════════════════════════════════
+const csvQ = (v) => (v == null ? "" : /[",\n]/.test(String(v)) ? '"' + String(v).replace(/"/g, '""') + '"' : String(v));
+/** Every judged launch: what it looked like at 90 seconds and how it ended. (The same file the dashboard's download button gives.) */
+function launchCsv() {
+  const pm = new Map(PATHS.list.map((p) => [p.mint, p]));
+  const head = ["mint", "symbol", "name", "launched_utc", "bonded_pct_90s", "mcap_90s", "top10_pct", "top1_pct", "creator_pct", "creator_launches_today",
+    "creator_past_graduates", "social_links", "hour_utc", "name_len", "emoji", "graduated", "trended", "peak_mcap", "winner", "lab_score_x", "path_peak_x", "path_low_x", "path_minutes"];
+  const lines = [head.join(",")];
+  for (const s of LAB.snaps) {
+    const p = pm.get(s.mint), pts = p ? p.pts : null;
+    lines.push([s.mint, s.sym, s.name, new Date(s.at).toISOString(), s.progress, s.mcap, s.top10, s.top1, s.devPct, s.dev24, s.devG, s.social, s.hour, s.nameLen, s.emoji,
+      s.grad ? 1 : 0, s.trended ? 1 : 0, s.peak, s.win ? 1 : s.done ? 0 : "", labLift(s).toFixed(2), pts ? Math.max(...pts).toFixed(3) : "", pts ? Math.min(...pts).toFixed(3) : "",
+      pts ? ((pts.length - 1) * PATH_STEP / 60000).toFixed(1) : ""].map(csvQ).join(","));
+  }
+  return lines.join("\n");
+}
+/** The full recorded price path of each token (a multiple of its price at the 90-second mark, every 15 seconds for up to 45 minutes). Join on mint. */
+function pathsCsv() {
+  const lines = ["mint,started_utc,mcap_at_start,graduated,minutes,step_seconds,points_x_of_start"];
+  for (const p of PATHS.list) if (p && p.pts && p.pts.length > 1) lines.push([p.mint, new Date(p.at).toISOString(), Math.round(p.mcap0 || 0), p.grad ? 1 : 0, ((p.pts.length - 1) * PATH_STEP / 60000).toFixed(1), PATH_STEP / 1000, p.pts.join(" ")].map(csvQ).join(","));
+  return lines.join("\n");
+}
+/** Every momentum signal, whether or not the bot bought, with how each exit style would have done (net % after costs). */
+function signalsCsv() {
+  const ids = EXP_SETS.map((e) => e.id), lines = [["mint", "symbol", "signal_utc", "mcap_usd", "buyers_last_minute", "buy_share_pct", "net_sol_last_minute", "rise_2min_pct", "hour_utc", "bought", "not_bought_because", ...ids.map((i) => "net_pct_exit_" + i)].join(",")];
+  for (const x of SIG.list) lines.push([x.mint, x.sym, new Date(x.at).toISOString(), x.mcap, x.buyers, x.share, x.net, x.rise, x.hour, x.took ? 1 : 0, x.why, ...ids.map((i) => (x.res && x.res[i] != null ? x.res[i] : ""))].map(csvQ).join(","));
+  return lines.join("\n");
+}
+/** Every closed paper trade, newest first. */
+function tradesCsv() {
+  const lines = ["symbol,mint,lane,opened_utc,closed_utc,minutes_held,size_usd,pnl_usd,pnl_pct,r_multiple,exit_reason,mcap_at_buy,bonded_pct_at_buy,top10_pct,top1_pct,creator_pct,stop_pct,price_impact_pct"];
+  for (const c of MP.closed) lines.push([c.symbol, c.mint, c.entryType || (c.fast ? "launch shot" : "at 90s"), c.openedAt ? new Date(c.openedAt).toISOString() : "", c.closedAt ? new Date(c.closedAt).toISOString() : "",
+    c.openedAt && c.closedAt ? ((c.closedAt - c.openedAt) / 60000).toFixed(1) : "", c.sizeUsd, c.pnlUsd, c.pnlPct, c.rMult, c.why, c.mcapAtBuy, c.progressAtBuy, c.top10, c.top1, c.devPct, c.stopPct, c.impactPct].map(csvQ).join(","));
+  return lines.join("\n");
+}
+/*EXPORT_END*/
 
 /** The live tape: every launch the bot sees, newest first, with what it decided. */
 function mpTape(mint, status) { const t = MP.tape.find((x) => x.mint === mint); if (t) { t.status = status; t.doneAt = Date.now(); } }
@@ -5004,21 +5049,11 @@ app.post("/api/mp/sweetspot/apply", (req, res) => {
 /** Owner: every launch studied, with its traits, what happened, and its price path summary, as a spreadsheet file. */
 app.get("/api/mp/data.csv", (req, res) => {
   if (!requireOwner(req, res)) return;
-  const pm = new Map(PATHS.list.map((p) => [p.mint, p]));
-  const q = (v) => (v == null ? "" : /[",\n]/.test(String(v)) ? '"' + String(v).replace(/"/g, '""') + '"' : String(v));
-  const head = ["mint", "symbol", "name", "launched_utc", "bonded_pct_90s", "mcap_90s", "top10_pct", "top1_pct", "creator_pct", "creator_launches_today",
-    "creator_past_graduates", "social_links", "hour_utc", "name_len", "emoji", "graduated", "trended", "peak_mcap", "winner", "lab_score_x", "path_peak_x", "path_low_x", "path_minutes"];
-  const lines = [head.join(",")];
-  for (const s of LAB.snaps) {
-    const p = pm.get(s.mint), pts = p ? p.pts : null;
-    lines.push([s.mint, s.sym, s.name, new Date(s.at).toISOString(), s.progress, s.mcap, s.top10, s.top1, s.devPct, s.dev24, s.devG, s.social, s.hour, s.nameLen, s.emoji,
-      s.grad ? 1 : 0, s.trended ? 1 : 0, s.peak, s.win ? 1 : s.done ? 0 : "", labLift(s).toFixed(2), pts ? Math.max(...pts).toFixed(3) : "", pts ? Math.min(...pts).toFixed(3) : "",
-      pts ? ((pts.length - 1) * PATH_STEP / 60000).toFixed(1) : ""].map(q).join(","));
-  }
   res.setHeader("Content-Type", "text/csv; charset=utf-8");
   res.setHeader("Content-Disposition", `attachment; filename="the-cannon-data-${new Date().toISOString().slice(0, 10)}.csv"`);
-  res.send(lines.join("\n"));
+  res.send(launchCsv());
 });
+
 
 app.get("/api/mp/ledger.csv", (req, res) => {
   if (!requireOwner(req, res)) return;
@@ -5134,6 +5169,7 @@ const TG_MENU = [
   [{ text: "🏛️ Court", callback_data: "court" }, { text: "🎯 $3 goal", callback_data: "goal" }, { text: "🎵 Rhythm", callback_data: "rhythm" }],
   [{ text: "🗺️ Plan", callback_data: "plan" }, { text: "📒 Ledger", callback_data: "ledger" }, { text: "📘 Playbook", callback_data: "playbook" }, { text: "🎓 Index", callback_data: "index" }],
   [{ text: "📐 25K→30K", callback_data: "band" }, { text: "🔬 Signal Lab", callback_data: "signals" }, { text: "💾 Saved?", callback_data: "saved" }],
+  [{ text: "📤 Export my data", callback_data: "export" }],
   [{ text: "📰 Morning report", callback_data: "report" }, { text: "🔄 Fresh start", callback_data: "ask:fresh" }],
   [{ text: "🧾 V1.0 test ($1,000 paper)", callback_data: "ask:v10" }, { text: "🧾 V1.1: risk 1% a trade", callback_data: "ask:v11" }],
   [{ text: "⏸ Pause", callback_data: "ask:pause" }, { text: "▶ Resume", callback_data: "ask:resume" }],
@@ -5222,6 +5258,7 @@ async function tgAct(chat, what) {
   return "Unknown action.";
 }
 async function tgCallback(chat, data) {
+  if (data === "export") return tgExport(chat);
   const views = { status: tgStatus, positions: tgPositions, hot: tgHot, grads: tgGrads, why: tgWhy, strategy: tgStrategy, top: tgTop, sweet: tgSweet, vault: tgVault, report: mpReportText, goal: tgGoal, rhythm: tgRhythm, band: tgBand, court: tgCourt, signals: tgSignals, saved: tgSaved, plan: tgPlan, ledger: tgLedger, playbook: tgPlaybook, index: tgIndex };
   if (views[data]) return tgSend(chat, views[data](), TG_MENU);
   if (data === "alerts") { TG.alerts = !TG.alerts; CONN.tgAlerts = TG.alerts; saveConn(); return tgSend(chat, TG.alerts ? "🔔 Alerts are ON." : "🔕 Alerts are OFF.", TG_MENU); }
@@ -5248,6 +5285,7 @@ async function tgHandle(u) {
   }
   const cmd = text.split(/[\s@]/)[0].toLowerCase(), arg = text.split(/\s+/)[1] || "";
   const views = { "/status": tgStatus, "/positions": tgPositions, "/hot": tgHot, "/graduates": tgGrads, "/grads": tgGrads, "/why": tgWhy, "/strategy": tgStrategy, "/top": tgTop, "/sweet": tgSweet, "/vault": tgVault, "/report": mpReportText, "/goal": tgGoal, "/rhythm": tgRhythm, "/band": tgBand, "/court": tgCourt, "/signals": tgSignals, "/saved": tgSaved, "/plan": tgPlan, "/ledger": tgLedger, "/playbook": tgPlaybook, "/index": tgIndex };
+  if (cmd === "/export") return tgExport(chat);
   if (views[cmd]) return tgSend(chat, views[cmd](), TG_MENU);
   if (cmd === "/pause" || cmd === "/resume" || cmd === "/defense" || cmd === "/balanced" || cmd === "/offense" || cmd === "/fresh" || cmd === "/v10" || cmd === "/v11") return tgCallback(chat, "ask:" + cmd.slice(1));
   if (cmd === "/alerts") { TG.alerts = !/^off$/i.test(arg); CONN.tgAlerts = TG.alerts; saveConn(); return tgSend(chat, TG.alerts ? "🔔 Alerts are ON." : "🔕 Alerts are OFF.", TG_MENU); }
@@ -5263,7 +5301,7 @@ const TG_COMMANDS = [
   { command: "hot", description: "Hottest launches right now" }, { command: "graduates", description: "Recent graduations" },
   { command: "why", description: "Why it's winning or losing" }, { command: "strategy", description: "What the bot is doing" },
   { command: "top", description: "Top 100 trending" }, { command: "sweet", description: "Best-performing rules" },
-  { command: "vault", description: "Vault and savings" }, { command: "report", description: "24-hour report" }, { command: "goal", description: "Progress to the per-trade profit goal" }, { command: "rhythm", description: "Best and worst times of day" }, { command: "band", description: "Does buying at 25K and selling at 30K work?" }, { command: "court", description: "Strategy Court: is anything proven?" }, { command: "signals", description: "Signal Lab: what actually works" }, { command: "saved", description: "Is everything being saved?" }, { command: "plan", description: "The game plan and where we are" }, { command: "ledger", description: "Win/loss row for every token" }, { command: "playbook", description: "Patterns kept forever, and lessons" }, { command: "index", description: "Graduate Index: hold every graduate" }, { command: "fresh", description: "New paper account on the safe profile" }, { command: "v10", description: "Start the V1.0 test ($1,000 paper)" }, { command: "v11", description: "Start V1.1: risk 1% of the money per trade" }, { command: "pause", description: "Stop new trades" },
+  { command: "vault", description: "Vault and savings" }, { command: "report", description: "24-hour report" }, { command: "goal", description: "Progress to the per-trade profit goal" }, { command: "rhythm", description: "Best and worst times of day" }, { command: "band", description: "Does buying at 25K and selling at 30K work?" }, { command: "court", description: "Strategy Court: is anything proven?" }, { command: "signals", description: "Signal Lab: what actually works" }, { command: "saved", description: "Is everything being saved?" }, { command: "export", description: "Send me all my data as spreadsheets" }, { command: "plan", description: "The game plan and where we are" }, { command: "ledger", description: "Win/loss row for every token" }, { command: "playbook", description: "Patterns kept forever, and lessons" }, { command: "index", description: "Graduate Index: hold every graduate" }, { command: "fresh", description: "New paper account on the safe profile" }, { command: "v10", description: "Start the V1.0 test ($1,000 paper)" }, { command: "v11", description: "Start V1.1: risk 1% of the money per trade" }, { command: "pause", description: "Stop new trades" },
   { command: "resume", description: "Start trading again" }, { command: "defense", description: "Safer settings" },
   { command: "balanced", description: "Default settings" }, { command: "offense", description: "Bolder settings" },
   { command: "alerts", description: "Turn alerts on or off" }, { command: "scan", description: "Scan a token: /scan then the address" },
@@ -5339,6 +5377,35 @@ function tgTradeOpened(p) { tgBroadcast(`🟢 <b>BOUGHT ${tgEsc(p.symbol)}</b> �
 function tgTradeClosed(p, why, pnl) { tgBroadcast(`${pnl >= 0 ? "✅" : "🔴"} <b>SOLD ${tgEsc(p.symbol)}</b> ${tgMoney(pnl)}\n${tgEsc(why)}\n<code>${p.mint}</code>`); }
 function tgEvent(text) { if (/vault|paused|stopped|rug zone|sweet spot|moved|resumed|savings|started fresh|autopilot|ran out|playbook/i.test(text) && !/hit \+/.test(text)) tgBroadcast("ℹ️ " + tgEsc(text)); }
 function tgGraduated(mint) { const p = MP.positions.find((x) => x.mint === mint); if (p) tgBroadcast(`🎓 <b>${tgEsc(p.symbol)} just graduated</b> (we hold it)\n<code>${mint}</code>`); }
+
+/** Send a file to a chat. Telegram wants a multipart upload for files, not JSON. */
+async function tgSendDoc(chat, filename, text, caption) {
+  if (!CONN.tgToken) throw new Error("no token");
+  const fd = new FormData(); fd.append("chat_id", String(chat)); if (caption) fd.append("caption", String(caption).slice(0, 900));
+  fd.append("document", new Blob([text], { type: "text/csv" }), filename);
+  const r = await withTimeout(fetch(`https://api.telegram.org/bot${CONN.tgToken}/sendDocument`, { method: "POST", body: fd }), 60000, "sendDocument");
+  const j = await r.json().catch(() => ({})); if (!j.ok) throw new Error(j.description || "telegram " + r.status);
+  return j.result;
+}
+const TG_DOC_GAP = { ms: 900, last: 0 };                                          // Telegram allows about one message a second to a chat
+async function tgExport(chat) {
+  const now = Date.now();
+  if (now - TG_DOC_GAP.last < 60e3) return tgSend(chat, "📤 I just sent the files. Give it a minute and tap again.", TG_MENU);
+  TG_DOC_GAP.last = now;
+  const files = [["alkaid-launches.csv", launchCsv(), "Every judged launch: what it looked like at 90 seconds and how it ended"], ["alkaid-paths.csv", pathsCsv(), "The full price path of each one (every 15 seconds, up to 45 minutes)"],
+    ["alkaid-signals.csv", signalsCsv(), "Every momentum signal and how each exit style would have done"], ["alkaid-ledger.csv", ledCsv(), "A win/loss row for every token, with the bot's decision"], ["alkaid-trades.csv", tradesCsv(), "Every closed paper trade"]];
+  await tgSend(chat, `📤 Sending ${files.length} spreadsheets. This takes about ${Math.ceil((files.length * (TG_DOC_GAP.ms + 600)) / 1000)} seconds.`);
+  let sent = 0;
+  for (const [name, text, cap] of files) {
+    const rows = Math.max(0, text.split("\n").length - 1);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try { await tgSendDoc(chat, name, text, `${cap}\n${rows.toLocaleString()} rows`); sent++; break; }
+      catch (e) { const m = /retry after (\d+)/i.exec(e.message || ""); if (m && attempt === 0) { await new Promise((r) => setTimeout(r, (+m[1] + 1) * 1000)); continue; } await tgSend(chat, `⚠️ Couldn't send ${name}: ${tgEsc(e.message)}`); break; }
+    }
+    await new Promise((r) => setTimeout(r, TG_DOC_GAP.ms));
+  }
+  return tgSend(chat, `✅ Sent ${sent} of ${files.length}.\n\nTo get them to Claude: open each file, tap the share icon, choose <b>Save to Files</b>, then attach them in your chat with Claude.`, TG_MENU);
+}
 /*TG_END*/
 
 /*CONN_BEGIN*/
