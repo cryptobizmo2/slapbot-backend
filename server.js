@@ -92,7 +92,7 @@ const SOLANA_RPC_URL = CONN.rpcUrl || process.env.SOLANA_RPC_URL || "https://api
 const SLAPGOLD_MINT = process.env.SLAPGOLD_MINT; // e.g. 4R7Hbdhh3YeVqZaESRA3qPJ8Z3xh3Qedsw88RDjxL1Q9
 // The owner wallet. Set here (it's a public address, not a secret) so it can be changed with a normal upload,
 // without touching the server's settings file. It wins over the MY_WALLET setting.
-const BUILD_ID = "2026-10-30 · owner-only · V1.1 · ledger · playbook · graduate index · phone-sized file";            // shown on the dashboard and the health page: it tells you which version is running
+const BUILD_ID = "2026-10-30 · owner-only · V1.1 · ledger · playbook · graduate index · price floor";            // shown on the dashboard and the health page: it tells you which version is running
 const OWNER_WALLET = "4t3F4TvCsRCohYJ3EZ4B2ahaN2nN5kBE3A8WUVy2K1CF";
 const MY_WALLET = OWNER_WALLET || process.env.MY_WALLET;   // YOUR wallet address — the only one allowed in
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*"; // lock to your GitHub Pages URL once live
@@ -796,8 +796,9 @@ function curveMarket(c, solUsd, decimals = 6) {
   const supplyTokens = Number(c.supply) / 10 ** decimals;
   const progress = c.rTok >= INITIAL_REAL_TOKEN_RESERVES ? 0
     : 1 - Number((c.rTok * 10000n) / INITIAL_REAL_TOKEN_RESERVES) / 10000;
+  const vs = Number(c.vSol), rs = Number(c.rSol), floorRatio = vs > 0 ? Math.pow(Math.max(0, vs - rs) / vs, 2) : null;   // price can never fall below this fraction of today's price while the token is on its curve
   return {
-    priceSol, price: priceSol * solUsd,
+    priceSol, price: priceSol * solUsd, floorRatio,
     mcap: priceSol * solUsd * supplyTokens,
     liq: (Number(c.rSol) / 1e9) * solUsd,          // real SOL locked in the curve
     progress: Math.round(Math.min(1, Math.max(0, progress)) * 10000) / 100,
@@ -3608,6 +3609,7 @@ function mpReportText() {
   const rows = Object.entries(by).sort((a, b) => a[1].pnl - b[1].pnl).map(([k, r]) => `• ${k}: ${r.n} trades, ${r.w} won, ${money(r.pnl)}`); if (rows.length) lines.push("By way of entering:\n" + rows.join("\n"));
   lines.push(acts.length ? "🤖 Autopilot did:\n" + acts.slice(0, 5).map((x) => "• " + x.text).join("\n") : "🤖 Autopilot: nothing needed changing.");
   { const c = mpCourt(); lines.push(`🏛️ Court: <b>${c.overall.verdict}</b> · ${c.overall.n} trades (${MP.settings.courtMinTrades} needed) · ${c.overall.passed} of ${c.overall.gates.length} tests passed${c.proven.length ? " · proven: " + c.proven.join(", ") : ""}`); }
+  if (MP.feed.glitches) lines.push(`🛡 Impossible price readings caught and ignored since the last restart: ${MP.feed.glitches}`);
   try { const p = mpPlan(), pb = pbPublic(), gx = gxPublic(), led = ledPublic();
     lines.push(`🗺️ Plan: day ${p.day} of ${p.days} · ${p.gates.filter((g) => g.ok).length} of ${p.gates.length} gates met${p.verdict ? " · VERDICT " + p.verdict : ""}`);
     lines.push(`📘 Playbook: ${pb.kept.length} kept · ${pb.avoid.length} confirmed to avoid · ${pb.testing.length} being tested · 📒 ${led.n} tokens in the ledger (${led.skipped.wins} skipped winners)${gx.n ? ` · 🎓 Index: ${gx.n} graduates, ${gx.runners10} runners 10x+, line ${gx.ret >= 0 ? "+" : ""}${gx.ret}%` : ""}`); } catch {}
@@ -4138,6 +4140,7 @@ const PB_SEEDS = [
   ["lesson:chasing", "Chasing a spike", "A token already up 276% in 2 minutes was bought and stopped out inside a minute. The bot now skips anything up more than 100% in 2 minutes, and the Signal Lab keeps checking whether that cap is right."],
   ["lesson:no-edge-yet", "No edge has shown up yet", "Across 180+ paper trades in the runs so far (110, 55 and 17 in the three reported, plus a smaller one), no way of entering has had a positive average after costs. Nothing is proven, and real money stays locked until the Strategy Court says otherwise."],
   ["lesson:restarts", "Open trades used to vanish on a restart", "Before this fix, an upload restarted the server and any open trade disappeared with its money. Open trades are now saved and restored, and everything is flushed to disk on shutdown."],
+  ["lesson:impossible-prices", "A loss bigger than a thin token can physically produce", "Oct 30: a \"−15% stop\" booked a 62% loss on a token at a $6.5K market cap. Such a token can fall at most about 35% (its curve has a floor), so the price used was wrong, and it also triggered the 3% daily stop. Fixed: a token bought on its curve now records its own floor and ignores any reading below it, and a failed chain read no longer switches the bot to a different, slower price source."],
   ["lesson:one-bad-print", "One bad price can cost a whole trade", "A graduate was booked at −99% on a −12% stop (bad data or a real crash). A one-step drop of 35% or more is now re-checked 1.5 seconds later before the bot acts."],
 ];
 function pbSeed() { for (const [id, title, text] of PB_SEEDS) if (!pbFind(id)) { const it = { id, kind: "lesson", status: "learned", title, text, at: Date.now(), log: [] }; PB.items.push(it); } }
@@ -4201,7 +4204,7 @@ function tgPlaybook() {
   const p = pbPublic(), L = (t) => t.replace(/[<>&]/g, "");
   return `📘 <b>Playbook</b> (kept forever)\n✅ Confirmed winners: ${p.kept.length}${p.kept.length ? "\n" + p.kept.map((x) => "• " + L(x.title)).join("\n") : ""}\n🚫 Confirmed to avoid: ${p.avoid.length}${p.avoid.length ? "\n" + p.avoid.map((x) => "• " + L(x.title)).join("\n") : ""}\n` +
     `🧪 Being tested on new data: ${p.testing.length}${p.testing.length ? "\n" + p.testing.slice(0, 6).map((x) => `• ${L(x.title)} (${x.live ? x.live.n : 0} of ${p.need} new signals)`).join("\n") : ""}\n🗑 Retired (turned out to be luck or stopped working): ${p.retired.length}\n\n` +
-    `📕 Lessons so far:\n` + p.lessons.slice(0, 8).map((x) => "• " + L(x.title)).join("\n") + `\n\nA pattern is only kept if it still works on signals that arrived after it was found.`;
+    `📕 Lessons so far:\n` + p.lessons.slice(0, 12).map((x) => "• " + L(x.title)).join("\n") + `\n\nA pattern is only kept if it still works on signals that arrived after it was found.`;
 }
 setInterval(() => { try { pbUpdate(); } catch (e) { log("error", `playbook: ${e.message}`); } }, 10 * 60e3);
 setTimeout(() => { try { pbSeed(); pbUpdate(); } catch {} }, 25000);
@@ -4610,7 +4613,7 @@ function mpOpen(ev, m, info) {
   const pos = { mint: ev.mint, symbol: ev.symbol, name: ev.name, creator: ev.creator, entry, entrySol: sol, tokens, sizeUsd, costUsd,
                 costSol: costUsd / sol, openedAt: Date.now(), progressAtBuy: m.progress, high: entry, last: entry, devPct, top10, top1,
                 tokensLeft: tokens, realizedUsd: 0, phase: "full", boosts, devCheckedAt: 0, entryType: info.entryType || (info.momentum ? "momentum" : "at 90s"), mcapAtBuy: Math.round(m.mcap || 0),
-                impactPct: +impact.toFixed(2), stopPct: (info.rules && info.rules.slPct) || S.slPct, ...(info.rules ? { rules: info.rules } : {}), ...(info.extra || {}) };
+                impactPct: +impact.toFixed(2), curveFloorSol: m.priceSol > 0 && m.floorRatio > 0.02 && m.floorRatio <= 1 && m.progress < 100 ? m.priceSol * m.floorRatio : 0, stopPct: (info.rules && info.rules.slPct) || S.slPct, ...(info.rules ? { rules: info.rules } : {}), ...(info.extra || {}) };
   MP.positions.push(pos); ledNote(pos.mint, "bought · " + pos.entryType); mpSaveNow();                                       // a trade is on disk the moment it opens
   if (typeof expOpen === "function") expOpen(pos);
   if (typeof tgTradeOpened === "function") tgTradeOpened(pos);
@@ -4753,8 +4756,17 @@ async function mpManageInner() {
     let price = null, graduated = false;
     try {
       const c = await readBondingCurve(p.mint);
-      if (!c) { const dx = await mpDexPrice(p.mint); if (dx) { price = dx.price; p.mcapNow = dx.mcap; p.postGrad = true; } }   // never on a bonding curve: follow its pool
-      else if (c && !c.complete) { const m = curveMarket(c, sol, 6); price = m.price; p.mcapNow = m.mcap; }
+      if (!c) {
+        if (p.curveFloorSol > 0 && !p.postGrad) {                         // bought on the curve: a failed chain read is NOT a reason to trust a different (slower, sometimes wrong) price source
+          p.nullReads = (p.nullReads || 0) + 1;
+          if (p.nullReads < 12) continue;                                  // wait for the next read; only after ~2 minutes of failures fall back to the pool price
+        }
+        const dx = await mpDexPrice(p.mint); if (dx) { price = dx.price; p.mcapNow = dx.mcap; p.postGrad = true; }   // never on a bonding curve: follow its pool
+      }
+      else if (c && !c.complete) {
+        const m = curveMarket(c, sol, 6); price = m.price; p.mcapNow = m.mcap; p.nullReads = 0;
+        if (p.curveFloorSol > 0 && m.priceSol < p.curveFloorSol * 0.95) { MP.feed.glitches = (MP.feed.glitches || 0) + 1; p.glitchAt = Date.now(); continue; }   // below the lowest price this curve can ever reach: not a real price, ignore it
+      }
       else if (c && c.complete) {
         const dx = await mpDexPrice(p.mint);                              // graduated: keep following it on the trading pool
         if (dx) { price = dx.price; p.mcapNow = dx.mcap; p.postGrad = true; }
