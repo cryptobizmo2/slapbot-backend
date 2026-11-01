@@ -92,7 +92,7 @@ const SOLANA_RPC_URL = CONN.rpcUrl || process.env.SOLANA_RPC_URL || "https://api
 const SLAPGOLD_MINT = process.env.SLAPGOLD_MINT; // e.g. 4R7Hbdhh3YeVqZaESRA3qPJ8Z3xh3Qedsw88RDjxL1Q9
 // The owner wallet. Set here (it's a public address, not a secret) so it can be changed with a normal upload,
 // without touching the server's settings file. It wins over the MY_WALLET setting.
-const BUILD_ID = "2026-10-31 · owner-only · V1.1 · price floor · stop survives restarts · data export";            // shown on the dashboard and the health page: it tells you which version is running
+const BUILD_ID = "2026-11-01 · FUFLOPBOT · V1.1 · rug guard: holders from the feed · standard curves · worst-case sizing · 7-day index paths";            // shown on the dashboard and the health page: it tells you which version is running
 const OWNER_WALLET = "4t3F4TvCsRCohYJ3EZ4B2ahaN2nN5kBE3A8WUVy2K1CF";
 const MY_WALLET = OWNER_WALLET || process.env.MY_WALLET;   // YOUR wallet address — the only one allowed in
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*"; // lock to your GitHub Pages URL once live
@@ -270,9 +270,11 @@ async function gtFetch(url, prio = "user") {
 const mintCache = new Map();
 const MINT_TTL = 5 * 60 * 1000;
 
-async function getMintCheck(address) {
+/** An RPC error message, safe to show anywhere: RPC addresses (which can carry an API key) are removed. */
+function rpcErrSafe(e) { return String((e && e.message) || e || "").replace(/https?:\/\/[^\s"'<>)]+/gi, "[rpc address hidden]").replace(/(api[-_]?key|token|secret)=([^\s&"']+)/gi, "$1=[hidden]").slice(0, 160); }
+async function getMintCheck(address, opts = {}) {
   const cached = mintCache.get(address);
-  if (cached && Date.now() - cached.ts < MINT_TTL) return cached.data;
+  if (cached && Date.now() - cached.ts < MINT_TTL && (opts.holders === false || cached.data.holdersTried)) return cached.data;
   try {
     const mintPubkey = new PublicKey(address);
     const info = await withTimeout(connection.getParsedAccountInfo(mintPubkey), 6000, "getParsedAccountInfo");
@@ -295,7 +297,7 @@ async function getMintCheck(address) {
     // the Ed25519 curve; program-derived addresses are deliberately off it —
     // that is exactly how Solana tells the two apart.
     let top10Pct = null, top10WalletPct = null, top1WalletPct = null; const topOwners = [];
-    try {
+    if (opts.holders !== false) try {                       // skipped when the live feed already counted the holders exactly
       const largest = await withTimeout(connection.getTokenLargestAccounts(mintPubkey), 5000, "getTokenLargestAccounts");
       const top = largest.value.slice(0, 20);
       const top10Sum = top.slice(0, 10).reduce((s, acc) => s + (acc.uiAmount || 0), 0);
@@ -317,6 +319,7 @@ async function getMintCheck(address) {
       }
     } catch (e) {
       log("error", `getTokenLargestAccounts failed for ${address}: ${e.message}`);
+      if (typeof HOLDDIAG !== "undefined") { HOLDDIAG.rpcFails++; HOLDDIAG.rpcErr = rpcErrSafe(e); HOLDDIAG.rpcErrAt = Date.now(); }
     }
 
     const result = {
@@ -329,7 +332,7 @@ async function getMintCheck(address) {
       decimals: parsed.decimals,
       top10HolderPct: top10Pct !== null ? parseFloat(top10Pct.toFixed(2)) : null,
       top10WalletPct: top10WalletPct !== null ? parseFloat(top10WalletPct.toFixed(2)) : null,
-      top1WalletPct: top1WalletPct !== null ? parseFloat(top1WalletPct.toFixed(2)) : null, topOwners,
+      top1WalletPct: top1WalletPct !== null ? parseFloat(top1WalletPct.toFixed(2)) : null, topOwners, holdersTried: opts.holders !== false,
       criticalHoneypot: !!freezeAuthority,
     };
 
@@ -2586,6 +2589,7 @@ app.get("/api/risk/:chain/:address", async (req, res) => {
  */
 /** Every store registers a saver here. flushAll() runs them all: on a schedule, and the instant the server is told to shut down (an upload restarts it). */
 const FLUSHERS = [];
+const TG_NAME = "FUFLOPBOT";                                                   // the sniper bot's name in Telegram (the scanner website stays SLAPBOT)
 const regFlush = (fn) => { FLUSHERS.push(fn); return fn; };
 function flushAll() { let n = 0; for (const f of FLUSHERS) { try { f(); n++; } catch {} } return n; }
 const PROVEN_V2 = { slots: 4, fastLane: 0, momentum: 1, momBuyers60: 10, momBuyShare: 65, momNetSol: 3, momRise2m: 20, momMaxRise2m: 100, momMaxMcap: 30000,
@@ -2605,7 +2609,7 @@ const V10 = { startUsd: 1000, slots: 0, autoSlots: 0, riskPct: 1, maxBetPct: 2, 
   minProgress: 8, maxTop10Pct: 30, maxTop1Pct: 10, maxDevPct: 5, gradOn: 1, gradWindowMin: 15, gradMinLiq: 25000, gradMinLiqPct: 5, gradMinVol24: 50000, gradMaxCh5: 25, gradMaxImpact: 3, gradMaxOpen: 3,
   labFilter: 1, labMinLift: 1.2, copyOn: 0, gridOn: 0, learn: 1, cfgVersion: 3 };
 /** V1.1 = V1.0 with FIXED-RISK sizing: risk 1% of all the money per trade, sized from the stop distance (the professional rule). */
-const V11 = { ...V10, sizeByRisk: 1, riskPerTradePct: 1, maxBetPct: 10, riskPct: 1 };
+const V11 = { ...V10, sizeByRisk: 1, riskPerTradePct: 1, maxBetPct: 10, riskPct: 1, sizeByWorst: 1, gradWorstPct: 100 };
 const MP = {
   on: !/^(0|off|false)$/i.test(String(process.env.MP_ON || "1")),
   settings: {
@@ -2699,6 +2703,8 @@ const MP = {
     maxDevPct: 8,         // creator may hold at most this % of supply
     maxTop10Pct: 35,      // top 10 real wallets (curve excluded) may hold at most this %
     maxTop1Pct: 12,       // biggest single real wallet
+    sizeByWorst: 1,       // size each trade by its WORST case (the curve floor, or a full loss on a pool token), not just the stop
+    gradWorstPct: 100,    // the worst case assumed for pool tokens (graduates): liquidity can be pulled
     tpPct: 100,           // take profit at +100%
     slPct: 30,            // stop loss at −30%
     maxHoldMin: 30,       // sell after 30 minutes no matter what
@@ -2778,12 +2784,13 @@ function mpLearned(closed, minN) {
     verdict: s.n < minN ? "learning" : s.sum / s.n < -10 ? "skip" : s.sum / s.n > 10 ? "favor" : "neutral" })).sort((a, b) => b.trades - a.trades);
 }
 /** Pure: how big the next snipe is. With slots, all the money (cash + what's in trades) is split evenly. */
-function mpBetSize(bank, S, openPositions, mult = 1, pctOverride = null, sol = 150, stopPct = null) {
+function mpBetSize(bank, S, openPositions, mult = 1, pctOverride = null, sol = 150, stopPct = null, worstPct = null) {
   let size;
   if (S.sizeByRisk && stopPct > 0 && pctOverride == null) {
     // FIXED-RISK: if the stop hits, you lose riskPerTradePct of ALL the money (cash + vault + what is in trades), costs included. position = risk / (stop distance + costs)
     const all = bank.cash + bank.vault + openPositions.reduce((a, p) => a + (p.costUsd || 0), 0);
-    const lossFrac = (stopPct + 2 * (S.feePct + S.slippagePct)) / 100;       // the REAL loss at the stop: the stop distance plus fees and slippage on the way in and out
+    let lossFrac = (stopPct + 2 * (S.feePct + S.slippagePct)) / 100;         // the REAL loss at the stop: the stop distance plus fees and slippage on the way in and out
+    if (S.sizeByWorst && worstPct > 0) lossFrac = Math.max(lossFrac, Math.min(100, worstPct) / 100);   // a stop does not limit a rug: size by the WORST case
     size = ((all * S.riskPerTradePct) / 100 / lossFrac) * mult;
   } else if (S.slots > 0 && pctOverride == null) {
     // each slot gets an equal share of ALL the money, and the bet is sized so fees + tips fit inside that share
@@ -3606,7 +3613,7 @@ function mpReportText() {
   const by = {}; for (const x of T) { const k = mpEntryType(x), r = by[k] || (by[k] = { n: 0, pnl: 0, w: 0 }); r.n++; r.pnl += x.pnlUsd; if (x.pnlUsd > 0) r.w++; }
   const money = (n) => (n < 0 ? "−$" : "+$") + Math.abs(n).toFixed(2);
   const acts = A.log.filter((x) => now - x.at <= 24 * 3600e3);
-  const lines = [`📰 <b>ALKAID · last 24 hours</b>`,
+  const lines = [`📰 <b>${TG_NAME} · last 24 hours</b>`,
     `Account <b>$${eq.toFixed(2)}</b> (started $${B.start.toFixed(2)}, ${eq >= B.start ? "+" : ""}${(((eq / B.start) - 1) * 100).toFixed(1)}%) · best so far $${(A.eqPeak || eq).toFixed(2)} · now ${A.dd || 0}% below it`,
     T.length ? `Trades <b>${T.length}</b> · ${W.length} won (${Math.round((W.length / T.length) * 100)}%) · <b>${money(pnl)}</b>` : `No trades closed in the last 24 hours.`];
   const rows = Object.entries(by).sort((a, b) => a[1].pnl - b[1].pnl).map(([k, r]) => `• ${k}: ${r.n} trades, ${r.w} won, ${money(r.pnl)}`); if (rows.length) lines.push("By way of entering:\n" + rows.join("\n"));
@@ -4028,11 +4035,19 @@ function storageStatus() {
   const acct = files[0];
   return { persistent: !!VOLUME_DIR, healthy: !!VOLUME_DIR && acct.ago != null && acct.ago < 180, openTrades: MP.positions.length, closedTrades: MP.closed.length, signals: SIG.list.length, files, savers: FLUSHERS.length };
 }
+function tgDataHealth() {
+  const H = typeof HOLDDIAG !== "undefined" ? HOLDDIAG : null, C = typeof CURVEDIAG !== "undefined" ? CURVEDIAG : null;
+  const lines = ["🧪 <b>Data health</b>"];
+  if (H) lines.push(`Holders measured: ${H.feed} from the live feed, ${H.rpc} from the chain check · ${H.none} unmeasured, so skipped (never bought blind)`);
+  if (H && H.rpcFails) lines.push(`The chain's holder call failed ${H.rpcFails} times${H.rpcErr ? " (last: " + tgEsc(H.rpcErr.slice(0, 80)) + ")" : ""}`);
+  if (C) lines.push(`Curves: ${C.std} standard · ${C.nonStd} non-standard, skipped${C.tripped ? " · ⚠️ SAFETY SWITCH ON: the check is paused" : ""}`);
+  return lines.join("\n");
+}
 function tgSaved() {
   const g = storageStatus(), ago = (s) => (s == null ? "not yet" : s < 90 ? s + " s ago" : Math.round(s / 60) + " min ago"), kb = (b) => (b > 1e6 ? (b / 1e6).toFixed(1) + " MB" : Math.max(1, Math.round(b / 1000)) + " KB");
   if (!g.persistent) return "💾 <b>NOT SAVING.</b> This server has no data folder set, so everything is lost whenever it restarts. Tell me and I will fix it.";
   return `💾 <b>${g.healthy ? "Saving ✅" : "Saving, but the account file looks old ⚠️"}</b>\nOpen trades kept: ${g.openTrades} · closed trades: ${g.closedTrades} · signals: ${g.signals}\n\n` + g.files.map((f) => `${f.ago != null && f.ago < 900 ? "✅" : f.bytes ? "🟡" : "⚪"} ${f.name}: ${f.bytes ? kb(f.bytes) + ", saved " + ago(f.ago) : "nothing yet"}`).join("\n") +
-    "\n\nEverything is also saved the instant the server shuts down, so an upload does not lose anything, and open trades come back after a restart.";
+    "\n\n" + tgDataHealth() + "\n\nEverything is also saved the instant the server shuts down, so an upload does not lose anything, and open trades come back after a restart.";
 }
 /*STORE_END*/
 
@@ -4061,7 +4076,7 @@ function ledAdd(path) {
   const tr = LED.trades.get(path.mint);
   const row = { m: path.mint, s: snap ? snap.sym : "?", at: path.at, mc: Math.round(path.mcap0 || (snap && snap.mcap) || 0), pr: snap ? snap.progress : null, d: LED.notes.get(path.mint) || null,
     took: tr ? 1 : 0, pnl: tr ? tr.pct : null, why: tr ? tr.why : null, lane: tr ? tr.lane : null, rp, pk: +Math.max(...pts).toFixed(2), en: +pts[pts.length - 1].toFixed(2), gr: path.grad || (snap && snap.grad) ? 1 : 0,
-    f: snap ? { t10: snap.top10, dv: snap.devPct, d24: snap.dev24, sc: snap.social, h: snap.hour, nl: snap.nameLen, fb: snap.fBuyers, fn: snap.fNet } : null };
+    f: snap ? { t10: snap.top10, dv: snap.devPct, d24: snap.dev24, sc: snap.social, h: snap.hour, nl: snap.nameLen, fb: snap.fBuyers, fn: snap.fNet, t1: snap.top1, sn: snap.snipe, hd: snap.holders, db: snap.devBuy, hs: snap.hsrc } : null };
   row.basis = tr ? "trade" : "replay"; row.res = ledResult(row);
   LED.rows.push(row); LED.idx.set(row.m, row);
   if (LED.rows.length > 25000) { const old = LED.rows.shift(); LED.idx.delete(old.m); }
@@ -4102,10 +4117,10 @@ function ledPublic() {
 function ledCsv() {
   const q = (v) => (v == null ? "" : /[",\n]/.test(String(v)) ? '"' + String(v).replace(/"/g, '""') + '"' : String(v));
   const head = ["mint", "symbol", "found_utc", "mcap_when_found", "bonded_pct", "decision", "bought", "result", "result_based_on", "net_pct_if_traded", "exit_reason", "lane", "replay_net_pct_if_bought", "peak_x", "end_x_45min", "graduated",
-    "top10_pct", "creator_pct", "creator_launches_today", "social_links", "hour_utc", "name_len", "buyers_90s", "net_sol_90s"];
+    "top10_pct", "creator_pct", "creator_launches_today", "social_links", "hour_utc", "name_len", "buyers_90s", "net_sol_90s", "top1_pct", "sniper_pct", "holders", "creator_first_buy_sol", "holder_source"];
   const lines = [head.join(",")];
   for (const r of LED.rows) { const f = r.f || {};
-    lines.push([r.m, r.s, new Date(r.at).toISOString(), r.mc, r.pr, r.d, r.took ? "yes" : "no", r.res, r.basis, r.pnl, r.why, r.lane, r.rp, r.pk, r.en, r.gr ? "yes" : "no", f.t10, f.dv, f.d24, f.sc, f.h, f.nl, f.fb, f.fn].map(q).join(",")); }
+    lines.push([r.m, r.s, new Date(r.at).toISOString(), r.mc, r.pr, r.d, r.took ? "yes" : "no", r.res, r.basis, r.pnl, r.why, r.lane, r.rp, r.pk, r.en, r.gr ? "yes" : "no", f.t10, f.dv, f.d24, f.sc, f.h, f.nl, f.fb, f.fn, f.t1, f.sn, f.hd, f.db, f.hs].map(q).join(",")); }
   return lines.join("\n");
 }
 function tgLedger() {
@@ -4143,11 +4158,23 @@ const PB_SEEDS = [
   ["lesson:chasing", "Chasing a spike", "A token already up 276% in 2 minutes was bought and stopped out inside a minute. The bot now skips anything up more than 100% in 2 minutes, and the Signal Lab keeps checking whether that cap is right."],
   ["lesson:no-edge-yet", "No edge has shown up yet", "Across 180+ paper trades in the runs so far (110, 55 and 17 in the three reported, plus a smaller one), no way of entering has had a positive average after costs. Nothing is proven, and real money stays locked until the Strategy Court says otherwise."],
   ["lesson:restarts", "Open trades used to vanish on a restart", "Before this fix, an upload restarted the server and any open trade disappeared with its money. Open trades are now saved and restored, and everything is flushed to disk on shutdown."],
-  ["lesson:impossible-prices", "A loss bigger than a thin token can physically produce", "Oct 30: a \"−15% stop\" booked a 62% loss on a token at a $6.5K market cap. Such a token can fall at most about 35% (its curve has a floor), so the price used was wrong, and it also triggered the 3% daily stop. Fixed: a token bought on its curve now records its own floor and ignores any reading below it, and a failed chain read no longer switches the bot to a different, slower price source."],
+  ["lesson:impossible-prices", "CORRECTED: OBELIS's −61% was real, not a bad price", "Oct 30: OBELIS lost 61% on a −15% stop. It was first called impossible, but that check used the wrong SOL price. Corrected Oct 31 from the exported data: it was bought at 49% bonded, where the curve's floor allowed a fall of about 62% with costs, and it fell all the way to the floor (a rug). Lesson: the higher the % bonded at the buy, the bigger the worst case, and a stop does not cap it. All 36 curve trades checked: none lost more than the curve allows."],
   ["lesson:restart-wiped-stop", "A restart used to cancel the daily stop", "Oct 30: the daily stop (3%) was active until 7 PM, but an upload restarted the server at about 6:50 PM and a leftover startup rule wiped the stop, so the bot bought 2 minutes later. Fixed: a daily stop that is still running now survives restarts. Only an expired one is cleared."],
-  ["lesson:one-bad-print", "One bad price can cost a whole trade", "A graduate was booked at −99% on a −12% stop (bad data or a real crash). A one-step drop of 35% or more is now re-checked 1.5 seconds later before the bot acts."],
+  ["lesson:one-bad-print", "Pool tokens can lose nearly everything in seconds", "4 of the first 44 graduate trades crashed 67% to 98% straight through a −12% stop: liquidity pulled or a dump between two price checks. These were real losses, not bad data. A one-step drop of 35% or more is still re-checked 1.5 seconds later before acting, and graduates are now sized as if they could lose everything."],
+  ["lesson:holders-never-checked", "The holder limits were never applied", "Oct 31: the top-10 and top-1 wallet limits never ran. The chain call behind them failed silently on every token, and the filter read \"unknown\" as a pass: 0 of 80 trades and 0 of 4,158 judged launches had holder data. Fixed: holders are now counted exactly from the live trade feed (plus snipers in the first 2 seconds and the creator's first buy), and a token whose holders cannot be measured is skipped, never bought blind."],
+  ["lesson:non-standard-curves", "1 in 5 tokens did not follow the standard curve", "Oct 31: about 19% of recorded tokens had a market cap that cannot match their curve (one showed $1 at 84% bonded). The bot's curve math does not apply to them, so they are now skipped and kept out of the Lab, the paths and the ledger. If most launches ever look non-standard, a safety switch pauses the check instead of skipping everything."],
+  ["lesson:size-by-worst-case", "A stop does not limit a rug: size by the worst case", "Oct 31, from the first 80 trades: 9 crash trades (lost 41–98% each) made the whole loss (−$330 of −$325); the other 71 trades made +$5. Re-sized by their worst case, the same trades would have lost $96–$226 instead. Now each trade is sized so its worst case (the curve floor, or a full loss on a pool token) costs about 1% of the money."],
 ];
-function pbSeed() { for (const [id, title, text] of PB_SEEDS) if (!pbFind(id)) { const it = { id, kind: "lesson", status: "learned", title, text, at: Date.now(), log: [] }; PB.items.push(it); } }
+function pbSeed() {
+  for (const [id, title, text] of PB_SEEDS) {
+    const old = pbFind(id);
+    if (!old) PB.items.push({ id, kind: "lesson", status: "learned", title, text, at: Date.now(), log: [] });
+    else if (old.kind === "lesson" && (old.title !== title || old.text !== text)) {     // a lesson that was wrong gets corrected in place, and the old title stays in its history
+      (old.log || (old.log = [])).push({ at: Date.now(), note: "corrected; it used to say: " + String(old.title).slice(0, 120) });
+      old.title = title; old.text = text;
+    }
+  }
+}
 function pbLive(it, res, since) {
   const items = res.filter((x) => x.at > since && x[it.dim] != null && (it.a == null || x[it.dim] >= it.a) && (it.b == null || x[it.dim] < it.b));
   const st = sigStat("live", items);
@@ -4234,7 +4261,7 @@ regFlush(gxSave); setInterval(gxSave, 5 * 60e3);
 function gxPending(mint) { if (!mint || GX.by.has(mint) || GX.pending.has(mint)) return; GX.pending.set(mint, { at: Date.now(), nx: Date.now() + 20e3 }); if (GX.pending.size > 400) GX.pending.delete(GX.pending.keys().next().value); }
 function gxAdd(mint, d, now = Date.now()) {
   if (GX.by.has(mint) || !(d && d.price > 0) || d.liq < GX_MIN_LIQ) return null;
-  const r = { m: mint, s: symOf(mint), t0: now, p0: d.price, mc0: Math.round(d.mcap), l0: Math.round(d.liq), pk: d.price, cf: d.price, last: d.price, lastAt: now, mcL: Math.round(d.mcap), lqL: Math.round(d.liq), n: 1, nx: now + 10 * 60e3, miss: 0, done: false, dead: false, h: new Date(now).getUTCHours() };
+  const r = { m: mint, s: symOf(mint), t0: now, p0: d.price, mc0: Math.round(d.mcap), l0: Math.round(d.liq), pk: d.price, cf: d.price, last: d.price, lastAt: now, mcL: Math.round(d.mcap), lqL: Math.round(d.liq), n: 1, nx: now + 10 * 60e3, miss: 0, done: false, sr: [[0, 1]], dead: false, h: new Date(now).getUTCHours() };
   GX.list.push(r); GX.by.set(mint, r); if (GX.list.length > 6000) { const o = GX.list.shift(); GX.by.delete(o.m); }
   return r;
 }
@@ -4243,6 +4270,7 @@ function gxUpdate(r, d, now = Date.now()) {
   r.miss = 0; const prev = r.last; r.last = d.price; r.lastAt = now; r.mcL = Math.round(d.mcap); r.lqL = Math.round(d.liq); r.n++;
   r.pk = Math.max(r.pk, d.price); r.cf = Math.max(r.cf, Math.min(prev, d.price));                       // cf = highest level seen on TWO readings in a row
   const age = now - r.t0; r.nx = now + (age < 6 * 3600e3 ? 10 * 60e3 : age < 48 * 3600e3 ? 3600e3 : 6 * 3600e3);
+  (r.sr || (r.sr = [[0, 1]])).push([Math.round(age / 60000), +(d.price / r.p0).toPrecision(4)]); if (r.sr.length > 200) r.sr.splice(1, r.sr.length - 200);   // the price path, for testing hold and dip-buy over days
   if (r.last / r.p0 < 0.01) r.dead = true;
   if (age >= GX_DAYS * 86400e3) r.done = true;
 }
@@ -4337,13 +4365,14 @@ const csvQ = (v) => (v == null ? "" : /[",\n]/.test(String(v)) ? '"' + String(v)
 function launchCsv() {
   const pm = new Map(PATHS.list.map((p) => [p.mint, p]));
   const head = ["mint", "symbol", "name", "launched_utc", "bonded_pct_90s", "mcap_90s", "top10_pct", "top1_pct", "creator_pct", "creator_launches_today",
-    "creator_past_graduates", "social_links", "hour_utc", "name_len", "emoji", "graduated", "trended", "peak_mcap", "winner", "lab_score_x", "path_peak_x", "path_low_x", "path_minutes"];
+    "creator_past_graduates", "social_links", "hour_utc", "name_len", "emoji", "graduated", "trended", "peak_mcap", "winner", "lab_score_x", "path_peak_x", "path_low_x", "path_minutes",
+    "sniper_pct", "snipers", "holders", "creator_first_buy_sol", "biggest_buy_sol", "holder_source", "holder_coverage"];
   const lines = [head.join(",")];
   for (const s of LAB.snaps) {
     const p = pm.get(s.mint), pts = p ? p.pts : null;
     lines.push([s.mint, s.sym, s.name, new Date(s.at).toISOString(), s.progress, s.mcap, s.top10, s.top1, s.devPct, s.dev24, s.devG, s.social, s.hour, s.nameLen, s.emoji,
       s.grad ? 1 : 0, s.trended ? 1 : 0, s.peak, s.win ? 1 : s.done ? 0 : "", labLift(s).toFixed(2), pts ? Math.max(...pts).toFixed(3) : "", pts ? Math.min(...pts).toFixed(3) : "",
-      pts ? ((pts.length - 1) * PATH_STEP / 60000).toFixed(1) : ""].map(csvQ).join(","));
+      pts ? ((pts.length - 1) * PATH_STEP / 60000).toFixed(1) : "", s.snipe, s.snipers, s.holders, s.devBuy, s.maxBuy, s.hsrc, s.hcov].map(csvQ).join(","));
   }
   return lines.join("\n");
 }
@@ -4364,6 +4393,13 @@ function tradesCsv() {
   const lines = ["symbol,mint,lane,opened_utc,closed_utc,minutes_held,size_usd,pnl_usd,pnl_pct,r_multiple,exit_reason,mcap_at_buy,bonded_pct_at_buy,top10_pct,top1_pct,creator_pct,stop_pct,price_impact_pct"];
   for (const c of MP.closed) lines.push([c.symbol, c.mint, c.entryType || (c.fast ? "launch shot" : "at 90s"), c.openedAt ? new Date(c.openedAt).toISOString() : "", c.closedAt ? new Date(c.closedAt).toISOString() : "",
     c.openedAt && c.closedAt ? ((c.closedAt - c.openedAt) / 60000).toFixed(1) : "", c.sizeUsd, c.pnlUsd, c.pnlPct, c.rMult, c.why, c.mcapAtBuy, c.progressAtBuy, c.top10, c.top1, c.devPct, c.stopPct, c.impactPct].map(csvQ).join(","));
+  return lines.join("\n");
+}
+/** Every graduate the Index follows: its price path for up to 7 days (minutes since found : multiple of the found price). */
+function gxCsv() {
+  const lines = ["mint,symbol,found_utc,found_mcap,found_liquidity,peak_x,last_x,days_followed,dead,points_minutes_x"];
+  for (const r of GX.list) lines.push([r.m, r.s, new Date(r.t0).toISOString(), r.mc0, r.l0, (r.pk / r.p0).toFixed(3), (r.last / r.p0).toFixed(3), (((r.lastAt || r.t0) - r.t0) / 86400e3).toFixed(2), r.dead ? 1 : 0,
+    (r.sr || [[0, 1]]).map(([mn, x]) => mn + ":" + x).join(" ")].map(csvQ).join(","));
   return lines.join("\n");
 }
 /*EXPORT_END*/
@@ -4440,6 +4476,17 @@ function mpOnTrade(tr) {
   if (held) mpInstant(held, tr);
   const f = FLOW.get(tr.mint); if (!f) return;
   const t = Date.now(); if (t - f.t0 > 20 * 60e3) { FLOW.delete(tr.mint); return; }
+  if (tr.tokens > 0 && tr.user) {                                     // who holds what, from the very first trade (exact; no chain calls)
+    const h = f.hold || (f.hold = new Map()), cur = h.get(tr.user) || 0, next = tr.isBuy ? cur + tr.tokens : Math.max(0, cur - tr.tokens);
+    if (next > 1e-6) h.set(tr.user, next); else h.delete(tr.user);
+    if (h.size > 5000) h.delete(h.keys().next().value);
+    if (f.ts0 == null && Number.isFinite(tr.ts)) f.ts0 = tr.ts;      // the chain's clock at the first trade (the creator's own buy)
+    if (tr.isBuy) {
+      if (f.creator && tr.user === f.creator) f.devBuy = (f.devBuy || 0) + tr.sol;
+      else if (f.ts0 != null && Number.isFinite(tr.ts) && tr.ts - f.ts0 <= 2) { f.early = (f.early || 0) + tr.tokens; (f.earlyU || (f.earlyU = new Set())).add(tr.user); }   // snipers / bundles: bought within 2 seconds of launch
+      f.maxBuy = Math.max(f.maxBuy || 0, tr.sol);
+    }
+  }
   if (f.trades.length < 1500) f.trades.push({ t, b: tr.isBuy, sol: tr.sol, u: tr.user, p: tr.priceSol });
   if (tr.isBuy && f.buyers.size < 2000) f.buyers.add(tr.user);
   MP.feed.trades = (MP.feed.trades || 0) + 1;
@@ -4448,6 +4495,43 @@ function mpOnTrade(tr) {
     const mc = tr.priceSol * 1e9 * sol, prev = f.lastMc; f.lastMc = mc;
     if (prev != null && prev < S.bandBuyK * 1000 && mc >= S.bandBuyK * 1000 && mc <= S.bandSellK * 1000 * 0.97 && !f.bandTried) { f.bandTried = true; mpBandBuy(tr.mint).catch(() => {}); }
   }
+}
+/** Pure: holder numbers from the live feed, as % of the 1B supply. ok = the feed saw (almost) every token the curve sold, so the numbers are complete. */
+const PUMP_SUPPLY = 1e9;
+function holdStats(f, soldTokens = null) {
+  if (!f || !f.hold) return null;
+  const v = [...f.hold.values()].sort((a, b) => b - a), held = v.reduce((a, x) => a + x, 0), pct = (x) => +((x / PUMP_SUPPLY) * 100).toFixed(2);
+  const cov = soldTokens > 0 ? held / soldTokens : null;
+  return { top1: pct(v[0] || 0), top10: pct(v.slice(0, 10).reduce((a, x) => a + x, 0)), devPct: f.creator ? pct(f.hold.get(f.creator) || 0) : null,
+    holders: v.length, sniperPct: pct(f.early || 0), snipers: f.earlyU ? f.earlyU.size : 0, devBuySol: +(f.devBuy || 0).toFixed(3), maxBuySol: +(f.maxBuy || 0).toFixed(3),
+    cov: cov == null ? null : +cov.toFixed(3), ok: soldTokens === 0 ? true : cov != null && cov >= 0.9 && cov <= 1.1 };
+}
+/**
+ * STANDARD CURVE CHECK. Every standard pump.fun curve keeps three fixed relationships: virtual tokens minus real tokens is always
+ * 279.9M, virtual SOL minus real SOL is always 30 SOL, and the supply is 1B. The bot's math (% bonded, market cap, the price floor)
+ * relies on them. About 1 in 5 recorded tokens broke them (a market cap of $1 at 84% bonded), so those are skipped and kept out of
+ * every statistic. Safety switch: if most launches suddenly look non-standard, pump.fun probably changed its constants, so the
+ * check stands down (and says so) instead of skipping everything.
+ */
+const STD_TOK_GAP = 279900000000000n, STD_SOL_GAP = 30000000000n, STD_SUPPLY = 1000000000000000n;
+function curveStd(c) {
+  if (!c || typeof c.vTok !== "bigint" || typeof c.rTok !== "bigint" || typeof c.vSol !== "bigint" || typeof c.rSol !== "bigint" || typeof c.supply !== "bigint") return { ok: true, known: false };
+  const near = (a, b) => (a > b ? a - b : b - a) * 1000n <= b;          // within 0.1%
+  if (!near(c.vTok - c.rTok, STD_TOK_GAP)) return { ok: false, known: true, why: "token reserves" };
+  if (!near(c.vSol - c.rSol, STD_SOL_GAP)) return { ok: false, known: true, why: "SOL reserves" };
+  if (!near(c.supply, STD_SUPPLY)) return { ok: false, known: true, why: "supply" };
+  return { ok: true, known: true };
+}
+const CURVEDIAG = { std: 0, nonStd: 0, why: {}, recent: [], tripped: false };
+/** Where each judged token's holder numbers came from: the live trade feed, the chain check, or nowhere (then it is skipped). */
+const HOLDDIAG = { feed: 0, rpc: 0, none: 0, lowCov: 0, rpcFails: 0, rpcErr: null, rpcErrAt: 0 };
+function curveNote(r) {
+  if (!r || !r.known) return;
+  if (r.ok) CURVEDIAG.std++; else { CURVEDIAG.nonStd++; CURVEDIAG.why[r.why] = (CURVEDIAG.why[r.why] || 0) + 1; }
+  CURVEDIAG.recent.push(r.ok ? 1 : 0); if (CURVEDIAG.recent.length > 200) CURVEDIAG.recent.shift();
+  const n = CURVEDIAG.recent.length, bad = n - CURVEDIAG.recent.reduce((a, x) => a + x, 0);
+  if (!CURVEDIAG.tripped && n >= 100 && bad / n > 0.5) { CURVEDIAG.tripped = true; mpEvent(`Safety switch: ${Math.round((bad / n) * 100)}% of recent launches look non-standard, so pump.fun may have changed its curve. The standard-curve check is paused until that is checked.`); }
+  else if (CURVEDIAG.tripped && n >= 100 && bad / n < 0.3) { CURVEDIAG.tripped = false; mpEvent("Standard-curve check is back on: launches look normal again."); }
 }
 /** Pure: momentum numbers for one token. */
 function flowStats(f, now = Date.now()) {
@@ -4515,7 +4599,7 @@ function mpSkip(reason, ev) {
 /** A new launch arrives: note the creator, queue it to be judged after the wait. */
 function mpOnLaunch(ev) {
   MP.seen++; MP.feed.lastEventAt = Date.now();
-  FLOW.set(ev.mint, { t0: Date.now(), trades: [], buyers: new Set() }); if (FLOW.size > 4000) FLOW.delete(FLOW.keys().next().value);
+  FLOW.set(ev.mint, { t0: Date.now(), trades: [], buyers: new Set(), hold: new Map(), creator: ev.creator || null, ts0: null, early: 0, earlyU: new Set(), devBuy: 0, maxBuy: 0 }); if (FLOW.size > 4000) FLOW.delete(FLOW.keys().next().value);
   GR.launches.push({ t: Date.now(), m: ev.mint }); GR.seen.set(ev.mint, Date.now()); rhCount("l", Date.now());
   if (GR.launches.length > 120000) GR.launches.splice(0, GR.launches.length - 120000);
   MP.launchTimes.push(Date.now()); if (MP.launchTimes.length > 600) MP.launchTimes.splice(0, MP.launchTimes.length - 600);
@@ -4577,6 +4661,8 @@ async function mpEvaluate(ev) {
   const sol = await getSolUsd().catch(() => null);
   if (!sol) return mpSkip("no SOL price", ev);
   const m = curveMarket(c, sol, 6);
+  const std = curveStd(c); curveNote(std);
+  if (!std.ok && !CURVEDIAG.tripped) return mpSkip(`non-standard curve (${std.why}): the bot's curve math does not apply`, ev);
   const skipT = (reason, extra) => {          // skip, and remember the price so we can see later if the skip was right
     mpSkip(reason, { ...ev, ...(extra || {}) });
     MP.outcomes.push({ mint: ev.mint, sym: ev.symbol, reason: reason.replace(/[\d.]+%/g, "N%").replace(/\d+ /g, "N "), p0: m.price, due: Date.now() + 30 * 60e3 });
@@ -4586,18 +4672,25 @@ async function mpEvaluate(ev) {
   let devAt = null; try { devAt = ((await balanceOf(ev.creator, ev.mint)) / 1e9) * 100; } catch {}
   labSnap(ev, m, devAt);                                        // the Winner Lab writes down what this launch looked like
   if (m.progress >= 1) pathStart(ev, m);                        // the Sweet Spot Finder records its price for 45 minutes
-  if (m.progress >= 3 && m.progress < S.minProgress) getMintCheck(ev.mint).then((ck) => { if (ck && ck.found) labFeat(ev.mint, { top10: ck.top10WalletPct ?? null, top1: ck.top1WalletPct ?? null }); }).catch(() => {});
+  // holders, counted exactly from the live feed (the chain's "largest holders" call failed on every token for weeks, silently)
+  const soldTok = typeof c.rTok === "bigint" ? Number(INITIAL_REAL_TOKEN_RESERVES - (c.rTok < INITIAL_REAL_TOKEN_RESERVES ? c.rTok : INITIAL_REAL_TOKEN_RESERVES)) / 1e6 : null;
+  const hs = holdStats(FLOW.get(ev.mint), soldTok);
+  if (hs && hs.ok) labFeat(ev.mint, { top10: hs.top10, top1: hs.top1, snipe: hs.sniperPct, snipers: hs.snipers, holders: hs.holders, devBuy: hs.devBuySol, maxBuy: hs.maxBuySol, hcov: hs.cov, hsrc: "feed" });
   if (m.progress >= 3) { rugWatch.push({ mint: ev.mint, sym: ev.symbol, creator: ev.creator, peakSol: Number(c.rSol) / 1e9, devAt, due: Date.now() + 30 * 60e3, round: 0 }); if (rugWatch.length > 2000) rugWatch.shift(); }
   if (m.progress < S.minProgress) return skipT(`weak demand (<${S.minProgress}% bonded)`, { progress: m.progress });
   // creator's bag and holder concentration, curve excluded
-  const chk = await getMintCheck(ev.mint).catch(() => null);
+  const chk = await getMintCheck(ev.mint, { holders: !(hs && hs.ok) }).catch(() => null);
   if (!chk || !chk.found) return mpSkip("couldn't check holders", ev);
   if (!chk.mintAuthorityRenounced || !chk.freezeAuthorityRenounced) return skipT("can print or freeze");
-  const top10 = chk.top10WalletPct, top1 = chk.top1WalletPct;
-  labFeat(ev.mint, { top10: top10 == null ? null : +top10.toFixed(1), top1: top1 == null ? null : +top1.toFixed(1) });
-  if (top1 != null && top1 > S.maxTop1Pct) return skipT(`one wallet holds ${Math.round(top1)}%`);
-  if (top10 != null && top10 > S.maxTop10Pct) return skipT(`top 10 hold ${Math.round(top10)}%`);
-  const devPct = devAt;
+  let top10 = null, top1 = null, hsrc = "none";
+  if (hs && hs.ok) { top10 = hs.top10; top1 = hs.top1; hsrc = "feed"; }
+  else if (chk.top10WalletPct != null && chk.top1WalletPct != null) { top10 = chk.top10WalletPct; top1 = chk.top1WalletPct; hsrc = "rpc"; }
+  HOLDDIAG[hsrc]++; if (hs && !hs.ok) HOLDDIAG.lowCov++;
+  if (hsrc === "none") return skipT("couldn't measure holders: never trade blind");          // before: an unknown passed every holder limit
+  labFeat(ev.mint, { top10: +(+top10).toFixed(1), top1: +(+top1).toFixed(1), hsrc });
+  if (top1 > S.maxTop1Pct) return skipT(`one wallet holds ${Math.round(top1)}%`);
+  if (top10 > S.maxTop10Pct) return skipT(`top 10 hold ${Math.round(top10)}%`);
+  const devPct = devAt != null ? devAt : hs && hs.ok ? hs.devPct : null;
   if (devPct != null && devPct > S.maxDevPct) return skipT(`creator holds ${devPct.toFixed(1)}%`);
   // learned: setups that have kept losing money get skipped
   if (S.learn) {
@@ -4646,7 +4739,10 @@ function mpOpen(ev, m, info) {
     const smartIn = recentBuys.filter((b) => b.t === ev.mint && ranked.has(b.w) && Date.now() - b.at < 15 * 60e3).length;
     if (smartIn) { mult *= S.smartBoost; boosts.push(`${smartIn} smart wallet${smartIn > 1 ? "s" : ""} bought it`); }
   } catch {}
-  let sizeUsd = mpBetSize(MP.bank, S, MP.positions, mult, null, sol, (info.rules && info.rules.slPct) || S.slPct);
+  // the worst case: a curve token can fall to its floor; a pool token (graduate) can lose nearly everything when liquidity is pulled
+  const onCurve = info.entryType !== "graduate" && m.floorRatio > 0 && m.floorRatio <= 1, cst = (S.slippagePct || 0) / 100, fee = (S.feePct || 0) / 100;
+  const worstPct = !S.sizeByWorst ? null : onCurve ? (1 - (m.floorRatio * (1 - cst) * (1 - fee)) / ((1 + cst) * (1 + fee))) * 100 : S.gradWorstPct;
+  let sizeUsd = mpBetSize(MP.bank, S, MP.positions, mult, null, sol, (info.rules && info.rules.slPct) || S.slPct, worstPct);
   if (info.maxBetUsd > 0) sizeUsd = Math.min(sizeUsd, info.maxBetUsd);          // e.g. the band lane never buys more than the curve can absorb
   if (!(sizeUsd > 0)) return mpSkip(`max loss ${S.maxLossPct}%: balance too small for a safe bet`, ev);
   const extraUsd = (S.priorityFeeSol + S.jitoTipSol) * sol, costUsd = sizeUsd * (1 + S.feePct / 100) + extraUsd;
@@ -4696,7 +4792,15 @@ async function mpWatchTick() {
     let c; try { c = await readBondingCurve(mint); } catch {}                    // confirm the price straight from the chain
     if (!c || c.complete) { mpSkip(c && c.complete ? "graduated before momentum buy" : "couldn't read curve", w.ev); continue; }
     const m = curveMarket(c, sol, 6);
-    mpOpen(w.ev, m, { ...w.info, labA: labAnalyze(), sol, momentum: `momentum: ${fs.buyers60} buyers/min, ${fs.buyShare60}% buys, +${fs.net60} SOL, +${fs.rise2m}% in 2m`,
+    // holders AGAIN, at the moment of buying: minutes after the first check, a whale or a bundle may have moved in
+    const soldNow = typeof c.rTok === "bigint" ? Number(INITIAL_REAL_TOKEN_RESERVES - (c.rTok < INITIAL_REAL_TOKEN_RESERVES ? c.rTok : INITIAL_REAL_TOKEN_RESERVES)) / 1e6 : null;
+    const hsNow = holdStats(FLOW.get(mint), soldNow); let info2 = w.info;
+    if (hsNow && hsNow.ok) {
+      const why = hsNow.top1 > S.maxTop1Pct ? `one wallet holds ${Math.round(hsNow.top1)}%` : hsNow.top10 > S.maxTop10Pct ? `top 10 hold ${Math.round(hsNow.top10)}%` : null;
+      if (why) { sigMark(mint, false, why + " at the buy"); mpSkip(`${why} (checked again at the buy)`, w.ev); continue; }
+      info2 = { ...w.info, top10: hsNow.top10, top1: hsNow.top1 };
+    }
+    mpOpen(w.ev, m, { ...info2, labA: labAnalyze(), sol, momentum: `momentum: ${fs.buyers60} buyers/min, ${fs.buyShare60}% buys, +${fs.net60} SOL, +${fs.rise2m}% in 2m`,
       why: `MOMENTUM · ${fs.buyers60} buyers in 60s · ${fs.buyShare60}% buys · +${fs.net60} SOL in · +${fs.rise2m}% in 2m · $${(m.mcap / 1000).toFixed(1)}K` });
     { const took = MP.positions.some((p) => p.mint === mint); sigMark(mint, took, took ? null : (MP.lastSkip && MP.lastSkip.mint === mint ? MP.lastSkip.reason : "not bought")); }
   }
@@ -5066,6 +5170,7 @@ app.get("/api/mp/ledger.csv", (req, res) => {
 function mpApplySettings(b) {
   const S = MP.settings;
   const clamp = (k, lo, hi) => { if (b[k] == null) return; const v = Number(b[k]); if (Number.isFinite(v)) S[k] = Math.min(hi, Math.max(lo, v)); };
+  clamp("gradWorstPct", 20, 100); clamp("sizeByWorst", 0, 1);
   clamp("startUsd", 1, 100000); clamp("slots", 0, 30); clamp("maxLossPct", 0, 100); clamp("riskPct", 1, 50); clamp("minTradeUsd", 0.1, 1000); clamp("vaultAtX", 1.2, 100); clamp("keepX", 0.2, 50);
   clamp("tp1SellPct", 10, 100); clamp("trailPct", 5, 90); clamp("moonHoldMin", 5, 2880); clamp("smartBoost", 1, 3); clamp("favorBoost", 1, 3);
   clamp("maxBetPct", 2, 50); clamp("devExit", 0, 1); clamp("gradOn", 0, 1); clamp("gradWindowMin", 5, 120); clamp("gradMinLiq", 5000, 5e6); clamp("gradMinMcap", 20000, 5e6); clamp("gradMaxMcap", 50000, 5e7); clamp("gradBuys5", 3, 1000); clamp("gradBuyShare", 40, 95);
@@ -5182,7 +5287,7 @@ function tgBank() {
 }
 function tgStatus() {
   const S = MP.settings, { B, total } = tgBank(), paused = B.pausedUntil > Date.now() ? B.pauseWhy : null, perMin = MP.launchTimes.filter((t) => Date.now() - t < 60000).length;
-  return `📊 <b>ALKAID</b> · paper money\nTotal <b>${tgMoney(total)}</b> (started ${tgMoney(B.start)}, ${total >= B.start ? "+" : ""}${(((total / B.start) - 1) * 100).toFixed(1)}%)\n` +
+  return `📊 <b>${TG_NAME}</b> · paper money\nTotal <b>${tgMoney(total)}</b> (started ${tgMoney(B.start)}, ${total >= B.start ? "+" : ""}${(((total / B.start) - 1) * 100).toFixed(1)}%)\n` +
     `Trading cash ${tgMoney(B.cash)} · Vault ${tgMoney(B.vault)} · Sent to savings ${tgMoney(B.sent || 0)}\nToday <b>${tgMoney(B.dayPnl || 0)}</b>\n` +
     `Open trades ${MP.positions.length}/${S.slots > 0 ? S.slots : S.maxOpen} · watching ${MP.watch.size} launches for momentum\n` +
     `Last launch ${MP.feed.lastEventAt ? tgAgo(MP.feed.lastEventAt) + " ago" : "—"} · ${perMin} a minute\n` +
@@ -5276,7 +5381,7 @@ async function tgHandle(u) {
     if (allowed) return tgSend(chat, "👋 Welcome back. Pick something:", TG_MENU);
     if (TG.pair && Date.now() < TG.pair.exp && code && tgSafeEq(code, TG.pair.code)) {
       TG.chats.add(chat); CONN.tgChats = [...TG.chats]; saveConn(); TG.pair = null; mpEvent("Telegram paired with your phone"); tgCommandsFor(chat);
-      return tgSend(chat, "✅ <b>You're connected to ALKAID.</b>\nAlerts are on: every buy, sell, pause, and vault lock. Paste any Solana token address to scan it.", TG_MENU);
+      return tgSend(chat, "✅ <b>You're connected to " + TG_NAME + ".</b>\nAlerts are on: every buy, sell, pause, and vault lock. Paste any Solana token address to scan it.", TG_MENU);
     }
   }
   if (!allowed) {                                                         // strangers get one polite line, at most every 10 minutes, and nothing else
@@ -5294,8 +5399,8 @@ async function tgHandle(u) {
   return tgSend(chat, "Pick something, or paste a Solana token address to scan it:", TG_MENU);
 }
 /** The bot's name card and command menu, set automatically. Commands are shown only to paired phones; strangers see none. */
-const TG_DESC = "ALKAID · private trading assistant.\n\nLive alerts, open positions, strategy reports and token safety scans for its owner.\n\nThis bot is private: it only answers phones paired from the owner's dashboard.";
-const TG_SHORT = "ALKAID · private trading alerts and token safety scans.";
+const TG_DESC = TG_NAME + " · private trading assistant.\n\nLive alerts, open positions, strategy reports and token safety scans for its owner.\n\nThis bot is private: it only answers phones paired from the owner's dashboard.";
+const TG_SHORT = TG_NAME + " · private trading alerts and token safety scans.";
 const TG_COMMANDS = [
   { command: "status", description: "Balance, today, open trades" }, { command: "positions", description: "Open trades with live profit or loss" },
   { command: "hot", description: "Hottest launches right now" }, { command: "graduates", description: "Recent graduations" },
@@ -5309,6 +5414,7 @@ const TG_COMMANDS = [
 ];
 const tgCommandsFor = (chat) => tgApi("setMyCommands", { commands: TG_COMMANDS, scope: { type: "chat", chat_id: Number(chat) } }).catch(() => {});
 async function tgProfile() {
+  await tgApi("setMyName", { name: TG_NAME }).catch(() => {});             // the name people see; the @username itself can only be changed in BotFather
   await tgApi("setMyDescription", { description: TG_DESC }).catch(() => {});
   await tgApi("setMyShortDescription", { short_description: TG_SHORT }).catch(() => {});
   await tgApi("deleteMyCommands", {}).catch(() => {});                   // the public sees no command list
@@ -5392,8 +5498,9 @@ async function tgExport(chat) {
   const now = Date.now();
   if (now - TG_DOC_GAP.last < 60e3) return tgSend(chat, "📤 I just sent the files. Give it a minute and tap again.", TG_MENU);
   TG_DOC_GAP.last = now;
-  const files = [["alkaid-launches.csv", launchCsv(), "Every judged launch: what it looked like at 90 seconds and how it ended"], ["alkaid-paths.csv", pathsCsv(), "The full price path of each one (every 15 seconds, up to 45 minutes)"],
-    ["alkaid-signals.csv", signalsCsv(), "Every momentum signal and how each exit style would have done"], ["alkaid-ledger.csv", ledCsv(), "A win/loss row for every token, with the bot's decision"], ["alkaid-trades.csv", tradesCsv(), "Every closed paper trade"]];
+  const files = [["fuflopbot-launches.csv", launchCsv(), "Every judged launch: what it looked like at 90 seconds and how it ended"], ["fuflopbot-paths.csv", pathsCsv(), "The full price path of each one (every 15 seconds, up to 45 minutes)"],
+    ["fuflopbot-signals.csv", signalsCsv(), "Every momentum signal and how each exit style would have done"], ["fuflopbot-ledger.csv", ledCsv(), "A win/loss row for every token, with the bot's decision"], ["fuflopbot-trades.csv", tradesCsv(), "Every closed paper trade"],
+    ["fuflopbot-index.csv", gxCsv(), "Every graduate followed for 7 days, with its price path (for testing hold and dip-buy over days)"]];
   await tgSend(chat, `📤 Sending ${files.length} spreadsheets. This takes about ${Math.ceil((files.length * (TG_DOC_GAP.ms + 600)) / 1000)} seconds.`);
   let sent = 0;
   for (const [name, text, cap] of files) {
@@ -5445,7 +5552,7 @@ app.post("/api/mp/connections", async (req, res) => {
   }
   if (b.tgTest === true) {
     if (!TG.chats.size) return res.status(400).json({ error: "No phone is paired yet. Tap Make a pairing code first." });
-    const sent = await Promise.all([...TG.chats].map((c) => tgApi("sendMessage", { chat_id: c, text: "✅ Test from ALKAID: Telegram is working. You'll get an alert here for every buy, sell, pause and vault lock." }).then(() => true).catch((e) => { TG.err = tgFail(e); return false; })));
+    const sent = await Promise.all([...TG.chats].map((c) => tgApi("sendMessage", { chat_id: c, text: "✅ Test from " + TG_NAME + ": Telegram is working. You'll get an alert here for every buy, sell, pause and vault lock." }).then(() => true).catch((e) => { TG.err = tgFail(e); return false; })));
     return res.json({ ok: sent.some(Boolean), sent: sent.filter(Boolean).length, ...connPublic(), error: sent.some(Boolean) ? undefined : (TG.err || "Couldn't send.") });
   }
   if (b.tgNewCode === true) { if (!CONN.tgToken) return res.status(400).json({ error: "Add your Telegram bot token first." }); TG.pair = { code: crypto.randomBytes(5).toString("hex").toUpperCase(), exp: Date.now() + 15 * 60e3 }; }
@@ -5631,7 +5738,9 @@ app.get("/api/health", (req, res) => {
                   callsLastMinute: gtTimes.filter((t) => Date.now() - t < 60000).length, budgetPerMinute: GT_PER_MIN, ...gtStats,
                   coolingDown: Date.now() < gtBackoffUntil, newPoolsAgeSec: poolCache.new.ts ? Math.round((Date.now() - poolCache.new.ts) / 1000) : null },
     lowSupply: { found: lowSupply.size, maxSupply: LOW_SUPPLY_MAX },
-    engine: { build: BUILD_ID, running: MP.on && MP.feed.connected, tradesRead: MP.feed.trades || 0, graduationsSeen: MP.feed.grads || 0, telegram: TG.on },   // details are owner-only (/api/mp/state)
+    engine: { build: BUILD_ID, running: MP.on && MP.feed.connected, tradesRead: MP.feed.trades || 0, graduationsSeen: MP.feed.grads || 0, telegram: TG.on,
+              holders: { fromFeed: HOLDDIAG.feed, fromChainCheck: HOLDDIAG.rpc, unmeasuredSkipped: HOLDDIAG.none, chainCheckFailures: HOLDDIAG.rpcFails, lastChainError: HOLDDIAG.rpcErr },
+              curves: { standard: CURVEDIAG.std, nonStandardSkipped: CURVEDIAG.nonStd, safetySwitchOn: CURVEDIAG.tripped } },   // details are owner-only (/api/mp/state)
     rugRegistry: { wallets: rugReg.size, watching: rugWatch.length, savedPermanently: !!RUG_FILE },
     smartWallets: { tracked: ledger.size, watching: watchList.length, liveWallets: liveSubs.size, alerts24h: alerts.length, learningSince: new Date(smartSince).toISOString(), savedPermanently: smartPersistent, priceUsd: SMART_PRICE_USD },
     time: new Date().toISOString(),
