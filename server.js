@@ -92,7 +92,7 @@ const SOLANA_RPC_URL = CONN.rpcUrl || process.env.SOLANA_RPC_URL || "https://api
 const SLAPGOLD_MINT = process.env.SLAPGOLD_MINT; // e.g. 4R7Hbdhh3YeVqZaESRA3qPJ8Z3xh3Qedsw88RDjxL1Q9
 // The owner wallet. Set here (it's a public address, not a secret) so it can be changed with a normal upload,
 // without touching the server's settings file. It wins over the MY_WALLET setting.
-const BUILD_ID = "2026-11-01 · FUFLOPBOT · V1.1 · rug guard: holders from the feed · standard curves · worst-case sizing · 7-day index paths";            // shown on the dashboard and the health page: it tells you which version is running
+const BUILD_ID = "2026-11-03 · FUFLOPBOT · V1.2 · Analyst: a birth record for every launch, top-20 tracking, /analyst /top20 /birth · Winner Lab counts finished launches only";            // shown on the dashboard and the health page: it tells you which version is running
 const OWNER_WALLET = "4t3F4TvCsRCohYJ3EZ4B2ahaN2nN5kBE3A8WUVy2K1CF";
 const MY_WALLET = OWNER_WALLET || process.env.MY_WALLET;   // YOUR wallet address — the only one allowed in
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*"; // lock to your GitHub Pages URL once live
@@ -2975,6 +2975,7 @@ function decodeCreateEvent(b64) {
 const LAB_FILE = VOLUME_DIR ? nodePath.join(VOLUME_DIR, "cannon-lab.json") : "";
 const LAB = { snaps: [], devs: new Map(), trended: new Map(), cache: null, cacheAt: 0 };
 const LAB_CP = [20 * 60e3, 2 * 3600e3, 12 * 3600e3];          // outcome checkpoints after launch
+const LAB_MATURE = LAB_CP[LAB_CP.length - 1] + 30 * 60e3;   // a launch counts in the lifts only after its last check (12.5 h): before that only its WINS were final, which flattered every trait of recent launches
 const LAB_READY_AT = 300;                                     // finished launches needed before the lab may steer trading
 try { if (LAB_FILE && nodeFs.existsSync(LAB_FILE)) { const d = JSON.parse(nodeFs.readFileSync(LAB_FILE, "utf8")); LAB.snaps = d.snaps || []; for (const [k, v] of d.devs || []) LAB.devs.set(k, v); } } catch {}
 const labSave = () => { if (!LAB_FILE) return; try { const t = LAB_FILE + ".tmp";
@@ -2990,14 +2991,14 @@ async function labSocial(uri) {                                // website / X / 
   } catch { return null; }
 }
 /** Write down what this launch looked like. Safe to call more than once. */
-function labSnap(ev, m, devPct) {
+function labSnap(ev, m, devPct, nonStd) {
   const old = LAB.snaps.find((x) => x.mint === ev.mint); if (old) return old;
   const d = LAB.devs.get(ev.creator) || { l: 0, g: 0 }, nm = String(ev.name || ""), at = ev.launchedAt || Date.now();
   const s = { mint: ev.mint, sym: ev.symbol, name: ev.name, creator: ev.creator, at, hour: new Date(at).getUTCHours(),
     progress: +(+m.progress).toFixed(2), mcap: Math.round(m.mcap), top10: null, top1: null, devPct: devPct == null ? null : +devPct.toFixed(2),
     ...(() => { const fs = flowStats(FLOW.get(ev.mint)); return { fBuyers: fs.buyersTotal, fNet: fs.netTotal, fShare: fs.buyShare60 }; })(),
     dev24: (MP.creators.get(ev.creator) || []).length, devL: d.l, devG: d.g, social: null, nameLen: nm.length,
-    emoji: /[^\x00-\x7F]/.test(nm + (ev.symbol || "")) ? 1 : 0, cp: 0, peak: Math.round(m.mcap), grad: false, trended: false, win: false, done: false };
+    emoji: /[^\x00-\x7F]/.test(nm + (ev.symbol || "")) ? 1 : 0, cp: 0, peak: nonStd ? 0 : Math.round(m.mcap), ns: nonStd ? 1 : 0, grad: false, trended: false, win: false, done: false };
   d.l++; LAB.devs.set(ev.creator, d); if (LAB.devs.size > 30000) LAB.devs.delete(LAB.devs.keys().next().value);
   LAB.snaps.push(s); if (LAB.snaps.length > 5000) LAB.snaps.splice(0, LAB.snaps.length - 5000);
   labSocial(ev.uri).then((v) => { s.social = v; }).catch(() => {});
@@ -3018,11 +3019,11 @@ setInterval(async () => {
       const c = await readBondingCurve(s.mint);
       let mc = null;
       if (c && c.complete) { s.grad = true; const dx = await mpDexPrice(s.mint); mc = dx ? dx.mcap : null; }
-      else if (c) mc = curveMarket(c, await getSolUsd(), 6).mcap;
+      else if (c && !s.ns) mc = curveMarket(c, await getSolUsd(), 6).mcap;   // a non-standard curve's market cap can't be computed: never a "$100K winner"
       if (mc) s.peak = Math.max(s.peak || 0, Math.round(mc));
     } catch { continue; }
     if (LAB.trended.has(s.mint)) s.trended = true;
-    if (s.grad || s.trended || s.peak >= 100000) s.win = true;
+    if (s.grad || s.trended || (s.peak >= 100000 && !s.ns)) s.win = true;
     if (s.grad && !s.gradCounted) { s.gradCounted = true; const d = LAB.devs.get(s.creator); if (d) d.g++; }
     s.cp++;
     if (s.win || s.cp >= LAB_CP.length) s.done = true;        // a win is final; a loss is final only after the 12 h look
@@ -3052,7 +3053,7 @@ const labBucket = (bins, v) => { if (v == null || Number.isNaN(v)) return null; 
 /** Count, feature by feature, how much more (or less) often winners had each trait. Cached 20 s. */
 function labAnalyze() {
   const now = Date.now(); if (LAB.cache && now - LAB.cacheAt < 20000) return LAB.cache;
-  const L = LAB.snaps.filter((s) => s.win || s.done), W = L.filter((s) => s.win).length, base = L.length ? W / L.length : 0, K = 20;
+  const L = LAB.snaps.filter((s) => (s.win || s.done) && now - s.at >= LAB_MATURE), W = L.filter((s) => s.win).length, base = L.length ? W / L.length : 0, K = 20;
   const rows = [], table = new Map();
   for (const [feat, get, bins] of LAB_FEATURES) for (const [lo, hi, label] of bins) {
     const inB = L.filter((s) => { const v = get(s); return v != null && v >= lo && v < hi; });
@@ -3485,6 +3486,7 @@ async function topRecord() {
     }
     t.bestRank = Math.min(t.bestRank, p.rank); t.lastRank = p.rank; t.lastAt = now; t.scans++;
   }
+  if (typeof anOnTop === "function") anOnTop(TOP.list, now);              // the Analyst: who made the top 100 / top 20, and which words are trending
 }
 setInterval(() => { topRecord().catch(() => {}); }, 5 * 60e3); setTimeout(() => { topRecord().catch(() => {}); }, 40000);
 const topMed = (a) => { const v = a.filter((x) => x != null && Number.isFinite(x)).sort((x, y) => x - y); return v.length ? v[Math.floor(v.length / 2)] : null; };
@@ -3497,6 +3499,485 @@ function topPublic() {
       medianBuyShare: topMed(recent.map((e) => e.buyShare0)), pumpPct: pct(recent.filter((e) => e.pump).length), sawBeforePct: pct(recent.filter((e) => e.sawBefore).length), medianLeadMin: topMed(recent.filter((e) => e.sawBefore).map((e) => e.leadMin)) } };
 }
 /*TOP_END*/
+
+
+/*ANALYST_BEGIN*/
+// ═══════════════════════════════════════════════════════════════════════
+// 🔬 ANALYST — the beginning before the beginning: a birth record for every launch, and what the top 20 had at birth
+// ═══════════════════════════════════════════════════════════════════════
+/**
+ * No list ranks a token before it exists. The bot's "top 20" is page 1 of GeckoTerminal's trending list (Solana, last hour),
+ * which ranks pools on people viewing them, volume, transactions, liquidity and safety checks. So the only "before" is what was
+ * lined up ahead of the launch, and that leaves fingerprints the bot can record:
+ *   BEFORE LAUNCH   how new the creator's wallet is, who funded it, whether that funder had funded other creators (and winners),
+ *                   the creator's launches in the last 24 hours and past winners, the X link (a tweet, an account, a community),
+ *                   a name riding a word that is trending right now
+ *   FIRST SECONDS   the creator's own buy; how many wallets bought within 2 seconds (a bundle) and with how much SOL;
+ *                   proven early buyers (wallets that were among the first 10 buyers of 2+ winners, at 15%+ of their early picks)
+ *   FIRST 90 SEC    how much of the curve sold, how many different buyers, net SOL in
+ * Every launch is followed for 24 hours: did it graduate, reach the top 100, reach the top 20, and how fast?
+ * The study counts only a random sample (so the rates are fair), only after each launch's 24 hours are over (so early winners
+ * can't flatter the numbers), compares launches WITH a trait to launches WITHOUT it, and calls a trait proven only if it
+ * held up in the first half AND the second half of the data. Creator-wallet checks cost 2 chain reads each, so they run on
+ * a random part of the sample, at most 6 a minute, and stop when the daily RPC cap is reached. Nothing here trades.
+ */
+const AN_FILE = VOLUME_DIR ? nodePath.join(VOLUME_DIR, "cannon-analyst.json") : "";
+const AN_H = 24 * 3600e3;                        // the outcome window: what happened in a launch's first 24 hours
+const AN_SAMPLE = 0.2;                           // share of launches in the random study sample (winners outside it are kept for the lists, never counted)
+const AN_DEEP_PER_MIN = 6;                       // creator-wallet checks a minute, at most (2 chain reads each)
+const AN_FIRST_N = 10;                           // first buyers scored for "proven early buyers"
+const AN_KEEP_OTHERS = 8 * 3600e3;              // launches outside the sample are kept 8 hours (for the top-20 notes), longer only if they win
+const AN_MAX_LIVE = 45000, AN_MAX_SAMPLED = 25000, AN_MAX_DONE = 15000, AN_MAX_WALLETS = 60000, AN_MAX_FUNDERS = 20000, AN_MAX_CREATORS = 80000;
+const AN_HEAP_LEAN = 450e6;                      // past this much server memory the Analyst keeps only the study sample (the study itself is untouched)
+const AN_OUT = ["t20", "g", "t100"];             // outcomes: reached the top 20, graduated, reached the top 100 (each within 24 hours)
+const AN_CURVE_K = 30 * 1073000000;              // standard pump.fun curve: virtual SOL × virtual tokens stays at this
+const AN_KEYS = ["m", "s", "n", "c", "t", "smp", "fin", "gap", "cl", "cw", "nl", "ne", "hk", "hw", "sn", "nf", "dev", "ew", "es", "ep", "pb", "b90", "net90", "p90", "std",
+  "dp", "dr", "age", "busy", "tx", "fu", "fa", "fn", "fw", "tw", "tg", "web", "g", "t100", "t20", "br"];
+const AN = { births: new Map(), done: [], doneIdx: new Map(), agg: {}, snapQ: [], deepQ: [], recent: [], wallets: new Map(), funders: new Map(), creators: new Map(), cwins: new Map(),
+  hot: new Map(), hot20: new Set(), hotAt: 0, upSince: Date.now(), since: Date.now(), cache: null, cacheAt: 0, wTrimAt: 0, memAt: 0, lean: false, liveSampled: 0,
+  diag: { launches: 0, sampled: 0, snaps: 0, noFeed: 0, deep: 0, deepFail: 0, deepErr: null, metaOk: 0, metaFail: 0, grads: 0, top100: 0, top20: 0 } };
+const anPack = (r) => AN_KEYS.map((k) => (r[k] === undefined ? null : r[k]));
+/** One birth record. Every record has all its fields from the start and none is ever deleted: that keeps tens of thousands of them small in memory. */
+const anBlank = () => ({ m: "", s: "", n: "", c: "", u: null, t: 0, smp: 0, fin: 0, gap: 0, cl: null, cw: 0, nl: 0, ne: 0, hk: 0, hw: "", sn: 0, nf: 0,
+  dev: null, ew: null, es: null, ep: null, pb: null, b90: null, net90: null, p90: null, std: null, dp: 0, dr: null, dq: 0, age: null, busy: 0, tx: null,
+  fu: null, fa: null, fn: null, fw: null, tw: null, tg: null, web: null, g: 0, t100: 0, t20: 0, br: 0, first: null, wc: 0, wf: 0, wcr: 0, ag: 0 });
+const anUnpack = (a) => { const r = anBlank(); AN_KEYS.forEach((k, i) => { if (a[i] !== null && a[i] !== undefined) r[k] = a[i]; }); return r; };
+try {
+  if (AN_FILE && nodeFs.existsSync(AN_FILE)) {
+    const d = JSON.parse(nodeFs.readFileSync(AN_FILE, "utf8")) || {};
+    if (d.since) AN.since = d.since;
+    for (const a of d.done || []) { const r = anUnpack(a); if (r.m) { AN.done.push(r); AN.doneIdx.set(r.m, r); } }
+    for (const a of d.live || []) { const r = anUnpack(a); if (!r.m) continue; r.gap = 1; if (!r.sn) { r.sn = 1; r.nf = 1; } AN.births.set(r.m, r); if (r.smp) AN.liveSampled++; }   // followed across a restart: flagged
+    if (d.agg && typeof d.agg === "object") AN.agg = d.agg;
+    for (const [k, e, w] of d.wallets || []) AN.wallets.set(k, Math.min(e, 1e6) * 1024 + Math.min(w, 1023));
+    for (const [k, ct, wt, l] of d.funders || []) AN.funders.set(k, { ct: ct || [], wt: wt || [], l: l || 0 });
+    for (const [k, v] of d.creators || []) AN.creators.set(k, v);
+    for (const [k, n] of d.cwins || []) AN.cwins.set(k, n);
+  }
+} catch {}
+const anSave = () => {
+  if (!AN_FILE) return;
+  try {
+    const now = Date.now(), live = [], wal = [], fun = [], cre = [];
+    for (const r of AN.births.values()) if (r.smp || r.g || r.t20 || r.t100) live.push(anPack(r));
+    for (const [k, v] of AN.wallets) if (v % 1024 >= 1) wal.push([k, Math.floor(v / 1024), v % 1024]);
+    for (const [k, v] of AN.funders) fun.push([k, v.ct, v.wt, v.l]);
+    const mn = Math.floor(now / 60000); for (const [k, v] of AN.creators) if (mn - (Array.isArray(v) ? v[v.length - 1] : v) < 1440) cre.push([k, v]);
+    const t = AN_FILE + ".tmp";
+    nodeFs.writeFileSync(t, JSON.stringify({ v: 2, since: AN.since, agg: AN.agg, done: AN.done.map(anPack), live, wallets: wal, funders: fun, creators: cre, cwins: [...AN.cwins] }));
+    nodeFs.renameSync(t, AN_FILE);
+  } catch {}
+};
+regFlush(anSave); setInterval(anSave, 10 * 60e3);
+
+/** Words in a token's name, for matching names to what is trending. Chinese, Japanese and Korean words count whole. */
+const AN_STOP = new Set(["the", "and", "for", "you", "your", "with", "this", "that", "coin", "token", "official", "sol", "solana", "pump", "fun", "inu", "meme",
+  "just", "not", "are", "was", "all", "get", "its", "our", "from", "dev", "who", "has", "but", "out", "now", "new", "one", "his", "her", "him"]);
+function anWords(text) {
+  const out = new Set();
+  for (const w of String(text || "").toLowerCase().split(/[^a-z0-9぀-ヿ㐀-鿿가-힯]+/)) {
+    if (!w) continue;
+    if (/^[a-z0-9]+$/.test(w)) { if (w.length >= 3 && !/^\d+$/.test(w) && !AN_STOP.has(w)) out.add(w); }
+    else out.add(w);
+  }
+  return [...out];
+}
+/** The trending word this name rides, "" for none, null when the trending list is too old to judge. */
+function anHotWord(name, sym, now = Date.now()) {
+  if (!AN.hotAt || now - AN.hotAt > 30 * 60e3) return null;
+  const S = String(sym || "").toUpperCase().replace(/^\$/, "");
+  if (S && AN.hot20.has(S)) return "$" + S;                                // same ticker as a token in the top 20 right now
+  let best = "";
+  for (const w of anWords(name + " " + sym)) if (AN.hot.has(w) && w.length > best.length) best = w;
+  return best;
+}
+/** How many creators to check a minute → chance a sampled launch gets checked. Keeps the checks spread evenly over the day. */
+function anDeepP(now = Date.now()) {
+  let n = 0; for (let i = AN.recent.length - 1; i >= 0 && now - AN.recent[i] < 60e3; i--) n++;
+  return Math.min(1, AN_DEEP_PER_MIN / Math.max(1, n * AN_SAMPLE));
+}
+/** A launch was just created on pump.fun: start its birth record. Instant, no chain reads. */
+function anOnLaunch(ev) {
+  try {
+    if (!ev || !ev.mint || AN.births.has(ev.mint)) return;
+    const now = Date.now(), nm = String(ev.name || ""), sy = String(ev.symbol || ""), c = String(ev.creator || "");
+    AN.diag.launches++; AN.recent.push(now); if (AN.recent.length > 900) AN.recent.splice(0, AN.recent.length - 900);
+    let cl = null, cw = 0;
+    if (c) {
+      const mn = Math.floor(now / 60000), v = AN.creators.get(c), ts = (v == null ? [] : Array.isArray(v) ? v : [v]).filter((x) => mn - x < 1440); ts.push(mn);
+      AN.creators.delete(c); AN.creators.set(c, ts.length === 1 ? mn : ts.slice(-50)); cl = ts.length; cw = AN.cwins.get(c) || 0;
+      if (AN.creators.size > AN_MAX_CREATORS) AN.creators.delete(AN.creators.keys().next().value);
+    }
+    const smp = AN.liveSampled < AN_MAX_SAMPLED && Math.random() < AN_SAMPLE ? 1 : 0;   // when too many are being followed, fewer NEW ones are sampled (never by outcome)
+    if (!smp && AN.lean) return;                                                        // short on memory: keep only the study sample
+    const r = anBlank();
+    r.m = ev.mint; r.s = sy.slice(0, 20); r.n = smp ? nm.slice(0, 32) : ""; r.c = c; r.u = String(ev.uri || "").slice(0, 300) || null; r.t = now; r.smp = smp;   // the metadata address is kept until checked, so a top-20 launch outside the sample still gets its socials read
+    r.cl = cl; r.cw = cw; r.nl = nm.length; r.ne = /[^\x00-\x7F]/.test(nm + sy) ? 1 : 0;
+    AN.births.set(ev.mint, r); AN.snapQ.push(r); if (AN.snapQ.length > 20000) AN.snapQ.splice(0, AN.snapQ.length - 20000);
+    if (smp) { AN.liveSampled++; AN.diag.sampled++; if (AN.deepQ.length < 40 && Math.random() < anDeepP(now)) { r.dq = 1; AN.deepQ.push({ m: ev.mint, dr: 1 }); } }
+    if (AN.births.size > AN_MAX_LIVE) for (const [k, x] of AN.births) { if (AN.births.size <= AN_MAX_LIVE * 0.95) break; if (!x.smp && !(x.g || x.t20 || x.t100)) AN.births.delete(k); }   // the sample is never trimmed
+  } catch {}
+}
+/** 90 seconds after launch: what the first seconds and the first 90 seconds looked like, straight from the live feed. */
+function anSnap(r, now = Date.now()) {
+  r.sn = 1; AN.diag.snaps++;
+  const f = typeof FLOW !== "undefined" ? FLOW.get(r.m) : null;
+  if (!f) { r.nf = 1; AN.diag.noFeed++; return; }
+  const end = f.t0 + 90e3, seen = new Set(), first = [];
+  let net = 0, lastP = null;
+  for (const x of f.trades) {
+    if (x.t > end) break;
+    net += x.b ? x.sol : -x.sol; if (x.p > 0) lastP = x.p;
+    if (x.b && x.u && x.u !== f.creator && !seen.has(x.u)) { seen.add(x.u); if (first.length < AN_FIRST_N) first.push(x.u.slice(0, 16)); }
+  }
+  r.b90 = seen.size; r.net90 = +net.toFixed(2);
+  r.dev = +(f.devBuy || 0).toFixed(2); r.ew = f.earlyU ? f.earlyU.size : 0; r.es = +(f.earlySol || 0).toFixed(2); r.ep = +(((f.early || 0) / 1e9) * 100).toFixed(2);
+  r.std = f.std == null ? null : f.std;
+  if (f.std === 0) r.p90 = null;
+  else if (lastP > 0) { const vTok = Math.sqrt(AN_CURVE_K / lastP); r.p90 = +Math.max(0, Math.min(100, ((1073000000 - vTok) / 793100000) * 100)).toFixed(2); }
+  else r.p90 = 0;
+  let pb = 0; for (const k of first) if (anProven(AN.wallets.get(k))) pb++;
+  r.pb = pb;
+  for (const k of first) { const v = AN.wallets.get(k) || 0; AN.wallets.delete(k); AN.wallets.set(k, v + 1024); }   // one more early buy (most recent last)
+  r.first = first;
+  const hw = anHotWord(r.n, r.s, now); r.hk = hw == null ? 0 : 1; r.hw = hw || "";
+  if ((r.g || r.t20) && !r.wc) anWin(r, now);                     // it won before its 90-second mark: credit its buyers now, after its own score was taken
+}
+/** A proven early buyer: among the first buyers of 2+ winners, and of 15%+ of everything it bought early. (Stored as early buys × 1024 + wins.) */
+const anProven = (v) => v != null && v % 1024 >= 2 && (v % 1024) / Math.max(1, Math.floor(v / 1024)) >= 0.15;
+/** A launch won (graduated or reached the top 20 inside its first 24 hours): its funder, creator and first buyers get the credit, once. */
+function anWin(r, now = Date.now()) {
+  if (r.fu && !r.wf) { r.wf = 1; const F = AN.funders.get(r.fu); if (F) { F.wt.push(now); if (F.wt.length > 60) F.wt.splice(0, F.wt.length - 60); } }
+  if (r.c && !r.wcr) { r.wcr = 1; AN.cwins.set(r.c, (AN.cwins.get(r.c) || 0) + 1); if (AN.cwins.size > 20000) AN.cwins.delete(AN.cwins.keys().next().value); }
+  if (!r.sn || r.wc) return;
+  r.wc = 1; for (const k of r.first || []) { const v = AN.wallets.get(k); if (v != null && v % 1024 < 1023) AN.wallets.set(k, v + 1); }
+}
+function anOnGrad(mint, now = Date.now()) {
+  try { const r = AN.births.get(mint); if (!r || r.g || now - r.t > AN_H) return; r.g = now; AN.diag.grads++; anWin(r, now); } catch {}
+}
+/** Every 5 minutes, with the top 100: which launches made the top 100 / top 20, and which words are trending. */
+function anOnTop(list, now = Date.now()) {
+  try {
+    if (!Array.isArray(list) || !list.length) return;
+    const cnt = new Map(), t20 = new Set();
+    for (const p of list) {
+      for (const w of anWords((p.name || "") + " " + (p.sym || ""))) { const c = cnt.get(w) || { n: 0, best: 999 }; c.n++; c.best = Math.min(c.best, p.rank); cnt.set(w, c); }
+      if (p.rank <= 20 && p.sym) t20.add(String(p.sym).toUpperCase().replace(/^\$/, ""));
+    }
+    AN.hot = new Map([...cnt].filter(([, c]) => c.n >= 2 || c.best <= 20)); AN.hot20 = t20; AN.hotAt = now;
+    for (const p of list) {
+      const r = AN.births.get(p.addr); if (!r || now - r.t > AN_H) continue;
+      if (!r.t100) { r.t100 = now; AN.diag.top100++; }
+      r.br = Math.min(r.br || 999, p.rank);
+      if (p.rank <= 20 && !r.t20) {
+        r.t20 = now; AN.diag.top20++; anWin(r, now);
+        if (!r.dp && !r.dq && r.c) { r.dq = 1; AN.deepQ.unshift({ m: r.m, dr: 0 }); }   // a top-20 launch outside the random checks: check it anyway (shown, never counted)
+      }
+    }
+  } catch {}
+}
+/** Who first sent SOL to the creator's wallet, from its first transaction. */
+function anFunder(tx, me) {
+  try {
+    if (!tx || !tx.transaction || !tx.transaction.message) return null;
+    const msg = tx.transaction.message, ins = [...(msg.instructions || []), ...(((tx.meta && tx.meta.innerInstructions) || []).flatMap((x) => x.instructions || []))];
+    let best = null;
+    for (const i of ins) {
+      const p = i && i.parsed; if (!p || !p.info) continue;
+      const to = p.info.destination || p.info.newAccount, from = p.info.source || p.info.from;
+      if (/^(transfer|transferWithSeed|createAccount|createAccountWithSeed)$/.test(p.type || "") && to === me && from && from !== me) {
+        const sol = (+p.info.lamports || 0) / 1e9; if (!best || sol > best.sol) best = { from, sol };
+      }
+    }
+    if (best) return { from: best.from, sol: +best.sol.toFixed(3) };
+    const keys = msg.accountKeys || [], key = (x) => (typeof x === "string" ? x : x && x.pubkey ? (x.pubkey.toBase58 ? x.pubkey.toBase58() : String(x.pubkey)) : x && x.toBase58 ? x.toBase58() : "");
+    const payer = key(keys[0]), idx = keys.findIndex((x) => key(x) === me);
+    if (payer && payer !== me && idx >= 0 && tx.meta && tx.meta.preBalances && tx.meta.postBalances) {
+      const d = (tx.meta.postBalances[idx] - tx.meta.preBalances[idx]) / 1e9; if (d > 0) return { from: payer, sol: +d.toFixed(3) };
+    }
+  } catch {}
+  return null;
+}
+/** What kind of X (Twitter) link the token gives. */
+function anTwKind(u) {
+  const x = String(u || "").trim().toLowerCase(); if (x.length < 4) return "none";
+  if (/\/status(es)?\/\d+/.test(x)) return "tweet";
+  if (/\/(i\/)?communities\//.test(x)) return "community";
+  if (/(^|\/\/|\.)(x|twitter)\.com\/[a-z0-9_]{1,15}\/?(\?.*)?$/.test(x) || /^@?[a-z0-9_]{1,15}$/.test(x)) return "account";
+  return "other";
+}
+/** The token's own metadata: which socials it lists. */
+async function anMeta(uri) {
+  if (!/^https:\/\//.test(uri || "")) return null;
+  try {
+    const res = await withTimeout(fetch(uri), 6000, "token meta");
+    const len = res && res.headers && typeof res.headers.get === "function" ? +res.headers.get("content-length") || 0 : 0; if (len > 300000) return null;
+    const j = await withTimeout(res.json(), 5000, "token meta body"); if (!j || typeof j !== "object") return null;
+    const s = (v) => (typeof v === "string" ? v.trim() : "");
+    return { tw: anTwKind(s(j.twitter)), tg: s(j.telegram).length > 3 ? 1 : 0, web: s(j.website).length > 3 ? 1 : 0 };
+  } catch { return null; }
+}
+/** The creator's wallet before launch: how old, how busy, who funded it, and what that funder had done before. 2 chain reads. */
+async function anDeep(r) {
+  if (!r || r.dp || !r.c || typeof connection === "undefined" || !connection || typeof connection.getSignaturesForAddress !== "function") return false;
+  const launchSec = Math.floor(r.t / 1000);
+  let sigs;
+  try { sigs = await withTimeout(connection.getSignaturesForAddress(new PublicKey(r.c), { limit: 100 }), 12000, "creator history"); }
+  catch (e) { AN.diag.deepFail++; AN.diag.deepErr = typeof rpcErrSafe === "function" ? rpcErrSafe(e) : String((e && e.message) || e).slice(0, 120); return false; }
+  if (!Array.isArray(sigs)) return false;
+  r.dp = 1; AN.diag.deep++;
+  r.tx = sigs.filter((s) => s && s.blockTime && s.blockTime < launchSec - 1).length;
+  if (sigs.length >= 100) r.busy = 1;                                      // 100+ transactions: an old or busy wallet (its start is out of reach in one read)
+  else if (sigs.length) {
+    const first = sigs[sigs.length - 1];                                    // newest first, so the last one is the wallet's first transaction ever
+    if (first && first.blockTime) r.age = +Math.max(0, (launchSec - first.blockTime) / 3600).toFixed(2);
+    try {
+      const tx = await withTimeout(connection.getParsedTransaction(first.signature, { maxSupportedTransactionVersion: 0 }), 12000, "creator funding");
+      const f = anFunder(tx, r.c);
+      if (f) {
+        const F = AN.funders.get(f.from) || { ct: [], wt: [], l: 0 };
+        r.fu = f.from; r.fa = f.sol; r.fn = F.ct.filter((t) => t < r.t).length; r.fw = F.wt.filter((t) => t < r.t).length;
+        F.ct.push(r.t); if (F.ct.length > 20) F.ct.splice(0, F.ct.length - 20);   // one entry per creator checked (each record is checked once)
+        F.l = Date.now(); AN.funders.delete(f.from); AN.funders.set(f.from, F);
+        if (AN.funders.size > AN_MAX_FUNDERS) AN.funders.delete(AN.funders.keys().next().value);
+        if ((r.g || r.t20) && !r.wf) { r.wf = 1; F.wt.push(r.g || r.t20); }
+      }
+    } catch (e) { AN.diag.deepFail++; AN.diag.deepErr = typeof rpcErrSafe === "function" ? rpcErrSafe(e) : String((e && e.message) || e).slice(0, 120); }
+  }
+  const meta = r.u ? await anMeta(r.u) : null;
+  if (meta) { r.tw = meta.tw; r.tg = meta.tg; r.web = meta.web; AN.diag.metaOk++; } else AN.diag.metaFail++;
+  r.u = null;
+  return true;
+}
+let anDeepBusy = false;
+async function anDeepTick() {
+  if (anDeepBusy || !AN.deepQ.length) return;
+  if (typeof rpcBudgetOk === "function" && !rpcBudgetOk()) return;          // background research stops at the daily RPC cap; trading never does
+  anDeepBusy = true;
+  try {
+    const q = AN.deepQ.shift(), r = q ? AN.births.get(q.m) : null;
+    if (r && !r.dp) { if (q.dr) r.dr = 1; else if (r.dr == null) r.dr = 0; await anDeep(r); }
+  } catch {} finally { anDeepBusy = false; }
+}
+/** After 24 hours a launch's record is final: a sampled one is added to the study's daily totals; winners are kept for the lists.
+ *  Launches outside the sample that did not win are let go after 12 hours. */
+function anFinalize(now = Date.now()) {
+  for (const [m, r] of AN.births) {
+    if (r.first && now - r.t > 2 * 3600e3) r.first = null;
+    const won = r.g || r.t20 || r.t100;
+    if (!r.smp && !won && now - r.t >= AN_KEEP_OTHERS) { AN.births.delete(m); continue; }
+    if (now - r.t < AN_H) continue;
+    AN.births.delete(m); r.u = null; r.first = null; r.dq = 0; r.fin = 1;
+    if (r.smp) { AN.liveSampled = Math.max(0, AN.liveSampled - 1); anAggAdd(r); }
+    if (r.smp || won) { AN.done.push(r); AN.doneIdx.set(m, r); }
+  }
+  if (AN.done.length > AN_MAX_DONE) for (const r of AN.done.splice(0, AN.done.length - AN_MAX_DONE)) if (AN.doneIdx.get(r.m) === r) AN.doneIdx.delete(r.m);
+  if (AN.wallets.size > AN_MAX_WALLETS) for (const [k, v] of AN.wallets) { if (AN.wallets.size <= AN_MAX_WALLETS * 0.8) break; if (v % 1024 === 0) AN.wallets.delete(k); }
+  if (now - AN.wTrimAt > 3600e3) {
+    AN.wTrimAt = now;
+    const mn = Math.floor(now / 60000); for (const [k, v] of AN.creators) if (mn - (Array.isArray(v) ? v[v.length - 1] : v) >= 1440) AN.creators.delete(k);
+  }
+  if (now - AN.memAt > 60e3) {                                          // a small server: keep only the study sample once memory runs high
+    AN.memAt = now;
+    try { const lim = require("v8").getHeapStatistics().heap_size_limit || Infinity; AN.lean = process.memoryUsage().heapUsed > Math.min(AN_HEAP_LEAN, lim * 0.6); } catch {}
+  }
+  AN.cache = null;
+}
+/** A finished sample launch joins its day's running totals, trait by trait. The study is built from these totals: all history, almost no memory. */
+function anAggAdd(r) {
+  if (!r || !r.smp || r.ag) return; r.ag = 1;
+  const day = new Date(r.t).toISOString().slice(0, 10), D = AN.agg[day] || (AN.agg[day] = { n: 0, h: [0, 0, 0], dp: 0, tr: {} }), y = AN_OUT.map((k) => (r[k] ? 1 : 0));
+  D.n++; y.forEach((v, i) => { D.h[i] += v; }); if (anDeepOk(r)) D.dp++;
+  for (const [, label, test] of AN_TRAITS) {
+    let v; try { v = test(r); } catch { v = null; } if (v == null) continue;
+    const c = D.tr[label] || (D.tr[label] = [0, 0, 0, 0, 0, 0, 0, 0]), o = v ? 0 : 4;   // [with: n, top-20, graduated, top-100 · without: the same]
+    c[o]++; y.forEach((x, i) => { c[o + 1 + i] += x; });
+  }
+  const days = Object.keys(AN.agg).sort(); while (days.length > 120) delete AN.agg[days.shift()];
+}
+function anTick(now = Date.now()) { while (AN.snapQ.length && now - AN.snapQ[0].t >= 90e3) { const r = AN.snapQ.shift(); if (!r.sn) anSnap(r, now); } }
+setInterval(() => { try { anTick(); } catch {} }, 5000);
+setInterval(() => { anDeepTick().catch(() => {}); }, 10000);
+setInterval(() => { try { anFinalize(); } catch {} }, 60e3);
+
+/** The traits the study tests. Each returns true (has it), false (doesn't), or null (unknown: left out of that line). */
+const anDeepOk = (r) => r.dp && r.dr;
+const AN_TRAITS = [
+  ["before", "Creator wallet under 1 day old", (r) => (anDeepOk(r) && !r.busy && r.age != null ? r.age < 24 : null)],
+  ["before", "Creator wallet over 30 days old", (r) => (anDeepOk(r) && !r.busy && r.age != null ? r.age > 720 : null)],
+  ["before", "Busy creator wallet (100+ transactions)", (r) => (anDeepOk(r) ? !!r.busy : null)],
+  ["before", "Funder had funded other creators", (r) => (anDeepOk(r) && r.fu ? r.fn >= 1 : null)],
+  ["before", "Funder funded 20+ creators (exchange-like)", (r) => (anDeepOk(r) && r.fu ? r.fn >= 20 : null)],
+  ["before", "Funder had a winner before", (r) => (anDeepOk(r) && r.fu ? r.fw >= 1 : null)],
+  ["before", "X link is a tweet (news or a viral post)", (r) => (anDeepOk(r) && r.tw ? r.tw === "tweet" : null)],
+  ["before", "X link is an account", (r) => (anDeepOk(r) && r.tw ? r.tw === "account" : null)],
+  ["before", "X link is a community", (r) => (anDeepOk(r) && r.tw ? r.tw === "community" : null)],
+  ["before", "No X, Telegram or website", (r) => (anDeepOk(r) && r.tw ? r.tw === "none" && !r.tg && !r.web : null)],
+  ["before", "Has a website", (r) => (anDeepOk(r) && r.tw ? !!r.web : null)],
+  ["before", "Creator's first launch in 24 hours", (r) => (r.cl == null ? null : r.cl <= 1)],
+  ["before", "Creator's 3rd+ launch in 24 hours", (r) => (r.cl == null ? null : r.cl >= 3)],
+  ["before", "Creator had a winner before", (r) => (r.cw == null ? null : r.cw >= 1)],
+  ["before", "Name rides a word trending right now", (r) => (r.sn && r.hk ? !!r.hw : null)],
+  ["before", "Chinese/Korean/Japanese or emoji name", (r) => (r.ne == null ? null : !!r.ne)],
+  ["before", "Short name (5 characters or fewer)", (r) => (r.nl == null ? null : r.nl <= 5)],
+  ["seconds", "Creator bought 1+ SOL at launch", (r) => (r.sn && !r.nf ? r.dev >= 1 : null)],
+  ["seconds", "Creator bought nothing", (r) => (r.sn && !r.nf ? !(r.dev > 0) : null)],
+  ["seconds", "3+ wallets bought in the first 2 seconds", (r) => (r.sn && !r.nf ? r.ew >= 3 : null)],
+  ["seconds", "First-2-second buyers took 10%+ of supply", (r) => (r.sn && !r.nf ? r.ep >= 10 : null)],
+  ["seconds", "A proven early buyer in the first 10", (r) => (r.sn && !r.nf ? r.pb >= 1 : null)],
+  ["ninety", "30%+ of the curve sold at 90 seconds", (r) => (r.sn && !r.nf && r.p90 != null ? r.p90 >= 30 : null)],
+  ["ninety", "50+ different buyers in 90 seconds", (r) => (r.sn && !r.nf ? r.b90 >= 50 : null)],
+  ["ninety", "10+ SOL net in at 90 seconds", (r) => (r.sn && !r.nf ? r.net90 >= 10 : null)],
+];
+/** 95% range for a rate (Wilson). */
+function anWilson(k, n, z = 1.96) {
+  if (!n) return [0, 1];
+  const p = k / n, d = 1 + (z * z) / n, c = (p + (z * z) / (2 * n)) / d, h = (z * Math.sqrt((p * (1 - p)) / n + (z * z) / (4 * n * n))) / d;
+  return [Math.max(0, c - h), Math.min(1, c + h)];
+}
+/** The study: for each trait, how often finished sample launches WITH it won vs those WITHOUT it, from the daily totals. Cached 1 minute.
+ *  "Proven" needs the effect in the earlier days AND the later days (split near the middle), and a 95% range clear of the others' rate. */
+function anStudy(now = Date.now()) {
+  if (AN.cache && now - AN.cacheAt < 60e3) return AN.cache;
+  const days = Object.keys(AN.agg).sort(), n = days.reduce((a, d) => a + AN.agg[d].n, 0), H = [0, 0, 0];
+  for (const d of days) AN.agg[d].h.forEach((v, i) => { H[i] += v; });
+  const hits = { t20: H[0], g: H[1], t100: H[2] }, oi = H[0] >= 20 ? 0 : 1, outcome = AN_OUT[oi];
+  const early = new Set(); let cum = 0; for (const d of days) { if (cum < n / 2) early.add(d); cum += AN.agg[d].n; }
+  const sm = (h, k) => (h + 0.5) / (k + 1), rows = [];
+  for (const [sec, label] of AN_TRAITS) {
+    const Tt = [0, 0, 0, 0], A = [[0, 0, 0, 0], [0, 0, 0, 0]];
+    for (const d of days) {
+      const c = AN.agg[d].tr[label]; if (!c) continue;
+      const v = [c[0], c[1 + oi], c[4], c[5 + oi]], h = A[early.has(d) ? 0 : 1];
+      for (let k = 0; k < 4; k++) { Tt[k] += v[k]; h[k] += v[k]; }
+    }
+    const [nw, hw, no, ho] = Tt; if (!nw && !no) continue;
+    const lift = sm(hw, nw) / sm(ho, no), l1 = sm(A[0][1], A[0][0]) / sm(A[0][3], A[0][2]), l2 = sm(A[1][1], A[1][0]) / sm(A[1][3], A[1][2]);
+    const [lo, hi] = anWilson(hw, nw), rw = nw ? hw / nw : 0, ro = no ? ho / no : 0, both = A[0][0] + A[0][2] > 0 && A[1][0] + A[1][2] > 0;
+    let verdict = "weak";
+    if (nw < 30 || no < 30 || hw + ho < 5) verdict = "few";
+    else if (both && hw >= 8 && A[0][1] >= 3 && A[1][1] >= 3 && l1 >= 1.5 && l2 >= 1.5 && lo > ro) verdict = "proven";
+    else if (both && ho >= 8 && nw >= 50 && l1 <= 0.67 && l2 <= 0.67 && hi < ro) verdict = "lower";
+    rows.push({ sec, label, nWith: nw, hitsWith: hw, nWithout: no, hitsWithout: ho, ratePct: +(rw * 100).toFixed(2), otherPct: +(ro * 100).toFixed(2),
+      lift: +lift.toFixed(2), liftFirstHalf: +l1.toFixed(2), liftSecondHalf: +l2.toFixed(2), verdict });
+  }
+  AN.cache = { at: now, n, hits, outcome, basePct: n ? +((H[oi] / n) * 100).toFixed(2) : 0, rows, deep: days.reduce((a, d) => a + (AN.agg[d].dp || 0), 0),
+    days: days.length, from: days[0] || null, to: days[days.length - 1] || null, following: AN.births.size, since: AN.since, lean: AN.lean };
+  AN.cacheAt = now; return AN.cache;
+}
+const anAgeTxt = (h) => (h < 1 ? Math.max(1, Math.round(h * 60)) + " min" : h < 48 ? Math.round(h) + " h" : Math.round(h / 24) + " days");
+const anMinTxt = (ms) => { const m = ms / 60000; return m < 90 ? Math.max(1, Math.round(m)) + " min" : (m / 60).toFixed(1) + " h"; };
+const anSocTxt = (r) => (r.tw == null ? "metadata unreadable" : ({ tweet: "X: a tweet link", account: "X: an account", community: "X: a community", other: "X: another link", none: "no X" }[r.tw] || "no X") + (r.tg ? " · Telegram" : "") + (r.web ? " · website" : ""));
+/** Short notes on what a launch looked like at birth, for lists. */
+function anNotes(r) {
+  const out = [];
+  if (r.dp) {
+    out.push(r.busy ? "busy creator wallet" : r.age != null ? "creator wallet " + anAgeTxt(r.age) + " old" : "creator wallet age ?");
+    if (r.fu) out.push(r.fn >= 20 ? "exchange-like funder" : r.fn >= 1 ? `funder had ${r.fn} other creator${r.fn === 1 ? "" : "s"}${r.fw ? " (" + r.fw + " won)" : ""}` : "first-time funder");
+    if (r.tw && r.tw !== "none") out.push("X " + r.tw);
+  }
+  if (r.cl >= 3) out.push(`creator's launch #${r.cl} in 24 h`); else if (r.cw) out.push(`creator had ${r.cw} winner${r.cw === 1 ? "" : "s"}`);
+  if (r.sn && !r.nf) {
+    out.push(`${r.ew} wallet${r.ew === 1 ? "" : "s"} in 2s${r.es ? " (" + r.es + " SOL)" : ""}`);
+    out.push(r.dev > 0 ? `creator ${r.dev} SOL` : "creator bought 0");
+    if (r.pb) out.push(`${r.pb} proven buyer${r.pb === 1 ? "" : "s"}`);
+    if (r.p90 != null) out.push(`${Math.round(r.p90)}% sold at 90s`);
+    out.push(`${r.b90} buyers`);
+  } else if (r.sn) out.push("no feed data");
+  if (r.hw) out.push(`word "${r.hw}"`);
+  if (r.t20) out.push(`top 20 after ${anMinTxt(r.t20 - r.t)}`);
+  return out;
+}
+const anCut = (t, n) => (t.length > n ? t.slice(0, n - 1).replace(/ ·? ?[^·]*$/, "") + " …" : t);
+function anFind(addr) { return AN.births.get(addr) || AN.doneIdx.get(addr) || null; }
+/** One line for the token scan: what the bot saw at its birth. */
+function anBirthLine(addr) { const r = anFind(addr); return r ? "🔬 At birth: " + anNotes(r).join(" · ") + " · /birth for more" : null; }
+/** The top 20 right now, each with its birth record when the bot saw it born. */
+function anTop20Data() {
+  const L = typeof TOP !== "undefined" && Array.isArray(TOP.list) ? TOP.list.filter((p) => p.rank <= 20) : [];
+  return L.map((p) => { const r = anFind(p.addr); return { rank: p.rank, addr: p.addr, sym: p.sym, name: p.name, mcap: Math.round(p.fdv || 0), ageMin: p.createdAt ? Math.round((Date.now() - p.createdAt) / 60000) : null,
+    pump: /pump$/.test(p.addr), birth: r ? { at: r.t, notes: anNotes(r) } : null }; });
+}
+function anPublic() { return { study: anStudy(), top20: anTop20Data(), following: AN.births.size, sampledFollowing: AN.liveSampled, lean: AN.lean, diag: AN.diag, since: AN.since, hotWords: [...AN.hot.keys()].slice(0, 30) }; }
+const AN_CSV = ["mint", "symbol", "name", "launched_utc", "in_sample", "final", "restart_during", "creator", "creator_launches_24h", "creator_past_winners", "name_len", "non_english",
+  "hot_list_ready", "hot_word", "creator_buy_sol", "wallets_first_2s", "sol_first_2s", "supply_pct_first_2s", "proven_early_buyers", "buyers_90s", "net_sol_90s", "bonded_pct_90s",
+  "curve_standard", "feed_seen", "deep_checked", "deep_random", "creator_wallet_age_h", "creator_wallet_busy", "creator_txs_before_launch", "funder", "funding_sol",
+  "funder_creators_before", "funder_winners_before", "x_link", "telegram", "website", "graduated", "grad_min", "top100", "top100_min", "top20", "top20_min", "best_rank"];
+function anCsvRow(r) {
+  const mins = (x) => (x ? ((x - r.t) / 60000).toFixed(1) : "");
+  return [r.m, r.s, r.n, new Date(r.t).toISOString(), r.smp ? 1 : 0, r.fin ? 1 : 0, r.gap ? 1 : 0, r.c, r.cl, r.cw, r.nl, r.ne, r.sn ? (r.hk ? 1 : 0) : "", r.hw || "",
+    r.dev, r.ew, r.es, r.ep, r.pb, r.b90, r.net90, r.p90, r.std, r.sn ? (r.nf ? 0 : 1) : "",
+    r.dp ? 1 : 0, r.dp ? (r.dr ? 1 : 0) : "", r.age, r.dp ? (r.busy ? 1 : 0) : "", r.tx, r.fu, r.fa, r.fn, r.fw, r.tw, r.tg, r.web,
+    r.g ? 1 : 0, mins(r.g), r.t100 ? 1 : 0, mins(r.t100), r.t20 ? 1 : 0, mins(r.t20), r.br].map(csvQ).join(",");
+}
+/** Every birth record: the finished study sample, finished winners, and the sample still being followed (final=0). */
+function anCsv() {
+  const lines = [AN_CSV.join(",")];
+  for (const r of AN.done) lines.push(anCsvRow(r));
+  for (const r of AN.births.values()) if (r.smp || r.g || r.t20 || r.t100) lines.push(anCsvRow(r));
+  return lines.join("\n");
+}
+function tgAnalyst() {
+  const st = anStudy(), D = AN.diag, head = "🔬 <b>Analyst</b> · what the winners had at birth\n";
+  if (st.n < 300) return head + `⏳ <b>Collecting.</b> Each launch is followed for a full 24 hours before it counts, so early luck can't flatter the numbers. ` +
+    `First results about a day after this update; trustworthy ones after a few days.\n\nSince the last restart: ${D.launches.toLocaleString()} launches recorded · ${AN.births.size.toLocaleString()} being followed · ` +
+    `${D.deep.toLocaleString()} creator wallets checked · ${D.top20} reached the top 20 and ${D.grads} graduated while being followed. Finished in the study so far: ${st.n.toLocaleString()} (300 needed).${AN.lean ? " ⚠️ The server is short on memory, so only the study sample is being kept." : ""}\n\n` +
+    "Meanwhile, /top20 shows the top 20 right now with what each one looked like at birth.";
+  const icon = { proven: "✅", lower: "🔻", weak: "⚠️", few: "⏳" }, fl = (x) => (x >= 10 ? String(Math.round(x)) : x.toFixed(1)) + "×";
+  const sec = (k, title) => {
+    const rows = st.rows.filter((x) => x.sec === k).sort((a, b) => (b.verdict === "proven") - (a.verdict === "proven") || b.lift - a.lift);
+    return rows.length ? `\n\n<b>${title}</b>\n` + rows.map((x) => `${icon[x.verdict]} <b>${fl(x.lift)}</b> ${x.label} · ${x.ratePct}% vs ${x.otherPct}% (${x.nWith.toLocaleString()})`).join("\n") : "";
+  };
+  return head + `Studied <b>${st.n.toLocaleString()}</b> launches over ${st.days} day${st.days === 1 ? "" : "s"} (${st.from}${st.days > 1 ? " to " + st.to : ""}; a random sample, each followed 24 hours) · <b>${st.hits.t20}</b> reached the top 20 · <b>${st.hits.g}</b> graduated\n` +
+    `Judged by <b>${st.outcome === "t20" ? "reaching the top 20" : "graduating"}</b> (${st.basePct}% of launches)${st.outcome === "g" ? ` · switches to the top 20 once 20 have made it (now ${st.hits.t20})` : ""}\n` +
+    "Each line: how many times more often launches WITH the trait made it · their rate vs launches without it · (how many had it)" +
+    sec("before", "Before launch") + sec("seconds", "First seconds") + sec("ninety", "First 90 seconds") +
+    `\n\n✅ proven: held up in both halves of the data · ⚠️ not proven · 🔻 fewer winners · ⏳ not enough yet\nCreator wallets checked in the sample: ${st.deep.toLocaleString()}`;
+}
+function tgTop20() {
+  const L = anTop20Data(); if (!L.length) return "🏆 The top-20 list is still loading. Try again in a few minutes.";
+  const seen = L.filter((x) => x.birth).length;
+  const head = `🏆 <b>Top 20 now</b> · GeckoTerminal trending, Solana, last hour · ${tgAgo(TOP.at)} ago\n\n`;
+  const foot = `\n\nSeen at birth: ${seen} of ${L.length} · /birth and an address for the full record\n<i>GeckoTerminal ranks pools on people viewing them, volume, transactions, liquidity and safety checks over the last hour.</i>`;
+  const rows = L.map((x) => ({ top: `${x.rank}. <b>${tgEsc(x.sym)}</b> $${tgK(x.mcap)}${x.ageMin != null ? " · " + anMinTxt(x.ageMin * 60000) + " old" : ""}`,
+    notes: x.birth ? x.birth.notes.join(" · ") : null, tail: x.pump ? " · no birth record" : " · not a pump.fun launch" }));
+  let cap = 400, out = "";
+  const build = () => head + rows.map((r) => r.top + (r.notes != null ? "\n   🔬 " + tgEsc(anCut(r.notes, cap)) : r.tail)).join("\n") + foot;
+  out = build(); while (out.length > 3750 && cap > 40) { cap -= 10; out = build(); }   // full notes when they fit; otherwise every row is trimmed evenly
+  return out;
+}
+function tgBirth(addr) {
+  const r = anFind(addr);
+  if (!r) return `🔬 No birth record for <code>${tgEsc(addr)}</code>.\nThe bot writes one for every pump.fun launch it sees live and keeps it 24 hours (3 days for the study sample and for anything that reached the top 20 or graduated). Older tokens and tokens from other launchpads have none.`;
+  const L = [`🔬 <b>Birth record</b> · ${tgEsc(r.s)} ${tgEsc(r.n)}`, `Born ${new Date(r.t).toISOString().slice(0, 16).replace("T", " ")} UTC (${tgAgo(r.t)} ago) · in the study sample: ${r.smp ? "yes" : "no"}${r.gap ? " · ⚠️ a restart happened while it was followed" : ""}`, "", "<b>Before launch</b>"];
+  if (r.dp) {
+    L.push(`• Creator wallet: ${r.busy ? "busy (100+ transactions)" : r.age != null ? anAgeTxt(r.age) + " old" : "age unknown"}${!r.busy && r.tx != null ? ` · ${r.tx} transaction${r.tx === 1 ? "" : "s"} before launch` : ""}`);
+    if (r.fu) L.push(`• Funded by <code>${tgEsc(r.fu.slice(0, 4) + "…" + r.fu.slice(-4))}</code> with ${r.fa} SOL · that wallet had funded ${r.fn} other creator${r.fn === 1 ? "" : "s"}${r.fw ? ` (${r.fw} winner${r.fw === 1 ? "" : "s"})` : ""} before`);
+    else if (!r.busy) L.push("• Funder: not found");
+    L.push("• Socials: " + anSocTxt(r));
+  } else L.push(`• Creator wallet and funder: ${r.dq ? "check queued" : "not checked (checks run on a random sample)"}`);
+  L.push(`• Creator's launches in the last 24 hours: ${r.cl == null ? "?" : r.cl}${r.cw ? ` · ${r.cw} earlier winner${r.cw === 1 ? "" : "s"}` : ""}`);
+  L.push(`• Name: ${r.nl} characters${r.ne ? " · non-English or emoji" : ""}${r.sn && r.hk ? (r.hw ? ` · rides the trending word "${tgEsc(r.hw)}"` : " · no trending word") : ""}`);
+  L.push("", "<b>First seconds</b>");
+  if (!r.sn) L.push("• Not measured yet (it is measured at 90 seconds)");
+  else if (r.nf) L.push("• No feed data (a very busy moment, or a restart)");
+  else {
+    L.push(`• Creator bought ${r.dev || 0} SOL · ${r.ew} wallet${r.ew === 1 ? "" : "s"} bought in the first 2 seconds (${r.es} SOL, ${r.ep}% of supply)`);
+    L.push(`• Proven early buyers among the first ${AN_FIRST_N}: ${r.pb}`);
+    L.push("", "<b>First 90 seconds</b>", `• ${r.p90 != null ? Math.round(r.p90) + "% of the curve sold" : "curve % unknown (non-standard curve)"} · ${r.b90} different buyers · net ${r.net90 >= 0 ? "+" : ""}${r.net90} SOL`);
+  }
+  const out = [r.g ? "graduated after " + anMinTxt(r.g - r.t) : null, r.t100 ? "top 100 after " + anMinTxt(r.t100 - r.t) : null, r.t20 ? "top 20 after " + anMinTxt(r.t20 - r.t) : null, r.br ? "best rank #" + r.br : null].filter(Boolean);
+  L.push("", "<b>What happened</b> (first 24 hours)", "• " + (out.length ? out.join(" · ") : r.fin ? "it never graduated or reached the top 100" : "nothing yet (still being followed)"));
+  L.push("", `<code>${tgEsc(r.m)}</code>`);
+  return L.join("\n");
+}
+function anReportLine() {
+  const st = anStudy(), pr = st.rows.filter((x) => x.verdict === "proven").sort((a, b) => b.lift - a.lift)[0];
+  return st.n >= 300 ? `🔬 Analyst: ${st.n.toLocaleString()} launches studied · ${st.hits.t20} reached the top 20, ${st.hits.g} graduated · ${pr ? "strongest proven sign: " + pr.label.toLowerCase() + " (" + pr.lift + "×)" : "no sign proven yet"}`
+    : `🔬 Analyst: collecting (${AN.births.size.toLocaleString()} launches being followed, ${st.n} finished of the 300 the first results need)`;
+}
+/*ANALYST_END*/
+
 
 
 /*AUTO_BEGIN*/
@@ -3624,6 +4105,7 @@ function mpReportText() {
     lines.push(`🗺️ Plan: day ${p.day} of ${p.days} · ${p.gates.filter((g) => g.ok).length} of ${p.gates.length} gates met${p.verdict ? " · VERDICT " + p.verdict : ""}`);
     lines.push(`📘 Playbook: ${pb.kept.length} kept · ${pb.avoid.length} confirmed to avoid · ${pb.testing.length} being tested · 📒 ${led.n} tokens in the ledger (${led.skipped.wins} skipped winners)${gx.n ? ` · 🎓 Index: ${gx.n} graduates, ${gx.runners10} runners 10x+, line ${gx.ret >= 0 ? "+" : ""}${gx.ret}%` : ""}`); } catch {}
   { const g = mpGoal(); if (g.n) lines.push(`🎯 Goal $${g.goal} per trade: averaging <b>${g.avg >= 0 ? "$" : "−$"}${Math.abs(g.avg).toFixed(2)}</b> over the last ${g.n} trades${g.hit ? " ✅" : ""}.`); }
+  try { if (typeof anReportLine === "function") lines.push(anReportLine()); } catch {}
   if (MP.runs[0]) lines.push("📚 " + mpRunsLine());
   lines.push(`Now: ${B.pausedUntil > now ? "⏸ paused (" + B.pauseWhy + ")" : "🟢 trading"} · ${S.momentum ? "momentum entries" : "buy at 90s"}${S.gradOn ? " + graduates" : ""}${S.fastLane ? " + launch shot" : ""} · stop −${S.slPct}% · ${S.sizeByRisk ? `risk ${S.riskPerTradePct}% a trade, up to ${S.maxOpen} at a time` : S.slots > 0 ? `${S.slots} bets at a time` : `${S.riskPct}% a bet, up to ${S.maxOpen} at a time`} · daily stop ${S.dailyStopPct}%`);
   return lines.join("\n\n");
@@ -4028,6 +4510,7 @@ const STORE_INFO = [
   ["cannon-ledger.json", "Token ledger: a win/loss row for every token judged", () => LED_FILE],
   ["cannon-playbook.json", "Playbook: patterns and lessons, kept forever", () => PB_FILE],
   ["cannon-gradindex.json", "Graduate Index: every graduate followed for 7 days", () => GX_FILE],
+  ["cannon-analyst.json", "Analyst: birth records, proven early buyers, funders", () => (typeof AN_FILE !== "undefined" ? AN_FILE : "")],
 ];
 function storageStatus() {
   const now = Date.now();
@@ -4041,6 +4524,10 @@ function tgDataHealth() {
   if (H) lines.push(`Holders measured: ${H.feed} from the live feed, ${H.rpc} from the chain check · ${H.none} unmeasured, so skipped (never bought blind)`);
   if (H && H.rpcFails) lines.push(`The chain's holder call failed ${H.rpcFails} times${H.rpcErr ? " (last: " + tgEsc(H.rpcErr.slice(0, 80)) + ")" : ""}`);
   if (C) lines.push(`Curves: ${C.std} standard · ${C.nonStd} non-standard, skipped${C.tripped ? " · ⚠️ SAFETY SWITCH ON: the check is paused" : ""}`);
+  if (typeof AN !== "undefined") {
+    const D = AN.diag, esc = (x) => (typeof tgEsc === "function" ? tgEsc(x) : String(x));
+    lines.push(`Analyst: ${D.launches} launches recorded since the restart · ${AN.births.size} being followed · creator wallets checked ${D.deep}${D.deepFail ? " (" + D.deepFail + " reads failed" + (D.deepErr ? ": " + esc(String(D.deepErr).slice(0, 60)) : "") + ")" : ""} · token metadata read ${D.metaOk} of ${D.metaOk + D.metaFail}`);
+  }
   return lines.join("\n");
 }
 function tgSaved() {
@@ -4421,7 +4908,7 @@ function decodeTradeEvent(b64) {
     const vSol = Number(buf.readBigUInt64LE(o)) / 1e9; o += 8;
     const vTok = Number(buf.readBigUInt64LE(o)) / 1e6; o += 8;
     if (!(sol >= 0) || !(vTok > 0)) return null;
-    return { mint, sol, tokens, isBuy, user, ts, priceSol: vSol / vTok };
+    return { mint, sol, tokens, isBuy, user, ts, priceSol: vSol / vTok, vSol, vTok };
   } catch { return null; }
 }
 /** Pure: a pump.fun graduation (the curve completed) from a "Program data:" log line, or null. */
@@ -4480,10 +4967,11 @@ function mpOnTrade(tr) {
     const h = f.hold || (f.hold = new Map()), cur = h.get(tr.user) || 0, next = tr.isBuy ? cur + tr.tokens : Math.max(0, cur - tr.tokens);
     if (next > 1e-6) h.set(tr.user, next); else h.delete(tr.user);
     if (h.size > 5000) h.delete(h.keys().next().value);
-    if (f.ts0 == null && Number.isFinite(tr.ts)) f.ts0 = tr.ts;      // the chain's clock at the first trade (the creator's own buy)
+    if (f.ts0 == null && Number.isFinite(tr.ts)) f.ts0 = tr.ts;
+    if (f.std == null && tr.vSol > 0 && tr.vTok > 0) f.std = Math.abs((tr.vSol * tr.vTok) / 3.219e10 - 1) < 0.003 ? 1 : 0;   // a standard pump.fun curve? (its reserves multiply to a fixed number)      // the chain's clock at the first trade (the creator's own buy)
     if (tr.isBuy) {
       if (f.creator && tr.user === f.creator) f.devBuy = (f.devBuy || 0) + tr.sol;
-      else if (f.ts0 != null && Number.isFinite(tr.ts) && tr.ts - f.ts0 <= 2) { f.early = (f.early || 0) + tr.tokens; (f.earlyU || (f.earlyU = new Set())).add(tr.user); }   // snipers / bundles: bought within 2 seconds of launch
+      else if (f.ts0 != null && Number.isFinite(tr.ts) && tr.ts - f.ts0 <= 2) { f.early = (f.early || 0) + tr.tokens; f.earlySol = (f.earlySol || 0) + tr.sol; (f.earlyU || (f.earlyU = new Set())).add(tr.user); }   // snipers / bundles: bought within 2 seconds of launch
       f.maxBuy = Math.max(f.maxBuy || 0, tr.sol);
     }
   }
@@ -4562,6 +5050,7 @@ function mpOnComplete(ev) {
   if (seenAt) rhCount("g", seenAt);                                       // a graduation counts for the hour the token was LAUNCHED
   MP.feed.grads = (MP.feed.grads || 0) + 1;
   gxPending(ev.mint);                                                      // the Graduate Index follows EVERY graduate, whether or not the bot trades it
+  if (typeof anOnGrad === "function") anOnGrad(ev.mint, now);             // the Analyst: this birth record graduated
   if (typeof gradWatchAdd === "function") gradWatchAdd(ev.mint);
   if (typeof tgGraduated === "function") tgGraduated(ev.mint);
 }
@@ -4608,6 +5097,7 @@ function mpOnLaunch(ev) {
   const c = MP.creators.get(ev.creator) || [];
   c.push(Date.now()); MP.creators.set(ev.creator, c.filter((t) => Date.now() - t < 24 * 3600e3));
   if (MP.creators.size > 50000) MP.creators.delete(MP.creators.keys().next().value);
+  if (typeof anOnLaunch === "function") anOnLaunch(ev);                   // the Analyst writes a birth record for EVERY launch (no chain reads)
   // instant rejects that need no chain reads
   if (!/pump$/.test(ev.mint)) { mpTape(ev.mint, "skipped: not a pump.fun mint"); return mpSkip("not a pump.fun mint"); }
   if (!ev.uri) { mpTape(ev.mint, "skipped: no metadata"); return mpSkip("no metadata"); }
@@ -4670,7 +5160,7 @@ async function mpEvaluate(ev) {
   };
   // every launch with real money in it gets watched for a creator dump, pass or skip
   let devAt = null; try { devAt = ((await balanceOf(ev.creator, ev.mint)) / 1e9) * 100; } catch {}
-  labSnap(ev, m, devAt);                                        // the Winner Lab writes down what this launch looked like
+  labSnap(ev, m, devAt, !std.ok);                               // the Winner Lab writes down what this launch looked like
   if (m.progress >= 1) pathStart(ev, m);                        // the Sweet Spot Finder records its price for 45 minutes
   // holders, counted exactly from the live feed (the chain's "largest holders" call failed on every token for weeks, silently)
   const soldTok = typeof c.rTok === "bigint" ? Number(INITIAL_REAL_TOKEN_RESERVES - (c.rTok < INITIAL_REAL_TOKEN_RESERVES ? c.rTok : INITIAL_REAL_TOKEN_RESERVES)) / 1e6 : null;
@@ -5267,6 +5757,7 @@ function tgBroadcast(text, kb) {
   TG.sent.push(now); for (const c of TG.chats) tgSend(c, text, kb);
 }
 const TG_MENU = [
+  [{ text: "🔬 Analyst", callback_data: "analyst" }, { text: "🏆 Top 20 at birth", callback_data: "top20" }],
   [{ text: "📊 Status", callback_data: "status" }, { text: "📈 Positions", callback_data: "positions" }],
   [{ text: "🔥 Hot launches", callback_data: "hot" }, { text: "🎓 Graduates", callback_data: "grads" }],
   [{ text: "📉 Why losing", callback_data: "why" }, { text: "🧭 Strategy", callback_data: "strategy" }],
@@ -5350,7 +5841,7 @@ async function tgLookup(addr) {
   const icon = { DANGER: "🚨", RISKY: "⚠️", CAUTION: "🟡", PASSED: "🟢", UNVERIFIED: "❔" }[r.verdict] || "❔", lv = { danger: "🚨", risk: "⚠️", caution: "🟡" };
   const text = `${icon} <b>${tgEsc(r.verdict)}</b> · ${tgEsc(r.symbol || (t && t.symbol) || "?")} ${tgEsc(r.name || (t && t.name) || "")}${r.score != null ? " · score " + r.score + "/100" : ""}\n` +
     (t && t.price ? `Price $${t.price < 0.01 ? t.price.toPrecision(3) : t.price.toFixed(4)} · cap $${tgK(t.mcap || 0)} · liquidity $${tgK(t.liq || 0)} · vol 24h $${tgK(t.vol24 || 0)}\n` : "") +
-    ((r.flags || []).slice(0, 6).map((f) => `${lv[f.level] || "•"} ${tgEsc(f.text)}`).join("\n") || "No warning signs found.") + `\n\n<code>${tgEsc(addr)}</code>`;
+    ((r.flags || []).slice(0, 6).map((f) => `${lv[f.level] || "•"} ${tgEsc(f.text)}`).join("\n") || "No warning signs found.") + (typeof anBirthLine === "function" && anBirthLine(addr) ? "\n\n" + tgEsc(anBirthLine(addr)) : "") + `\n\n<code>${tgEsc(addr)}</code>`;
   return { text, kb: [[{ text: "📈 Chart", url: `https://dexscreener.com/solana/${addr}` }, { text: "🔎 Full scan", url: `https://cryptobizmo2.github.io/SLAPBOT/?scan=${addr}` }]] };
 }
 async function tgAct(chat, what) {
@@ -5364,7 +5855,7 @@ async function tgAct(chat, what) {
 }
 async function tgCallback(chat, data) {
   if (data === "export") return tgExport(chat);
-  const views = { status: tgStatus, positions: tgPositions, hot: tgHot, grads: tgGrads, why: tgWhy, strategy: tgStrategy, top: tgTop, sweet: tgSweet, vault: tgVault, report: mpReportText, goal: tgGoal, rhythm: tgRhythm, band: tgBand, court: tgCourt, signals: tgSignals, saved: tgSaved, plan: tgPlan, ledger: tgLedger, playbook: tgPlaybook, index: tgIndex };
+  const views = { analyst: tgAnalyst, top20: tgTop20, status: tgStatus, positions: tgPositions, hot: tgHot, grads: tgGrads, why: tgWhy, strategy: tgStrategy, top: tgTop, sweet: tgSweet, vault: tgVault, report: mpReportText, goal: tgGoal, rhythm: tgRhythm, band: tgBand, court: tgCourt, signals: tgSignals, saved: tgSaved, plan: tgPlan, ledger: tgLedger, playbook: tgPlaybook, index: tgIndex };
   if (views[data]) return tgSend(chat, views[data](), TG_MENU);
   if (data === "alerts") { TG.alerts = !TG.alerts; CONN.tgAlerts = TG.alerts; saveConn(); return tgSend(chat, TG.alerts ? "🔔 Alerts are ON." : "🔕 Alerts are OFF.", TG_MENU); }
   if (data.startsWith("ask:")) { const w = data.slice(4); return tgSend(chat, `Are you sure you want to <b>${tgEsc(w)}</b>?`, [[{ text: "✅ Yes, " + w, callback_data: "do:" + w }, { text: "✖ Cancel", callback_data: "no" }]]); }
@@ -5389,11 +5880,12 @@ async function tgHandle(u) {
     return tgSend(chat, /^\/start\b/i.test(text) ? "🔒 This bot is private. To connect your phone: open your ALKAID dashboard, go to Connections, tap Make a pairing code, then tap the green Open Telegram button it shows." : "🔒 This bot is private.");
   }
   const cmd = text.split(/[\s@]/)[0].toLowerCase(), arg = text.split(/\s+/)[1] || "";
-  const views = { "/status": tgStatus, "/positions": tgPositions, "/hot": tgHot, "/graduates": tgGrads, "/grads": tgGrads, "/why": tgWhy, "/strategy": tgStrategy, "/top": tgTop, "/sweet": tgSweet, "/vault": tgVault, "/report": mpReportText, "/goal": tgGoal, "/rhythm": tgRhythm, "/band": tgBand, "/court": tgCourt, "/signals": tgSignals, "/saved": tgSaved, "/plan": tgPlan, "/ledger": tgLedger, "/playbook": tgPlaybook, "/index": tgIndex };
+  const views = { "/analyst": tgAnalyst, "/top20": tgTop20, "/status": tgStatus, "/positions": tgPositions, "/hot": tgHot, "/graduates": tgGrads, "/grads": tgGrads, "/why": tgWhy, "/strategy": tgStrategy, "/top": tgTop, "/sweet": tgSweet, "/vault": tgVault, "/report": mpReportText, "/goal": tgGoal, "/rhythm": tgRhythm, "/band": tgBand, "/court": tgCourt, "/signals": tgSignals, "/saved": tgSaved, "/plan": tgPlan, "/ledger": tgLedger, "/playbook": tgPlaybook, "/index": tgIndex };
   if (cmd === "/export") return tgExport(chat);
   if (views[cmd]) return tgSend(chat, views[cmd](), TG_MENU);
   if (cmd === "/pause" || cmd === "/resume" || cmd === "/defense" || cmd === "/balanced" || cmd === "/offense" || cmd === "/fresh" || cmd === "/v10" || cmd === "/v11") return tgCallback(chat, "ask:" + cmd.slice(1));
   if (cmd === "/alerts") { TG.alerts = !/^off$/i.test(arg); CONN.tgAlerts = TG.alerts; saveConn(); return tgSend(chat, TG.alerts ? "🔔 Alerts are ON." : "🔕 Alerts are OFF.", TG_MENU); }
+  if (cmd === "/birth") return tgSend(chat, SOL_ADDR.test(arg) ? tgBirth(arg) : "🔬 Send /birth, a space, then the token address.", TG_MENU);
   const addr = SOL_ADDR.test(text) ? text : (cmd === "/lookup" || cmd === "/scan") && SOL_ADDR.test(arg) ? arg : null;
   if (addr) { await tgApi("sendChatAction", { chat_id: chat, action: "typing" }).catch(() => {}); const r = await tgLookup(addr); return tgSend(chat, r.text, r.kb); }
   return tgSend(chat, "Pick something, or paste a Solana token address to scan it:", TG_MENU);
@@ -5402,6 +5894,8 @@ async function tgHandle(u) {
 const TG_DESC = TG_NAME + " · private trading assistant.\n\nLive alerts, open positions, strategy reports and token safety scans for its owner.\n\nThis bot is private: it only answers phones paired from the owner's dashboard.";
 const TG_SHORT = TG_NAME + " · private trading alerts and token safety scans.";
 const TG_COMMANDS = [
+  { command: "analyst", description: "What top-20 tokens had at birth" }, { command: "top20", description: "Top 20 now, with each one's birth record" },
+  { command: "birth", description: "Birth record: /birth then the address" },
   { command: "status", description: "Balance, today, open trades" }, { command: "positions", description: "Open trades with live profit or loss" },
   { command: "hot", description: "Hottest launches right now" }, { command: "graduates", description: "Recent graduations" },
   { command: "why", description: "Why it's winning or losing" }, { command: "strategy", description: "What the bot is doing" },
@@ -5500,7 +5994,8 @@ async function tgExport(chat) {
   TG_DOC_GAP.last = now;
   const files = [["fuflopbot-launches.csv", launchCsv(), "Every judged launch: what it looked like at 90 seconds and how it ended"], ["fuflopbot-paths.csv", pathsCsv(), "The full price path of each one (every 15 seconds, up to 45 minutes)"],
     ["fuflopbot-signals.csv", signalsCsv(), "Every momentum signal and how each exit style would have done"], ["fuflopbot-ledger.csv", ledCsv(), "A win/loss row for every token, with the bot's decision"], ["fuflopbot-trades.csv", tradesCsv(), "Every closed paper trade"],
-    ["fuflopbot-index.csv", gxCsv(), "Every graduate followed for 7 days, with its price path (for testing hold and dip-buy over days)"]];
+    ["fuflopbot-index.csv", gxCsv(), "Every graduate followed for 7 days, with its price path (for testing hold and dip-buy over days)"],
+    ["fuflopbot-births.csv", anCsv(), "Analyst: every launch's birth record (creator wallet, funder, first-second buyers, 90-second numbers) and whether it reached the top 20 or graduated within 24 hours. For fair rates use only rows with in_sample=1 and final=1."]];
   await tgSend(chat, `📤 Sending ${files.length} spreadsheets. This takes about ${Math.ceil((files.length * (TG_DOC_GAP.ms + 600)) / 1000)} seconds.`);
   let sent = 0;
   for (const [name, text, cap] of files) {
@@ -5529,6 +6024,14 @@ function connPublic() {
       link: TG.pair && Date.now() < TG.pair.exp && TG.me ? `https://t.me/${TG.me.username}?start=${TG.pair.code}` : null } };
 }
 app.get("/api/mp/connections", (req, res) => { if (!requireOwner(req, res)) return; res.json(connPublic()); });
+/** Owner-only: the Analyst's study, the top 20 with birth records, and every birth record as a spreadsheet. */
+app.get("/api/mp/analyst", (req, res) => { if (!requireOwner(req, res)) return; res.json(anPublic()); });
+app.get("/api/mp/births.csv", (req, res) => {
+  if (!requireOwner(req, res)) return;
+  res.setHeader("Content-Type", "text/csv; charset=utf-8");
+  res.setHeader("Content-Disposition", `attachment; filename="fuflopbot-births-${new Date().toISOString().slice(0, 10)}.csv"`);
+  res.send(anCsv());
+});
 app.post("/api/mp/connections", async (req, res) => {
   if (!requireOwner(req, res)) return;
   const b = req.body || {};
