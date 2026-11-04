@@ -53,6 +53,35 @@ if (process.env.PROXY_TO) {
   return;   // stop here: nothing below runs in proxy mode
 }
 
+/**
+ * HEAP MODE. Node limits a program to about a quarter of the server's RAM by default (about 0.5 GB on a 2 GB server),
+ * far less than the box really has. When that ceiling is the low default, this file starts ITSELF again with a higher
+ * one (about 55% of the RAM, at most 1200 MB) and acts only as a thin supervisor: it passes stop signals to the real
+ * bot and exits with the same exit code, so systemd, the auto-updater and restarts behave exactly as before.
+ * If anything about this fails, the bot simply runs in this process with the default ceiling.
+ */
+if (!process.env.SLAP_HEAP_CHILD && !process.env.PROXY_TO) {
+  try {
+    const lim = require("v8").getHeapStatistics().heap_size_limit, ramMb = require("os").totalmem() / 1048576;
+    const wantMb = Math.min(1200, Math.floor(ramMb * 0.55));
+    const manual = /max-old-space-size/.test(String(process.env.NODE_OPTIONS || "") + " " + process.execArgv.join(" "));
+    if (!manual && lim < 900e6 && wantMb * 1048576 > lim * 1.4) {
+      const ch = require("child_process").spawn(process.execPath, [...process.execArgv, "--max-old-space-size=" + wantMb, ...process.argv.slice(1)],
+        { stdio: "inherit", env: { ...process.env, SLAP_HEAP_CHILD: "1" } });
+      console.log(`[heap] default memory ceiling is ${Math.round(lim / 1048576)} MB; running the bot with ${wantMb} MB (this server has ${Math.round(ramMb)} MB)`);
+      let stopping = false;
+      for (const sg of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(sg, () => {
+        try { ch.kill(sg); } catch {}
+        if (!stopping) { stopping = true; setTimeout(() => { try { ch.kill("SIGKILL"); } catch {} process.exit(1); }, 15000).unref(); }
+      });
+      ch.on("error", (e) => { console.error("[heap] could not start the bot: " + (e && e.message)); process.exit(1); });
+      ch.on("exit", (code) => process.exit(code == null ? 1 : code));
+      process.on("exit", () => { try { ch.kill("SIGKILL"); } catch {} });
+      return;   // this process only supervises
+    }
+  } catch (e) { console.error("[heap] staying with the default memory ceiling: " + (e && e.message)); }
+}
+
 const express = require("express");
 const cors = require("cors");
 const rateLimit = require("express-rate-limit");
@@ -92,7 +121,7 @@ const SOLANA_RPC_URL = CONN.rpcUrl || process.env.SOLANA_RPC_URL || "https://api
 const SLAPGOLD_MINT = process.env.SLAPGOLD_MINT; // e.g. 4R7Hbdhh3YeVqZaESRA3qPJ8Z3xh3Qedsw88RDjxL1Q9
 // The owner wallet. Set here (it's a public address, not a secret) so it can be changed with a normal upload,
 // without touching the server's settings file. It wins over the MY_WALLET setting.
-const BUILD_ID = "2026-11-03 · FUFLOPBOT · V1.2 · Analyst: a birth record for every launch, top-20 tracking, /analyst /top20 /birth · Winner Lab counts finished launches only";            // shown on the dashboard and the health page: it tells you which version is running
+const BUILD_ID = "2026-11-03 · FUFLOPBOT · V1.2.1 · Analyst + memory: the bot now uses more of the server's RAM · /analyst /top20 /birth · Winner Lab counts finished launches only";            // shown on the dashboard and the health page: it tells you which version is running
 const OWNER_WALLET = "4t3F4TvCsRCohYJ3EZ4B2ahaN2nN5kBE3A8WUVy2K1CF";
 const MY_WALLET = OWNER_WALLET || process.env.MY_WALLET;   // YOUR wallet address — the only one allowed in
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*"; // lock to your GitHub Pages URL once live
@@ -3528,7 +3557,7 @@ const AN_DEEP_PER_MIN = 6;                       // creator-wallet checks a minu
 const AN_FIRST_N = 10;                           // first buyers scored for "proven early buyers"
 const AN_KEEP_OTHERS = 8 * 3600e3;              // launches outside the sample are kept 8 hours (for the top-20 notes), longer only if they win
 const AN_MAX_LIVE = 45000, AN_MAX_SAMPLED = 25000, AN_MAX_DONE = 15000, AN_MAX_WALLETS = 60000, AN_MAX_FUNDERS = 20000, AN_MAX_CREATORS = 80000;
-const AN_HEAP_LEAN = 450e6;                      // past this much server memory the Analyst keeps only the study sample (the study itself is untouched)
+const AN_HEAP_LEAN = 700e6;                      // past this much server memory (or 60% of Node's ceiling, whichever is lower) the Analyst keeps only the study sample (the study itself is untouched)
 const AN_OUT = ["t20", "g", "t100"];             // outcomes: reached the top 20, graduated, reached the top 100 (each within 24 hours)
 const AN_CURVE_K = 30 * 1073000000;              // standard pump.fun curve: virtual SOL × virtual tokens stays at this
 const AN_KEYS = ["m", "s", "n", "c", "t", "smp", "fin", "gap", "cl", "cw", "nl", "ne", "hk", "hw", "sn", "nf", "dev", "ew", "es", "ep", "pb", "b90", "net90", "p90", "std",
@@ -3898,7 +3927,8 @@ function anTop20Data() {
   return L.map((p) => { const r = anFind(p.addr); return { rank: p.rank, addr: p.addr, sym: p.sym, name: p.name, mcap: Math.round(p.fdv || 0), ageMin: p.createdAt ? Math.round((Date.now() - p.createdAt) / 60000) : null,
     pump: /pump$/.test(p.addr), birth: r ? { at: r.t, notes: anNotes(r) } : null }; });
 }
-function anPublic() { return { study: anStudy(), top20: anTop20Data(), following: AN.births.size, sampledFollowing: AN.liveSampled, lean: AN.lean, diag: AN.diag, since: AN.since, hotWords: [...AN.hot.keys()].slice(0, 30) }; }
+function anHeapTxt() { try { const L = require("v8").getHeapStatistics().heap_size_limit; return Math.round(process.memoryUsage().heapUsed / 1048576) + " of " + Math.round(L / 1048576) + " MB used"; } catch { return "memory unknown"; } }
+function anPublic() { return { study: anStudy(), top20: anTop20Data(), following: AN.births.size, sampledFollowing: AN.liveSampled, lean: AN.lean, heap: anHeapTxt(), diag: AN.diag, since: AN.since, hotWords: [...AN.hot.keys()].slice(0, 30) }; }
 const AN_CSV = ["mint", "symbol", "name", "launched_utc", "in_sample", "final", "restart_during", "creator", "creator_launches_24h", "creator_past_winners", "name_len", "non_english",
   "hot_list_ready", "hot_word", "creator_buy_sol", "wallets_first_2s", "sol_first_2s", "supply_pct_first_2s", "proven_early_buyers", "buyers_90s", "net_sol_90s", "bonded_pct_90s",
   "curve_standard", "feed_seen", "deep_checked", "deep_random", "creator_wallet_age_h", "creator_wallet_busy", "creator_txs_before_launch", "funder", "funding_sol",
@@ -3921,7 +3951,7 @@ function tgAnalyst() {
   const st = anStudy(), D = AN.diag, head = "🔬 <b>Analyst</b> · what the winners had at birth\n";
   if (st.n < 300) return head + `⏳ <b>Collecting.</b> Each launch is followed for a full 24 hours before it counts, so early luck can't flatter the numbers. ` +
     `First results about a day after this update; trustworthy ones after a few days.\n\nSince the last restart: ${D.launches.toLocaleString()} launches recorded · ${AN.births.size.toLocaleString()} being followed · ` +
-    `${D.deep.toLocaleString()} creator wallets checked · ${D.top20} reached the top 20 and ${D.grads} graduated while being followed. Finished in the study so far: ${st.n.toLocaleString()} (300 needed).${AN.lean ? " ⚠️ The server is short on memory, so only the study sample is being kept." : ""}\n\n` +
+    `${D.deep.toLocaleString()} creator wallets checked · ${D.top20} reached the top 20 and ${D.grads} graduated while being followed. Finished in the study so far: ${st.n.toLocaleString()} (300 needed).${AN.lean ? " ⚠️ The server is short on memory (" + anHeapTxt() + "), so only the study sample is being kept." : ""}\n\n` +
     "Meanwhile, /top20 shows the top 20 right now with what each one looked like at birth.";
   const icon = { proven: "✅", lower: "🔻", weak: "⚠️", few: "⏳" }, fl = (x) => (x >= 10 ? String(Math.round(x)) : x.toFixed(1)) + "×";
   const sec = (k, title) => {
